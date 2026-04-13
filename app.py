@@ -311,6 +311,7 @@ try:
     from review_analyst.symptomizer import (
         tag_review_batch as _v3_tag_review_batch,
         gate_polarity as _v3_gate_polarity,
+        polarity_confidence_modifier as _v3_polarity_modifier,
         estimate_batch_size as _v3_estimate_batch_size,
         match_label as _v3_match_label,
         validate_evidence as _v3_validate_evidence,
@@ -319,6 +320,7 @@ try:
         audit_tag_distribution as _v3_audit_distribution,
         LabelTracker as _v3_LabelTracker,
         generate_taxonomy_recommendations as _v3_generate_recommendations,
+        _result_cache as _v3_result_cache,
     )
     _HAS_SYMPTOMIZER_V3 = True
 except Exception:
@@ -6116,8 +6118,25 @@ def _call_symptomizer_batch(*, client, items, allowed_delighters, allowed_detrac
                 elif _RELIABILITY_KW_MIX.search(_rt): reliability = "Intermittent Issue"
                 elif not dets and dels: reliability = "Reliable"
                 sessions = "Unknown"
+                # Extract unlisted candidates from claims that didn't match taxonomy
+                all_matched = set(dets + dels)
+                unl_dets, unl_dels = [], []
+                for claim in claims:
+                    aspect = claim.get("aspect", "").strip()
+                    polarity = claim.get("polarity", "neutral")
+                    if not aspect or len(aspect) < 4 or len(aspect.split()) > 6:
+                        continue
+                    # Check if this claim's aspect already matched a catalog label
+                    from review_analyst.symptomizer import match_label as _ml
+                    if _ml(aspect, list(allowed_detractors) + list(allowed_delighters), aliases=aliases):
+                        continue
+                    aspect_title = " ".join(w.capitalize() for w in aspect.split())
+                    if polarity in ("negative", "mixed") and aspect_title not in unl_dets:
+                        unl_dets.append(aspect_title)
+                    elif polarity in ("positive",) and aspect_title not in unl_dels:
+                        unl_dels.append(aspect_title)
                 out_staged[idx] = dict(dels=dels, dets=dets, ev_del=ev_del, ev_det=ev_det,
-                    unl_dels=[], unl_dets=[], safety=safety, reliability=reliability, sessions=sessions)
+                    unl_dels=unl_dels[:5], unl_dets=unl_dets[:5], safety=safety, reliability=reliability, sessions=sessions)
             else:
                 out_staged[idx] = dict(dels=[], dets=[], ev_del={}, ev_det={},
                     unl_dels=[], unl_dets=[], safety="Not Mentioned", reliability="Not Mentioned", sessions="Unknown")
@@ -6172,7 +6191,7 @@ sessions    → {SESSIONS_ENUM}
 2. EXACT LABELS: Use catalog label text EXACTLY. No paraphrasing.
 3. EVIDENCE REQUIRED: Each evidence string must be verbatim text from the review (4-{max_ev_chars} chars). Max 2 per label. No evidence = no tag.
 4. HIGH RECALL: Find EVERY applicable symptom. Long reviews can legitimately map to many labels.
-5. POLARITY GATE: Respect needs_detractors / needs_delighters flags per review.
+5. BOTH SIDES: Tag BOTH detractors AND delighters for every review regardless of rating. A 5★ review can have minor complaints. A 1★ review can acknowledge positives.
 6. NO INFERENCE: Only tag what is explicitly stated or clearly described.
 
 ═══ ACCURACY RULES ═══
@@ -6189,6 +6208,11 @@ sessions    → {SESSIONS_ENUM}
 17. UNLISTED: Add strong missing themes to unlisted arrays (Title Case, 2-5 words). Be conservative.
 18. ALL IDS: Return a result for EVERY review id.
 
+═══ COMMON MISTAKES TO AVOID ═══
+WRONG: "I was worried it would damage my hair but it didn't" → tagging "Hair Damage". RIGHT: This is a DELIGHTER — no damage occurred.
+WRONG: "my OLD dryer was so loud, this one is quiet" → tagging "Loud". RIGHT: Loudness is about a DIFFERENT product. Tag "Quiet" for THIS product.
+WRONG: "cord is short but manageable" → not tagging. RIGHT: Tag it — hedging lowers confidence, not tagging.
+
 ═══ OUTPUT SCHEMA (strict JSON) ═══
 {{"items":[{{
   "id":"<review_id_string>",
@@ -6200,8 +6224,10 @@ sessions    → {SESSIONS_ENUM}
   "reliability":"<enum value>",
   "sessions":"<enum value>"
 }}]}}"""
-    payload = dict(items=[dict(id=str(it["idx"]), review=it["review"], rating=it.get("rating"), needs_delighters=it.get("needs_del", True), needs_detractors=it.get("needs_det", True)) for it in items])
-    max_out = min(5500, max(1200, 200 * len(items) + 400))  # Tighter token budget = faster responses
+    payload = dict(items=[dict(id=str(it["idx"]), review=it["review"], rating=it.get("rating")) for it in items])
+    catalog_size = len(allowed_detractors) + len(allowed_delighters)
+    catalog_mult = 1.0 + min(0.5, max(0, catalog_size - 20) / 80)
+    max_out = min(6500, max(1200, int((200 * len(items) + 400) * catalog_mult)))
     result_text = _chat_complete_with_fallback_models(
         client,
         model=_shared_model(),
@@ -8773,23 +8799,27 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                     idx=int(idx),
                     review=_symptomizer_review_text(row),
                     rating=row.get("rating"),
-                    needs_del=bool(row.get("Needs_Delighters", True)),
-                    needs_det=bool(row.get("Needs_Detractors", True)),
                 )
                 for idx, row in batch
             ]
             _log.info("Batch %d/%d — reviews %d–%d", bi, len(bidxs), start + 1, min(start + batch_size, len(rows_list)))
             status.info(f"Batch {bi}/{len(bidxs)} — reviews {start + 1}–{min(start + batch_size, len(rows_list))}")
+            # Adaptive prompt hints from LabelTracker (appended to profile for later batches)
+            _adaptive_profile = profile
+            if _label_tracker and bi > 3:
+                hints = _label_tracker.get_prompt_hints()
+                if hints:
+                    _adaptive_profile = profile + "\n" + hints
             outs = {}
             if client:
                 try:
-                    outs = _call_symptomizer_batch(client=client, items=items, allowed_delighters=_active_dels, allowed_detractors=_active_dets, product_profile=profile, product_knowledge=product_knowledge, max_ev_chars=_ev_chars, aliases=aliases, include_universal_neutral=_include_universal)
+                    outs = _call_symptomizer_batch(client=client, items=items, allowed_delighters=_active_dels, allowed_detractors=_active_dets, product_profile=_adaptive_profile, product_knowledge=product_knowledge, max_ev_chars=_ev_chars, aliases=aliases, include_universal_neutral=_include_universal)
                 except Exception as exc:
                     status.warning(f"Batch {bi} failed ({exc}) — retrying individually…")
                     failed_count += len(items)
                     for it in items:
                         try:
-                            single = _call_symptomizer_batch(client=client, items=[it], allowed_delighters=_active_dels, allowed_detractors=_active_dets, product_profile=profile, product_knowledge=product_knowledge, max_ev_chars=_ev_chars, aliases=aliases, include_universal_neutral=_include_universal)
+                            single = _call_symptomizer_batch(client=client, items=[it], allowed_delighters=_active_dels, allowed_detractors=_active_dets, product_profile=_adaptive_profile, product_knowledge=product_knowledge, max_ev_chars=_ev_chars, aliases=aliases, include_universal_neutral=_include_universal)
                             outs.update(single)
                             failed_count -= 1
                         except Exception:
@@ -8797,10 +8827,8 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
             for it in items:
                 idx = int(it["idx"])
                 out = outs.get(idx, empty_out)
-                write_det = bool(it.get("needs_det", True))
-                write_del = bool(it.get("needs_del", True))
-                dets_out = list(out.get("dets", []))[:10] if write_det else None
-                dels_out = list(out.get("dels", []))[:10] if write_del else None
+                dets_out = list(out.get("dets", []))[:10]
+                dels_out = list(out.get("dels", []))[:10]
                 updated_df = _write_ai_symptom_row(
                     updated_df,
                     idx,
@@ -8828,10 +8856,8 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
             rate = done / elapsed if elapsed > 0 else 0
             rem = (total_n - done) / rate if rate > 0 else 0
             prog.progress(done / total_n, text=f"{done}/{total_n} processed")
-            # Checkpoint: save partial results so page refresh doesn't lose everything
-            if done % max(batch_size * 2, 10) == 0:
-                st.session_state["sym_processed_rows"] = list(processed_local)
-                st.session_state["_sym_checkpoint_done"] = done
+            # Checkpoint already saved via dataset_ck above (every batch)
+            st.session_state["_sym_checkpoint_done"] = done
             eta_box.markdown(f"**Speed:** {rate * 60:.1f} rev/min · **ETA:** ~{_fmt_secs(rem)}")
             avg_labels = total_labels_written / max(done, 1)
             stats_box.markdown(f"<span style='font-size:12px;color:var(--slate-500);'>Labels written: **{total_labels_written}** · Avg per review: **{avg_labels:.1f}**" + (f" · ⚠️ {failed_count} failed" if failed_count > 0 else "") + "</span>", unsafe_allow_html=True)
@@ -8839,9 +8865,16 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
             if _label_tracker:
                 _label_tracker.record_batch(outs)
                 alerts = _label_tracker.check_alerts(min_reviews=batch_size * 3)
-                for alert in alerts[:2]:
+                for alert in alerts[:4]:
                     if alert["issue"] == "too_broad":
                         stats_box.markdown(f"<span style='font-size:11px;color:var(--warning);'>⚠️ '{alert['label']}' hitting {alert['pct']:.0f}% of reviews — may be too broad</span>", unsafe_allow_html=True)
+                    elif alert["issue"] == "high_zero_rate":
+                        stats_box.markdown(f"<span style='font-size:11px;color:var(--warning);'>⚠️ {alert['pct']:.0f}% of reviews returned zero tags — taxonomy may need tuning</span>", unsafe_allow_html=True)
+                    elif alert["issue"] == "zero_hits":
+                        stats_box.markdown(f"<span style='font-size:11px;color:var(--slate-400);'>ℹ️ '{alert['label']}' ({alert['side']}) — zero hits after {_label_tracker.total_reviews} reviews</span>", unsafe_allow_html=True)
+                # Show if adaptive prompting is active
+                if bi > 3 and _label_tracker.get_prompt_hints():
+                    stats_box.markdown(f"<span style='font-size:11px;color:var(--indigo);'>🧠 Adaptive prompting active — adjusting for dominant/missing labels</span>", unsafe_allow_html=True)
             gc.collect()
         # ── v3 auto-retry for zero-tag reviews ───────────────────────────
         if _HAS_SYMPTOMIZER_V3 and client and processed_local:
@@ -8890,6 +8923,7 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
             "elapsed_sec": round(time.perf_counter() - t0, 1),
             "model": _shared_model(), "reasoning": _shared_reasoning(),
             "staged": bool(st.session_state.get("sym_staged_pipeline")),
+            "cache_stats": _v3_result_cache.stats if _HAS_SYMPTOMIZER_V3 else {},
         }
         st.rerun()
     st.divider()
@@ -8911,15 +8945,43 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
     st.markdown(_chip_html([(f"{len(processed)} reviews tagged", "green"), (f"{total_tags} labels written", "indigo")]), unsafe_allow_html=True)
     if _HAS_SYMPTOMIZER_V3 and len(processed) >= 3:
         try:
-            _aud = _v3_audit_distribution({r["idx"]: {"dets":r.get("wrote_dets",[]),"dels":r.get("wrote_dels",[]),"ev_det":r.get("ev_det",{}),"ev_del":r.get("ev_del",{})} for r in processed})
+            # Build items list from session data for polarity mismatch detection
+            _audit_items = []
+            _ds = st.session_state.get("analysis_dataset", {})
+            _rdf = _ds.get("reviews_df") if isinstance(_ds, dict) else None
+            if _rdf is not None and hasattr(_rdf, "loc"):
+                for r in processed:
+                    _ridx = r["idx"]
+                    try:
+                        _rrow = _rdf.loc[_ridx] if _ridx in _rdf.index else None
+                        _audit_items.append({"idx": _ridx, "rating": _rrow.get("rating") if _rrow is not None else None})
+                    except Exception:
+                        _audit_items.append({"idx": _ridx, "rating": None})
+            _aud = _v3_audit_distribution(
+                {r["idx"]: {"dets":r.get("wrote_dets",[]),"dels":r.get("wrote_dels",[]),"ev_det":r.get("ev_det",{}),"ev_del":r.get("ev_del",{})} for r in processed},
+                items=_audit_items or None,
+            )
             _sing = _aud.get("singleton_detractors",[])+_aud.get("singleton_delighters",[])
             _dom = _aud.get("dominant_detractors",[])+_aud.get("dominant_delighters",[])
             _noev = _aud.get("zero_evidence_tags",[])
-            if _sing or _dom or _noev:
-                with st.expander(f"🔍 Tag quality audit — {len(_sing)} singletons · {len(_dom)} dominant · {len(_noev)} no-evidence", expanded=False):
+            _pol = _aud.get("polarity_mismatches",[])
+            _shared = _aud.get("shared_evidence_labels",{})
+            issue_count = len(_sing) + len(_dom) + len(_noev) + len(_pol) + len(_shared)
+            if issue_count > 0:
+                with st.expander(f"🔍 Tag quality audit — {len(_sing)} singletons · {len(_dom)} dominant · {len(_noev)} no-evidence" + (f" · {len(_pol)} polarity mismatches" if _pol else ""), expanded=False):
                     if _sing: st.caption("**Singletons** (appear once — possible hallucinations):"); st.markdown(", ".join(f"`{s}`" for s in _sing[:20]))
                     if _dom: st.caption("**Dominant** (>50% of reviews — may be too broad):"); st.markdown(", ".join(f"`{d}`" for d in _dom[:10]))
                     if _noev: st.caption("**No evidence** (tagged without supporting text):"); st.markdown(", ".join(f"`{e}`" for e in _noev[:15]))
+                    if _pol:
+                        st.caption(f"**Polarity mismatches** ({len(_pol)} reviews where star rating contradicts tags):")
+                        for pm in _pol[:8]:
+                            issue_desc = "5★ with only detractors" if pm["issue"] == "5star_only_detractors" else "1-2★ with only delighters"
+                            tags = pm.get("dets", pm.get("dels", []))
+                            st.markdown(f"Row {pm['idx']}: {issue_desc} — tags: {', '.join(f'`{t}`' for t in tags[:3])}")
+                    if _shared:
+                        st.caption(f"**Shared evidence** ({len(_shared)} evidence strings reused across 3+ labels — possible AI laziness):")
+                        for ev, labels in list(_shared.items())[:5]:
+                            st.markdown(f'"{ev[:50]}…" → {", ".join(f"`{l}`" for l in labels[:4])}')
         except Exception: pass
     # ── Phase 4: Taxonomy recommendations ────────────────────────────────
     if _HAS_SYMPTOMIZER_V3 and len(processed) >= 5:

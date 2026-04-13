@@ -37,6 +37,7 @@ gate_polarity(rating, review_text) → Tuple[bool, bool]
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import math
 import re
@@ -46,6 +47,64 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 logger = logging.getLogger("starwalk.symptomizer")
+
+
+# ---------------------------------------------------------------------------
+# Result cache — avoids re-processing identical reviews
+# ---------------------------------------------------------------------------
+
+class ResultCache:
+    """In-memory content-hash cache for symptomizer results.
+    
+    Key = hash(review_text + sorted_catalog_labels + model_name).
+    Value = the result dict for that review.
+    
+    Survives within a single Streamlit session. Cleared on taxonomy change.
+    """
+    def __init__(self, max_size: int = 5000):
+        self._store: Dict[str, Dict[str, Any]] = {}
+        self._max = max_size
+        self._hits = 0
+        self._misses = 0
+    
+    def _key(self, review_text: str, catalog_hash: str, model: str = "") -> str:
+        raw = f"{review_text.strip().lower()}|{catalog_hash}|{model}"
+        return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:24]
+    
+    def get(self, review_text: str, catalog_hash: str, model: str = "") -> Optional[Dict[str, Any]]:
+        result = self._store.get(self._key(review_text, catalog_hash, model))
+        if result is not None:
+            self._hits += 1
+        else:
+            self._misses += 1
+        return result
+    
+    def put(self, review_text: str, catalog_hash: str, model: str, result: Dict[str, Any]) -> None:
+        if len(self._store) >= self._max:
+            # Evict oldest 20%
+            keys = list(self._store.keys())
+            for k in keys[:len(keys) // 5]:
+                del self._store[k]
+        self._store[self._key(review_text, catalog_hash, model)] = result
+    
+    def clear(self) -> None:
+        self._store.clear()
+        self._hits = 0
+        self._misses = 0
+    
+    @property
+    def stats(self) -> Dict[str, int]:
+        return {"size": len(self._store), "hits": self._hits, "misses": self._misses}
+
+    @staticmethod
+    def catalog_hash(detractors: Sequence[str], delighters: Sequence[str]) -> str:
+        """Deterministic hash of the catalog for cache keying."""
+        raw = "|".join(sorted(str(d).lower() for d in detractors)) + "||" + "|".join(sorted(str(d).lower() for d in delighters))
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+# Module-level singleton — lives for the Streamlit session
+_result_cache = ResultCache()
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -139,41 +198,76 @@ def gate_polarity(
     rating: Any,
     review_text: str,
 ) -> Tuple[bool, bool]:
-    """Decide which sides to tag based on rating + text signals.
+    """Always returns (True, True) — both sides are always eligible for tagging.
 
-    Returns (needs_detractors, needs_delighters).
+    Rating and text signals feed into confidence scoring downstream, not
+    into hard gating.  A 5★ review that says "but the cord is too short"
+    needs that detractor.  A 1★ review that says "love the color though"
+    needs that delighter.
 
-    Rules:
-    - 1–2★: detractors only, unless text has explicit positive signals
-    - 3★: both sides (mixed by definition)
-    - 4★: delighters only, unless text has explicit negative signals
-    - 5★: delighters only, unless text has explicit negative signals
-    - Any review with mixed-sentiment markers: both sides
+    Returns (needs_detractors, needs_delighters) — always (True, True).
+    """
+    return True, True
+
+
+def polarity_confidence_modifier(
+    rating: Any,
+    review_text: str,
+    side: str,
+) -> float:
+    """Soft confidence modifier based on rating + text alignment.
+
+    Returns a float in [-0.25, +0.20] that adjusts tag confidence.
+    Cross-polarity tags (detractor on 5★, delighter on 1★) get a penalty
+    UNLESS the review text contains explicit signals for that side.
+
+    This replaces the old hard gate — rating influences confidence, never
+    blocks a tag entirely.
     """
     try:
         r = float(rating)
     except (TypeError, ValueError):
-        return True, True  # unknown rating → tag both
+        return 0.0  # unknown rating → neutral
 
     text = str(review_text or "")
     has_mixed = bool(_MIXED_SIGNAL.search(text))
     has_negative = bool(_EXPLICIT_NEGATIVE.search(text))
     has_positive = bool(_EXPLICIT_POSITIVE.search(text))
 
-    if r <= 2:
-        needs_det = True
-        needs_del = has_mixed or has_positive
-    elif r <= 3:
-        needs_det = True
-        needs_del = True
-    elif r <= 4:
-        needs_det = has_mixed or has_negative
-        needs_del = True
-    else:  # 5★
-        needs_det = has_mixed or has_negative
-        needs_del = True
+    modifier = 0.0
 
-    return needs_det, needs_del
+    if side == "detractor":
+        if r <= 2:
+            modifier = +0.15          # expected — boost
+        elif r <= 3:
+            modifier = +0.05          # neutral territory
+        elif r >= 5:
+            if has_negative or has_mixed:
+                modifier = -0.05      # cross-polarity but text supports it — mild penalty
+            else:
+                modifier = -0.18      # cross-polarity, no text support — stronger penalty
+        elif r >= 4:
+            if has_negative or has_mixed:
+                modifier = 0.0
+            else:
+                modifier = -0.10
+    elif side == "delighter":
+        if r >= 4:
+            modifier = +0.15          # expected — boost
+        elif r <= 3 and r > 2:
+            modifier = +0.05          # neutral territory
+        elif r <= 2:
+            if has_positive or has_mixed:
+                modifier = -0.05      # cross-polarity but text supports it
+            else:
+                modifier = -0.18      # cross-polarity, no text support
+        elif r <= 3:
+            if has_positive or has_mixed:
+                modifier = 0.0
+            else:
+                modifier = -0.10
+
+    return modifier
 
 
 # ---------------------------------------------------------------------------
@@ -314,46 +408,113 @@ _NEGATION_PREFIX = re.compile(
 _NEG_CONTEXT = re.compile(r"\b(not|no|never|don't|doesn't|won't|can't|isn't|wasn't|without|hardly|barely|nor)\s+", re.I)
 _SARCASM_MARKERS = re.compile(r"(yeah right|sure|great[.!,]|wonderful[.!,]|fantastic[.!,]).*\b(broke|fail|terrible|awful|worst)", re.I)
 
+# Try to import the sophisticated fragment-level NegationDetector from tag_quality
+try:
+    from review_analyst.tag_quality import NegationDetector as _NegDetector
+    _HAS_NEG_DETECTOR = True
+except Exception:
+    _HAS_NEG_DETECTOR = False
+
 def validate_evidence(
     evidence_list: Sequence[str],
     review_text: str,
     max_chars: int = 120,
+    *,
+    label: str = "",
 ) -> List[str]:
-    """Validate evidence with negation awareness and minimum quality checks.
+    """Validate evidence with fuzzy matching, negation awareness, and quality checks.
     
-    Checks both preceding and following context for negation patterns to catch:
-    - "it didn't damage my hair" (negation before)
-    - "damage my hair? not at all" (negation after)
-    - "I was worried about damage but no issues" (negation in surrounding window)
+    Matching cascade:
+    1. Exact verbatim match (case-insensitive, whitespace-normalized)
+    2. Fuzzy substring match — handles minor AI paraphrasing like
+       "really loud" matching inside "really really loud"
+    3. Negation filtering (NegationDetector or window-based fallback)
+    
+    Short reviews (< 30 words) get relaxed minimum evidence length (4 chars).
     """
     if not evidence_list or not review_text:
         return []
     rv_norm = re.sub(r"\s+", " ", review_text.lower())
+    rv_words = len(rv_norm.split())
+    # Relax minimum for short reviews
+    min_chars = 4 if rv_words < 30 else 6
+    min_words = 1 if rv_words < 20 else 2
     out = []
     for e in evidence_list:
         e = str(e).strip()[:max_chars]
-        # Minimum quality: 6+ chars, 2+ words
-        if len(e) < 6 or len(e.split()) < 2:
+        if len(e) < min_chars or len(e.split()) < min_words:
             continue
         e_norm = re.sub(r"\s+", " ", e.lower())
-        if e_norm not in rv_norm:
+        
+        # Tier 1: Exact verbatim match
+        found_verbatim = e_norm in rv_norm
+        
+        # Tier 2: Fuzzy substring — find if all significant words appear nearby
+        found_fuzzy = False
+        if not found_verbatim:
+            e_words = [w for w in e_norm.split() if len(w) > 2 and w not in _STOP_TOKENS]
+            if e_words and len(e_words) >= 2:
+                # Check if all content words appear within a 150-char window
+                for start_pos in range(0, len(rv_norm) - 10, 20):
+                    window = rv_norm[start_pos:start_pos + 150]
+                    if all(w in window for w in e_words):
+                        found_fuzzy = True
+                        break
+            elif e_words and len(e_words) == 1 and len(e_words[0]) >= 5:
+                # Single significant word — just check it exists
+                found_fuzzy = e_words[0] in rv_norm
+        
+        if not found_verbatim and not found_fuzzy:
             continue
-        # Negation check: reject short evidence preceded OR followed by negation
-        idx = rv_norm.find(e_norm)
-        if idx >= 0 and len(e_norm.split()) <= 4:
-            # Check 40 chars before for negation
-            preceding = rv_norm[max(0, idx - 40):idx]
-            if _NEG_CONTEXT.search(preceding):
-                continue
-            # Check 30 chars after for negation/dismissal patterns
-            end_idx = idx + len(e_norm)
-            following = rv_norm[end_idx:end_idx + 30]
-            if re.search(r"\b(not|no|never|at all|whatsoever|zero)\b", following):
-                # But only reject if there's no double-negation reset
-                if not re.search(r"\b(but|however|actually|still)\b", following):
-                    continue
+        
+        # Negation check — use sophisticated detector when available
+        is_negated = False
+        if _HAS_NEG_DETECTOR and len(e_norm.split()) <= 6:
+            idx = rv_norm.find(e_norm) if found_verbatim else _find_fuzzy_position(e_norm, rv_norm)
+            if idx >= 0:
+                frag_start = max(0, rv_norm.rfind(".", 0, idx) + 1, rv_norm.rfind("!", 0, idx) + 1,
+                                 rv_norm.rfind(";", 0, idx) + 1, rv_norm.rfind("—", 0, idx) + 1)
+                frag_end = len(rv_norm)
+                for delim in ".!;—":
+                    pos = rv_norm.find(delim, idx + len(e_norm))
+                    if pos > 0:
+                        frag_end = min(frag_end, pos + 1)
+                fragment = rv_norm[frag_start:frag_end].strip()
+                if _NegDetector.is_negated(e_norm, fragment):
+                    is_negated = True
+                elif label and len(e_norm.split()) <= 3:
+                    label_words = [w for w in label.lower().split() if len(w) > 3 and w not in _STOP_TOKENS]
+                    for lw in label_words:
+                        if lw in fragment and _NegDetector.is_negated(lw, fragment):
+                            is_negated = True
+                            break
+        elif len(e_norm.split()) <= 4:
+            idx = rv_norm.find(e_norm)
+            if idx >= 0:
+                preceding = rv_norm[max(0, idx - 40):idx]
+                if _NEG_CONTEXT.search(preceding):
+                    is_negated = True
+                else:
+                    end_idx = idx + len(e_norm)
+                    following = rv_norm[end_idx:end_idx + 30]
+                    if re.search(r"\b(not|no|never|at all|whatsoever|zero)\b", following):
+                        if not re.search(r"\b(but|however|actually|still)\b", following):
+                            is_negated = True
+        if is_negated:
+            continue
         out.append(e)
     return out[:2]
+
+
+def _find_fuzzy_position(evidence_norm: str, review_norm: str) -> int:
+    """Find approximate position of evidence in review for negation checking.
+    Returns the position of the first content word match, or -1."""
+    words = [w for w in evidence_norm.split() if len(w) > 3 and w not in _STOP_TOKENS]
+    if not words:
+        return -1
+    # Find position of first significant word
+    pos = review_norm.find(words[0])
+    return pos if pos >= 0 else -1
 
 
 # ---------------------------------------------------------------------------
@@ -397,13 +558,8 @@ def _score_tag_confidence(
     else:
         score -= 0.15
 
-    try:
-        r = float(rating)
-        if side == "detractor" and r <= 2: score += 0.15
-        elif side == "detractor" and r >= 5: score -= 0.20
-        elif side == "delighter" and r >= 4: score += 0.15
-        elif side == "delighter" and r <= 2: score -= 0.20
-    except (TypeError, ValueError): pass
+    # Rating-polarity alignment: soft modifier replaces hard gating
+    score += polarity_confidence_modifier(rating, review_text, side)
 
     # Hedging downgrade: "kind of loud" = lower confidence
     if _HEDGING.search(ev_text): score -= 0.08
@@ -411,6 +567,19 @@ def _score_tag_confidence(
     if _EMPHASIS.search(ev_text): score += 0.08
     # Severity boost: safety-critical language for detractors
     if side == "detractor" and _SEVERITY_HIGH.search(ev_text): score += 0.12
+
+    # Sarcasm-rating cross-check: 1★ with positive words = sarcasm → boost detractor confidence
+    try:
+        r = float(rating)
+        rv_lower_full = review_text.lower() if review_text else ""
+        if r <= 2 and side == "detractor" and _EXPLICIT_POSITIVE.search(rv_lower_full):
+            score += 0.06  # Likely sarcasm — boost detractor confidence
+        elif r <= 2 and side == "delighter" and _EXPLICIT_POSITIVE.search(ev_text):
+            score -= 0.10  # Positive words in 1-2★ context — likely sarcastic
+        elif r >= 5 and side == "detractor" and _EXPLICIT_NEGATIVE.search(ev_text):
+            score -= 0.08  # Negative words in 5★ context — likely "was worried but..."
+    except (TypeError, ValueError):
+        pass
 
     # Small catalog penalty
     if catalog_size < 8:
@@ -465,7 +634,7 @@ STEP 2: For each claim, check if it maps to a catalog label. Only emit tags with
 2. EXACT LABELS: Use catalog label text exactly. No paraphrasing.
 3. EVIDENCE REQUIRED: Every tag needs 1-2 verbatim quotes (6+ chars, 2+ words). No evidence = no tag.
 4. HIGH RECALL: Capture every applicable symptom. Long reviews can map to many labels.
-5. POLARITY GATE: Respect needs_detractors / needs_delighters flags.
+5. BOTH SIDES: Tag BOTH detractors AND delighters for every review regardless of rating. A 5★ review can have minor complaints. A 1★ review can acknowledge positives. Let the evidence guide you.
 6. NO INFERENCE: Only tag what is explicitly stated or clearly described.
 
 ═══ ACCURACY RULES ═══
@@ -481,6 +650,19 @@ STEP 2: For each claim, check if it maps to a catalog label. Only emit tags with
 16. ZERO IS VALID: No tags better than forced matches.
 17. UNLISTED: Add strong missing themes to unlisted arrays. Be conservative.
 18. ALL IDS: Return a result for EVERY review id.
+
+═══ COMMON MISTAKES TO AVOID ═══
+WRONG: Review says "I was worried it would damage my hair but it didn't" → tagging "Hair Damage" as detractor.
+RIGHT: This is a DELIGHTER — the reviewer is praising that no damage occurred.
+
+WRONG: 5★ review "Love everything about this dryer" → tagging zero detractors AND zero delighters.
+RIGHT: Tag the delighters! "Love everything" maps to Overall Satisfaction + any specific praise.
+
+WRONG: Review says "cord is short but manageable" → NOT tagging "Short Cord".
+RIGHT: Tag it — "cord is short" is an explicit complaint even if hedged. Hedging lowers confidence, not tagging.
+
+WRONG: Review says "my OLD dryer was so loud, this one is quiet" → tagging "Loud" as detractor.
+RIGHT: The loudness is about a DIFFERENT product. Tag "Quiet" as a delighter for THIS product.
 
 ═══ OUTPUT (strict JSON) ═══
 {{"items":[{{
@@ -498,25 +680,16 @@ STEP 2: For each claim, check if it maps to a catalog label. Only emit tags with
 def _build_user_payload(
     items: Sequence[Mapping[str, Any]],
 ) -> str:
-    """Build the user message with rating-gated polarity flags."""
+    """Build the user message. Both sides always eligible — rating informs
+    confidence downstream, not hard gating at the prompt level."""
     payload_items = []
     for it in items:
         review_text = str(it.get("review", ""))
         rating = it.get("rating")
-        needs_det, needs_del = gate_polarity(rating, review_text)
-
-        # Allow caller overrides
-        if it.get("needs_det") is False:
-            needs_det = False
-        if it.get("needs_del") is False:
-            needs_del = False
-
         payload_items.append(dict(
             id=str(it["idx"]),
             review=review_text,
             rating=rating,
-            needs_detractors=needs_det,
-            needs_delighters=needs_del,
         ))
     return json.dumps(dict(items=payload_items))
 
@@ -560,6 +733,25 @@ def tag_review_batch(
     _model = (model_fn or (lambda: "gpt-4o"))()
     _reasoning = (reasoning_fn or (lambda: "none"))()
 
+    # ── Cache check: skip items we've already processed ──────────────
+    _cat_hash = ResultCache.catalog_hash(allowed_detractors, allowed_delighters)
+    cached_results: Dict[int, Dict[str, Any]] = {}
+    uncached_items: List[Mapping[str, Any]] = []
+    for it in items:
+        cached = _result_cache.get(str(it.get("review", "")), _cat_hash, _model)
+        if cached is not None:
+            cached_results[int(it["idx"])] = cached
+        else:
+            uncached_items.append(it)
+
+    # If everything was cached, return immediately
+    if not uncached_items:
+        logger.info("All %d items served from cache", len(items))
+        return cached_results
+
+    # Use uncached items for the AI call
+    items_to_process = uncached_items
+
     # Build prompt context
     category = "general"
     if infer_category_fn:
@@ -596,8 +788,13 @@ def tag_review_batch(
         max_ev_chars=max_ev_chars,
     )
 
-    user_payload = _build_user_payload(items)
-    max_out = min(5500, max(1200, 200 * len(items) + 400))  # Tighter = faster
+    user_payload = _build_user_payload(items_to_process)
+    # Dynamic token budget: scales with batch size AND catalog size
+    # Large catalogs generate more tags per review → need more output tokens
+    catalog_size = len(allowed_detractors) + len(allowed_delighters)
+    catalog_multiplier = 1.0 + min(0.5, max(0, catalog_size - 20) / 80)  # up to 1.5x for 60+ labels
+    base_tokens = int((200 * len(items_to_process) + 400) * catalog_multiplier)
+    max_out = min(6500, max(1200, base_tokens))
 
     # Call the AI
     if chat_complete_fn:
@@ -624,7 +821,7 @@ def tag_review_batch(
     # Process results with confidence scoring
     out_by_idx: Dict[int, Dict[str, Any]] = {}
 
-    for it in items:
+    for it in items_to_process:
         idx = int(it["idx"])
         review_text = it.get("review", "")
         rating = it.get("rating")
@@ -705,6 +902,13 @@ def tag_review_batch(
             reliability=reliability,
             sessions=sessions,
         )
+        # Cache the result for this review
+        _result_cache.put(it.get("review", ""), _cat_hash, _model, out_by_idx[idx])
+
+    # Merge cached + fresh results
+    if cached_results:
+        logger.info("Cache: %d hits, %d fresh", len(cached_results), len(out_by_idx))
+        out_by_idx.update(cached_results)
 
     return out_by_idx
 
@@ -810,9 +1014,11 @@ def _extract_side_with_confidence(
     side: str,
     max_ev_chars: int = 120,
 ) -> Tuple[List[str], Dict[str, List[str]]]:
-    """Extract labels with confidence, universal discipline, and contradiction checking."""
+    """Extract labels with confidence, universal discipline, contradiction checking,
+    and aspect-level deduplication."""
     labels = []
     ev_map: Dict[str, List[str]] = {}
+    coherence_flags: Dict[str, bool] = {}  # track coherence for confidence scoring
 
     for obj in (raw_objs or []):
         if not isinstance(obj, dict): continue
@@ -820,27 +1026,36 @@ def _extract_side_with_confidence(
         lbl = match_label(raw, allowed, aliases=aliases)
         if not lbl or lbl in labels: continue  # Dedup
         raw_evs = [str(e) for e in (obj.get("evidence") or []) if isinstance(e, str)]
-        validated = validate_evidence(raw_evs, review_text, max_ev_chars)
+        validated = validate_evidence(raw_evs, review_text, max_ev_chars, label=lbl)
         if not validated:
             validated = [str(e).strip()[:max_ev_chars] for e in raw_evs if str(e).strip()][:1]
-        # Semantic coherence: does evidence actually relate to the label?
-        if not _evidence_coherent_with_label(lbl, validated, review_text=review_text):
+        # Semantic coherence: soft signal, not hard gate
+        # Tags with weak coherence survive but get a confidence penalty downstream
+        is_coherent = _evidence_coherent_with_label(lbl, validated, review_text=review_text)
+        coherence_flags[lbl] = is_coherent
+        # Only hard-drop if NO evidence at all AND no coherence
+        if not validated and not is_coherent:
             continue
         labels.append(lbl)
         ev_map[lbl] = validated[:2]
         if len(labels) >= 10: break
 
+    # Aspect-level dedup: "Loud Noise" + "Noisy Motor" = same concept — keep best evidence
+    labels, ev_map = _dedup_same_concept_labels(labels, ev_map)
+
     # Post-extraction intelligence
     labels, ev_map = _enforce_universal_discipline(labels, ev_map)
-    labels = _check_contradictions_side(labels)
-    # Filter by confidence threshold — drop very low-confidence tags
+    labels = _check_contradictions_with_evidence(labels, ev_map)
+    # Filter by confidence threshold
     if len(labels) >= 2:
         scored = []
         for lbl in labels:
             c = _score_tag_confidence(lbl, ev_map.get(lbl, []), review_text, rating,
                                        side=side, catalog_size=len(allowed))
+            # Coherence penalty: -0.12 for incoherent evidence
+            if not coherence_flags.get(lbl, True):
+                c -= 0.12
             scored.append((lbl, c))
-        # Keep tags above 0.25 confidence, or top 3 if all are low
         above_threshold = [(l, c) for l, c in scored if c >= 0.25]
         if above_threshold:
             labels = [l for l, c in above_threshold]
@@ -849,6 +1064,64 @@ def _extract_side_with_confidence(
             labels = [l for l, c in scored[:3]]
         ev_map = {k: v for k, v in ev_map.items() if k in labels}
     return labels, ev_map
+
+
+def _dedup_same_concept_labels(labels: List[str], ev_map: Dict[str, List[str]]) -> Tuple[List[str], Dict[str, List[str]]]:
+    """Remove same-concept duplicates: 'Loud Noise' + 'Noisy Motor' → keep the one with better evidence."""
+    if len(labels) < 2:
+        return labels, ev_map
+    seen_stems: Dict[str, Tuple[str, int]] = {}  # stem_key → (label, evidence_score)
+    out_labels = []
+    for lbl in labels:
+        stems = frozenset(_tokenize_stemmed(lbl))
+        if not stems:
+            out_labels.append(lbl)
+            continue
+        # Check overlap with already-seen labels
+        ev_score = sum(len(e) for e in ev_map.get(lbl, []))
+        merged = False
+        for key, (existing_lbl, existing_score) in list(seen_stems.items()):
+            existing_stems = frozenset(key.split("|"))
+            overlap = len(stems & existing_stems) / max(len(stems), len(existing_stems))
+            if overlap >= 0.6:
+                # Same concept — keep the one with better evidence
+                if ev_score > existing_score:
+                    out_labels = [l for l in out_labels if l != existing_lbl]
+                    out_labels.append(lbl)
+                    seen_stems["|".join(sorted(stems))] = (lbl, ev_score)
+                    # Merge evidence: combine best from both
+                    combined_ev = list(ev_map.get(existing_lbl, [])) + list(ev_map.get(lbl, []))
+                    ev_map[lbl] = sorted(set(combined_ev), key=lambda x: -len(x))[:2]
+                    if existing_lbl in ev_map and existing_lbl != lbl:
+                        del ev_map[existing_lbl]
+                # else: keep existing, discard new
+                merged = True
+                break
+        if not merged:
+            out_labels.append(lbl)
+            seen_stems["|".join(sorted(stems))] = (lbl, ev_score)
+    return out_labels, ev_map
+
+
+def _check_contradictions_with_evidence(labels: List[str], ev_map: Dict[str, List[str]]) -> List[str]:
+    """Evidence-weighted contradiction resolution.
+    
+    When contradictory labels coexist (Quiet + Loud), keep the one with
+    stronger evidence rather than just counting set sizes.
+    """
+    for set_a, set_b in _CONTRADICTION_PAIRS:
+        has_a = set_a & set(labels)
+        has_b = set_b & set(labels)
+        if has_a and has_b:
+            # Score each side by total evidence length
+            score_a = sum(sum(len(e) for e in ev_map.get(l, [])) for l in has_a)
+            score_b = sum(sum(len(e) for e in ev_map.get(l, [])) for l in has_b)
+            # Drop the weaker side
+            drop = has_b if score_a >= score_b else has_a
+            labels = [l for l in labels if l not in drop]
+            for d in drop:
+                ev_map.pop(d, None)
+    return labels
 
 
 def _validate_enum(value: Any, enum_str: str) -> str:
@@ -865,9 +1138,19 @@ def _validate_enum(value: Any, enum_str: str) -> str:
 # ---------------------------------------------------------------------------
 
 _EXTRACT_SYSTEM = """You are a product review analyst. Extract every factual claim from this review.
-For each claim: quote EXACT text (4-120 chars), label polarity (positive/negative/neutral/mixed), label aspect (2-4 words).
-Output strict JSON: {"claims":[{"quote":"<verbatim>","polarity":"<polarity>","aspect":"<2-4 words>"}]}
-Rules: extract ALL claims, verbatim quotes only, do not infer."""
+
+For each claim:
+- Quote EXACT text from the review (4-120 chars) — must appear verbatim
+- Label polarity: positive, negative, neutral, or mixed
+- Label aspect: 2-4 word noun phrase describing what the claim is about (e.g., "noise level", "hair damage", "ease of use", "build quality", "drying speed")
+
+NEGATION AWARENESS: "didn't damage my hair" is POSITIVE polarity about "hair damage". "no issues with noise" is POSITIVE about "noise level". Read the full clause before assigning polarity.
+
+SARCASM: "Great, another broken product" — the polarity is NEGATIVE despite positive words. Use rating as a signal.
+
+Extract ALL claims — even minor mentions. A thorough extraction enables better downstream classification.
+
+Output strict JSON: {"claims":[{"quote":"<verbatim>","polarity":"<polarity>","aspect":"<2-4 words>"}]}"""
 
 
 def extract_claims(*, client, review_text, rating, chat_fn=None, json_fn=None, model_fn=None, reasoning_fn=None):
@@ -891,23 +1174,48 @@ def extract_claims(*, client, review_text, rating, chat_fn=None, json_fn=None, m
 
 
 def map_claims_to_taxonomy(claims, allowed_detractors, allowed_delighters, aliases=None):
-    """Stage 2: Map extracted claims to catalog labels deterministically (no AI call)."""
+    """Stage 2: Map extracted claims to catalog labels deterministically (no AI call).
+    
+    Uses a three-strategy matching cascade per claim:
+    1. Match the AI-generated aspect label directly to catalog
+    2. Match the first 60 chars of the verbatim claim text to catalog
+    3. Extract key noun phrases from claim and match those
+    """
     det_labels, del_labels = [], []
     det_ev, del_ev = {}, {}
     for claim in (claims or []):
-        text = claim.get("text","")
-        aspect = claim.get("aspect","")
-        polarity = claim.get("polarity","neutral")
+        text = claim.get("text", "")
+        aspect = claim.get("aspect", "")
+        polarity = claim.get("polarity", "neutral")
         targets = []
-        if polarity in ("negative","mixed"): targets.append(("det", allowed_detractors, det_labels, det_ev))
-        if polarity in ("positive","mixed"): targets.append(("del", allowed_delighters, del_labels, del_ev))
+        if polarity in ("negative", "mixed"):
+            targets.append(("det", allowed_detractors, det_labels, det_ev))
+        if polarity in ("positive", "mixed"):
+            targets.append(("del", allowed_delighters, del_labels, del_ev))
         if polarity == "neutral":
             targets.append(("det", allowed_detractors, det_labels, det_ev))
             targets.append(("del", allowed_delighters, del_labels, del_ev))
         for side, catalog, labels, ev in targets:
-            label = match_label(aspect, catalog, aliases=aliases) or match_label(text[:60], catalog, aliases=aliases, cutoff=0.65)
+            # Strategy 1: Match aspect label directly
+            label = match_label(aspect, catalog, aliases=aliases)
+            # Strategy 2: Match claim text (first 60 chars)
+            if not label:
+                label = match_label(text[:60], catalog, aliases=aliases, cutoff=0.65)
+            # Strategy 3: Extract 2-3 word chunks from claim text and try each
+            if not label and len(text.split()) >= 3:
+                words = [w for w in text.lower().split() if w not in _STOP_TOKENS and len(w) > 2]
+                # Try consecutive 2-3 word chunks
+                for chunk_size in (3, 2):
+                    if label:
+                        break
+                    for i in range(len(words) - chunk_size + 1):
+                        chunk = " ".join(words[i:i + chunk_size])
+                        label = match_label(chunk, catalog, aliases=aliases, cutoff=0.68)
+                        if label:
+                            break
             if label and label not in labels:
-                labels.append(label); ev[label] = [text[:120]]
+                labels.append(label)
+                ev[label] = [text[:120]]
             elif label and label in ev and len(ev[label]) < 2:
                 ev[label].append(text[:120])
     return det_labels[:10], del_labels[:10], det_ev, del_ev
@@ -995,11 +1303,37 @@ def retry_zero_tag_reviews(
             continue
 
         rating = item.get("rating")
-        needs_det, needs_del = gate_polarity(rating, item.get("review", ""))
+        review_text = item.get("review", "")
+        dets_found = result.get("dets") or []
+        dels_found = result.get("dels") or []
 
-        # Check if we missed tags on an expected side
-        missed_det = needs_det and not result.get("dets")
-        missed_del = needs_del and not result.get("dels")
+        # Smart retry criteria: retry when rating SUGGESTS tags should exist
+        # but don't retry just because gate_polarity says both sides are eligible
+        try:
+            r = float(rating)
+        except (TypeError, ValueError):
+            r = 3.0  # unknown rating → neutral
+
+        missed_det = False
+        missed_del = False
+
+        # Definitely retry: zero tags on BOTH sides (always suspicious)
+        if not dets_found and not dels_found:
+            missed_det = True
+            missed_del = True
+        else:
+            # Rating-based: 1-3★ with zero detractors is likely a miss
+            if r <= 3 and not dets_found:
+                missed_det = True
+            # Rating-based: 3-5★ with zero delighters is likely a miss
+            if r >= 3 and not dels_found:
+                missed_del = True
+            # Text signal override: explicit negative words but no detractors
+            if not dets_found and _EXPLICIT_NEGATIVE.search(review_text):
+                missed_det = True
+            # Text signal override: explicit positive words but no delighters
+            if not dels_found and _EXPLICIT_POSITIVE.search(review_text):
+                missed_del = True
 
         if not (missed_det or missed_del):
             continue
@@ -1202,6 +1536,7 @@ def audit_tag_distribution(
     results: Dict[int, Dict[str, Any]],
     *,
     min_occurrences: int = 2,
+    items: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Audit the distribution of tags across all processed reviews.
 
@@ -1209,6 +1544,8 @@ def audit_tag_distribution(
     - singleton_labels: labels that appear exactly once (potential hallucinations)
     - dominant_labels: labels on >50% of reviews (might be too broad)
     - zero_evidence_tags: tags that were assigned without evidence
+    - shared_evidence_labels: labels that reuse identical evidence strings (lazy AI)
+    - polarity_mismatches: reviews where star rating contradicts tag polarity
     """
     if not results:
         return {}
@@ -1218,20 +1555,52 @@ def audit_tag_distribution(
     no_evidence: List[str] = []
     total = len(results)
 
+    # Evidence reuse tracking
+    evidence_to_labels: Dict[str, List[str]] = {}
+    # Polarity mismatch tracking
+    polarity_mismatches: List[Dict[str, Any]] = []
+    items_by_idx = {int(it["idx"]): it for it in (items or [])} if items else {}
+
     for idx, result in results.items():
-        for label in (result.get("dets") or []):
+        dets = result.get("dets") or []
+        dels = result.get("dels") or []
+        for label in dets:
             det_counts[label] = det_counts.get(label, 0) + 1
             if label not in (result.get("ev_det") or {}):
                 no_evidence.append(label)
-        for label in (result.get("dels") or []):
+            for ev in (result.get("ev_det") or {}).get(label, []):
+                ev_key = ev.strip().lower()[:60]
+                if ev_key and len(ev_key) >= 10:
+                    evidence_to_labels.setdefault(ev_key, []).append(label)
+        for label in dels:
             del_counts[label] = del_counts.get(label, 0) + 1
             if label not in (result.get("ev_del") or {}):
                 no_evidence.append(label)
+            for ev in (result.get("ev_del") or {}).get(label, []):
+                ev_key = ev.strip().lower()[:60]
+                if ev_key and len(ev_key) >= 10:
+                    evidence_to_labels.setdefault(ev_key, []).append(label)
+
+        # Polarity mismatch: 5★ with only detractors, or 1-2★ with only delighters
+        item = items_by_idx.get(int(idx))
+        if item:
+            try:
+                r = float(item.get("rating", 3))
+                if r >= 5 and dets and not dels:
+                    polarity_mismatches.append({"idx": idx, "rating": r, "issue": "5star_only_detractors", "dets": dets[:3]})
+                elif r <= 2 and dels and not dets:
+                    polarity_mismatches.append({"idx": idx, "rating": r, "issue": "low_star_only_delighters", "dels": dels[:3]})
+            except (TypeError, ValueError):
+                pass
 
     singleton_det = [l for l, c in det_counts.items() if c < min_occurrences]
     singleton_del = [l for l, c in del_counts.items() if c < min_occurrences]
     dominant_det = [l for l, c in det_counts.items() if c > total * 0.5]
     dominant_del = [l for l, c in del_counts.items() if c > total * 0.5]
+
+    # Evidence reuse: same evidence string used for 3+ different labels = suspicious
+    shared_evidence = {ev: labels for ev, labels in evidence_to_labels.items()
+                       if len(set(labels)) >= 3}
 
     return {
         "total_reviews": total,
@@ -1242,6 +1611,8 @@ def audit_tag_distribution(
         "dominant_detractors": dominant_det,
         "dominant_delighters": dominant_del,
         "zero_evidence_tags": list(set(no_evidence)),
+        "shared_evidence_labels": {ev: list(set(labels)) for ev, labels in shared_evidence.items()},
+        "polarity_mismatches": polarity_mismatches[:20],
     }
 
 
@@ -1255,21 +1626,30 @@ class LabelTracker:
     
     Flags labels that are hitting too often (>40% = too broad) or
     never hitting (0 in first N batches = possibly irrelevant).
+    
+    Can generate adaptive prompt hints for subsequent batches to
+    steer the AI away from over-tagging dominant labels.
     """
     def __init__(self, allowed_detractors, allowed_delighters):
         self.det_counts = {l: 0 for l in allowed_detractors}
         self.del_counts = {l: 0 for l in allowed_delighters}
         self.total_reviews = 0
+        self.zero_tag_reviews = 0  # Reviews with no tags at all
         self.warnings = []
+        self._dominant_warned = set()  # Labels already warned about
     
     def record_batch(self, batch_results):
         """Record results from one batch."""
         for idx, result in (batch_results or {}).items():
             self.total_reviews += 1
-            for label in (result.get("dets") or []):
+            dets = result.get("dets") or []
+            dels = result.get("dels") or []
+            if not dets and not dels:
+                self.zero_tag_reviews += 1
+            for label in dets:
                 if label in self.det_counts:
                     self.det_counts[label] += 1
-            for label in (result.get("dels") or []):
+            for label in dels:
                 if label in self.del_counts:
                     self.del_counts[label] += 1
     
@@ -1295,7 +1675,33 @@ class LabelTracker:
             elif count == 0 and self.total_reviews >= 20:
                 alerts.append({"label": label, "side": "delighter", "issue": "zero_hits",
                                "pct": 0, "count": 0})
+        # Alert if zero-tag rate is too high
+        if self.total_reviews >= 10 and self.zero_tag_reviews / n > 0.5:
+            alerts.append({"label": "(overall)", "side": "both", "issue": "high_zero_rate",
+                           "pct": round(self.zero_tag_reviews / n * 100, 1), "count": self.zero_tag_reviews})
         return alerts
+
+    def get_prompt_hints(self) -> str:
+        """Generate adaptive hints for subsequent batch prompts.
+        
+        When a label is hitting >50% of reviews, tell the AI to be more
+        selective about it. When zero-tag rate is high, tell it to be more generous.
+        Returns empty string if no adjustments needed.
+        """
+        if self.total_reviews < 15:
+            return ""
+        n = max(self.total_reviews, 1)
+        hints = []
+        for label, count in {**self.det_counts, **self.del_counts}.items():
+            pct = count / n
+            if pct > 0.50 and label not in self._dominant_warned:
+                hints.append(f"- '{label}' is appearing in {pct:.0%} of reviews. Only tag it when evidence is strong and specific.")
+                self._dominant_warned.add(label)
+        if self.zero_tag_reviews / n > 0.4:
+            hints.append("- Many reviews are returning zero tags. Be more generous — look for subtle signals and hedged language.")
+        if not hints:
+            return ""
+        return "\n═══ MID-RUN ADJUSTMENTS ═══\n" + "\n".join(hints)
 
 
 # ---------------------------------------------------------------------------
