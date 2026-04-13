@@ -111,19 +111,26 @@ class SymptomResult:
 
 _MIXED_SIGNAL = re.compile(
     r"\b(but|however|although|except|yet|while|wish|if only|"
-    r"on the other hand|that said|pros and cons)\b",
+    r"on the other hand|that said|pros and cons|"
+    r"only complaint|only (issue|problem|downside)|"
+    r"other than that|aside from|apart from|"
+    r"would be (better|nice|great) if|my only)\b",
     re.IGNORECASE,
 )
 
 _EXPLICIT_NEGATIVE = re.compile(
     r"\b(broke|broken|fail|defect|issue|problem|stopped|won't|doesn't|"
-    r"difficult|terrible|awful|hate|disappointed|returned|returning)\b",
+    r"difficult|terrible|awful|hate|disappointed|returned|returning|"
+    r"worst|horrible|useless|waste|junk|garbage|regret|refund|"
+    r"burned|melted|smoke|smoking|shocked|dangerous)\b",
     re.IGNORECASE,
 )
 
 _EXPLICIT_POSITIVE = re.compile(
     r"\b(love|perfect|amazing|excellent|great|easy|recommend|best|"
-    r"happy|satisfied|fantastic|wonderful|awesome)\b",
+    r"happy|satisfied|fantastic|wonderful|awesome|"
+    r"impressed|obsessed|game.?changer|holy grail|worth every|"
+    r"smooth|silky|shiny|beautiful|gorgeous|salon)\b",
     re.IGNORECASE,
 )
 
@@ -260,13 +267,26 @@ def match_label(
     if m:
         return m[0]
 
-    # 4. Substring
+    # 5. Substring containment (bidirectional)
     raw_lower = raw_s.lower()
     for label in allowed:
         if raw_lower in label.lower() or label.lower() in raw_lower:
             return label
 
-    # 5. Stemmed token overlap (≥55%)
+    # 6. Word-boundary prefix/suffix: "Hair Damage Issues" → "Hair Damage"
+    raw_words = [w for w in raw_lower.split() if w not in _STOP_TOKENS]
+    if len(raw_words) >= 2:
+        for label in allowed:
+            label_words = [w.lower() for w in label.split() if w.lower() not in _STOP_TOKENS]
+            if len(label_words) >= 2:
+                # Check if all label words appear in raw in order (prefix match)
+                if all(lw in raw_words for lw in label_words):
+                    return label
+                # Check if all raw words appear in label in order (suffix match)
+                if all(rw in label_words for rw in raw_words):
+                    return label
+
+    # 7. Stemmed token overlap (≥55%)
     if raw_stems and len(raw_stems) >= 2:
         best_score, best_label = 0.0, None
         for label in allowed:
@@ -299,7 +319,13 @@ def validate_evidence(
     review_text: str,
     max_chars: int = 120,
 ) -> List[str]:
-    """Validate evidence with negation awareness and minimum quality checks."""
+    """Validate evidence with negation awareness and minimum quality checks.
+    
+    Checks both preceding and following context for negation patterns to catch:
+    - "it didn't damage my hair" (negation before)
+    - "damage my hair? not at all" (negation after)
+    - "I was worried about damage but no issues" (negation in surrounding window)
+    """
     if not evidence_list or not review_text:
         return []
     rv_norm = re.sub(r"\s+", " ", review_text.lower())
@@ -312,12 +338,20 @@ def validate_evidence(
         e_norm = re.sub(r"\s+", " ", e.lower())
         if e_norm not in rv_norm:
             continue
-        # Negation check: reject short evidence preceded by negation
+        # Negation check: reject short evidence preceded OR followed by negation
         idx = rv_norm.find(e_norm)
-        if idx > 0 and len(e_norm.split()) <= 4:
-            preceding = rv_norm[max(0, idx - 30):idx]
+        if idx >= 0 and len(e_norm.split()) <= 4:
+            # Check 40 chars before for negation
+            preceding = rv_norm[max(0, idx - 40):idx]
             if _NEG_CONTEXT.search(preceding):
                 continue
+            # Check 30 chars after for negation/dismissal patterns
+            end_idx = idx + len(e_norm)
+            following = rv_norm[end_idx:end_idx + 30]
+            if re.search(r"\b(not|no|never|at all|whatsoever|zero)\b", following):
+                # But only reject if there's no double-negation reset
+                if not re.search(r"\b(but|however|actually|still)\b", following):
+                    continue
         out.append(e)
     return out[:2]
 
@@ -327,8 +361,8 @@ def validate_evidence(
 # ---------------------------------------------------------------------------
 
 _HEDGING = re.compile(r"\b(kind of|sort of|somewhat|slightly|a (little|bit)|maybe|perhaps|not (too|that) bad)\b", re.I)
-_EMPHASIS = re.compile(r"\b(very|extremely|incredibly|absolutely|completely|totally|SO|really really|worst|best ever|terrible|horrible)\b", re.I)
-_SEVERITY_HIGH = re.compile(r"\b(explod|fire|burn|shock|injur|hospital|danger|hazard|recall|broke.*first|DOA|caught fire|melted|smoking)\b", re.I)
+_EMPHASIS = re.compile(r"\b(very|extremely|incredibly|absolutely|completely|totally|SO|really really|worst|best ever|terrible|horrible|love|hate|perfect|amazing)\b", re.I)
+_SEVERITY_HIGH = re.compile(r"\b(explod|fire|burn|shock|injur|hospital|danger|hazard|recall|broke.*first|DOA|caught fire|melted|smoking|sparks?|electr)\b", re.I)
 
 def _score_tag_confidence(
     label: str,
@@ -339,7 +373,7 @@ def _score_tag_confidence(
     side: str,
     catalog_size: int,
 ) -> float:
-    """Confidence scoring with hedging downgrade, emphasis boost, severity awareness."""
+    """Confidence scoring with hedging downgrade, emphasis boost, severity and repetition awareness."""
     score = 0.5
     ev_text = " ".join(evidence) if evidence else ""
 
@@ -350,6 +384,16 @@ def _score_tag_confidence(
             score += 0.25 * min(1.0, matched / max(len(evidence), 1))
         avg_len = sum(len(e) for e in evidence) / max(len(evidence), 1)
         score += min(0.1, avg_len / 200)
+        # Repetition boost: evidence concept mentioned multiple times = stronger signal
+        for e in evidence:
+            e_lower = e.lower()
+            if len(e_lower) >= 8:
+                # Count approximate mentions of the core concept
+                core_words = [w for w in e_lower.split() if len(w) > 3 and w not in _STOP_TOKENS]
+                if core_words:
+                    repeat_count = sum(1 for w in core_words if rv_lower.count(w) > 1)
+                    if repeat_count >= 2:
+                        score += 0.06  # Repeated complaint/praise = higher confidence
     else:
         score -= 0.15
 
@@ -425,17 +469,18 @@ STEP 2: For each claim, check if it maps to a catalog label. Only emit tags with
 6. NO INFERENCE: Only tag what is explicitly stated or clearly described.
 
 ═══ ACCURACY RULES ═══
-7. SARCASM: "Great, another broken product" is NEGATIVE. Detect contradiction between words and context.
-8. TEMPORAL: "Loved at first, now broken" — tag based on FINAL state, not initial impression.
-9. COMPARATIVES: "Better than my old one" IS about this product. But only tag the product under review.
-10. HEDGING: "Kind of loud" — still tag, but use specific labels over broad universals.
-11. SEVERITY: Primary complaints (detailed, repeated) and passing mentions (brief) both get tagged.
-12. MULTI-PRODUCT: Only tag symptoms about THIS product. Ignore claims about other products.
-13. UNIVERSAL DISCIPLINE: Overall Satisfaction/Dissatisfaction are LAST RESORT. If 2+ specific labels on one side, DROP the universal.
-14. CONTRADICTIONS: Don't assign Quiet AND Loud unless review discusses both in different contexts.
-15. ZERO IS VALID: No tags better than forced matches.
-16. UNLISTED: Add strong missing themes to unlisted arrays. Be conservative.
-17. ALL IDS: Return a result for EVERY review id.
+7. NEGATION: "didn't damage my hair" and "no issues with noise" are POSITIVE signals, NOT detractors. "it's not loud" means quiet. Read the FULL clause before deciding polarity.
+8. SARCASM: "Great, another broken product" is NEGATIVE. Mismatch between positive words and negative context. Rating is a strong signal — 1★ with "great" is sarcastic.
+9. TEMPORAL: "Loved at first, now broken" — tag based on FINAL state. "worked for 2 weeks then died" = detractor.
+10. COMPARATIVES: "Better than my old one" IS about this product. But only tag the product under review.
+11. HEDGING: "Kind of loud" — still tag, but use specific labels over broad universals.
+12. SEVERITY: Primary complaints (detailed, repeated) and passing mentions (brief) both get tagged.
+13. MULTI-PRODUCT: Only tag symptoms about THIS product. Ignore claims about other products.
+14. UNIVERSAL DISCIPLINE: Overall Satisfaction/Dissatisfaction are LAST RESORT. If 2+ specific labels on one side, DROP the universal.
+15. CONTRADICTIONS: Don't assign Quiet AND Loud unless review discusses both in different contexts.
+16. ZERO IS VALID: No tags better than forced matches.
+17. UNLISTED: Add strong missing themes to unlisted arrays. Be conservative.
+18. ALL IDS: Return a result for EVERY review id.
 
 ═══ OUTPUT (strict JSON) ═══
 {{"items":[{{
@@ -670,13 +715,22 @@ def tag_review_batch(
 
 _UNIVERSAL_LABELS = {"Overall Satisfaction", "Overall Dissatisfaction"}
 _CONTRADICTION_PAIRS = [
-    ({"Quiet","Quiet Operation","Low Noise"}, {"Loud","Loud Noise","Noisy","Noisy Motor"}),
-    ({"Easy To Use","Easy To Operate"}, {"Difficult To Use","Hard To Use","Confusing"}),
-    ({"Fast Drying","Quick Results"}, {"Slow Drying","Takes Too Long"}),
-    ({"Lightweight","Light Weight"}, {"Heavy","Too Heavy"}),
+    ({"Quiet","Quiet Operation","Low Noise"}, {"Loud","Loud Noise","Noisy","Noisy Motor","Loud Motor"}),
+    ({"Easy To Use","Easy To Operate","User Friendly"}, {"Difficult To Use","Hard To Use","Confusing","Confusing Controls"}),
+    ({"Fast Drying","Quick Results","Fast Results"}, {"Slow Drying","Takes Too Long","Slow Performance"}),
+    ({"Lightweight","Light Weight","Light"}, {"Heavy","Too Heavy","Bulky"}),
     ({"Easy To Clean","Easy Cleanup"}, {"Hard To Clean","Difficult To Clean"}),
-    ({"Long Battery Life","Good Battery"}, {"Battery Dies Fast","Short Battery Life"}),
-    ({"Durable","Well Built"}, {"Broke Quickly","Fragile","Poor Build Quality"}),
+    ({"Long Battery Life","Good Battery","Battery Life"}, {"Battery Dies Fast","Short Battery Life","Poor Battery"}),
+    ({"Durable","Well Built","Sturdy","Build Quality"}, {"Broke Quickly","Fragile","Poor Build Quality","Cheap Materials"}),
+    # Hair care specific
+    ({"Smooth Hair","Smoothing","Reduces Frizz","Frizz Control"}, {"Frizzy Hair","Causes Frizz","More Frizz"}),
+    ({"Adds Shine","Shiny Hair","Glossy"}, {"Dull Hair","No Shine","Leaves Hair Dull"}),
+    ({"No Hair Damage","Gentle On Hair","Hair Protection"}, {"Hair Damage","Damages Hair","Burns Hair","Dries Out Hair"}),
+    ({"Cool Temperature","Temperature Control"}, {"Too Hot","Overheating","Burns Scalp","Gets Too Hot"}),
+    ({"Compact","Portable","Travel Friendly"}, {"Too Large","Too Big","Not Portable"}),
+    ({"Good Value","Worth The Price","Great Value"}, {"Overpriced","Not Worth The Price","Too Expensive"}),
+    ({"Long Cord","Cord Length"}, {"Short Cord","Cord Too Short"}),
+    ({"Multiple Attachments","Good Accessories"}, {"Missing Attachments","Needs More Attachments"}),
 ]
 
 def _enforce_universal_discipline(labels, ev_map):
@@ -695,22 +749,31 @@ def _check_contradictions_side(labels):
             labels = [l for l in labels if l not in (has_b if len(has_a) >= len(has_b) else has_a)]
     return labels
 
-def _evidence_coherent_with_label(label: str, evidence: List[str]) -> bool:
+def _evidence_coherent_with_label(label: str, evidence: List[str], review_text: str = "") -> bool:
     """Check if evidence text semantically relates to the label.
-    Catches cases where AI picks a label and then grabs unrelated evidence."""
+    Catches cases where AI picks a label and then grabs unrelated evidence.
+    
+    Uses three signals:
+    1. Token overlap between label stems and evidence stems
+    2. Evidence contains a keyword semantically related to the label's domain
+    3. Long evidence (40+ chars) that at least shares one content word with label
+    """
     if not evidence or not label:
         return True  # Give benefit of doubt if no evidence
-    label_tokens = _tokenize_label(label)
+    label_tokens = _tokenize_stemmed(label)
     if not label_tokens:
         return True
     ev_text = " ".join(e.lower() for e in evidence)
     ev_tokens = {_stem(w) for w in re.findall(r"[a-z]+", ev_text) if len(w) > 2}
-    # At least one label token should appear in evidence OR evidence should be 20+ chars
+    # Direct token overlap — strongest signal
     overlap = label_tokens & ev_tokens
     if overlap:
         return True
-    if any(len(e) >= 20 for e in evidence):
-        return True  # Long evidence is probably contextual
+    # Long evidence must share at least one raw word (not stemmed) with the label
+    label_words = {w.lower() for w in re.findall(r"[a-z]+", label.lower()) if len(w) > 2 and w.lower() not in _STOP_TOKENS}
+    ev_words = {w.lower() for w in re.findall(r"[a-z]+", ev_text) if len(w) > 2}
+    if any(len(e) >= 40 for e in evidence) and (label_words & ev_words):
+        return True
     return False
 
 
@@ -720,7 +783,7 @@ def _standardize_unlisted(raw_list: List[str]) -> List[str]:
     seen_stems = []
     out = []
     for label in raw_list:
-        stems = _tokenize_label(label)
+        stems = _tokenize_stemmed(label)
         if not stems:
             continue
         # Check overlap with already-seen labels
@@ -761,7 +824,7 @@ def _extract_side_with_confidence(
         if not validated:
             validated = [str(e).strip()[:max_ev_chars] for e in raw_evs if str(e).strip()][:1]
         # Semantic coherence: does evidence actually relate to the label?
-        if not _evidence_coherent_with_label(lbl, validated):
+        if not _evidence_coherent_with_label(lbl, validated, review_text=review_text):
             continue
         labels.append(lbl)
         ev_map[lbl] = validated[:2]
@@ -771,14 +834,14 @@ def _extract_side_with_confidence(
     labels, ev_map = _enforce_universal_discipline(labels, ev_map)
     labels = _check_contradictions_side(labels)
     # Filter by confidence threshold — drop very low-confidence tags
-    if len(labels) > 3:
+    if len(labels) >= 2:
         scored = []
         for lbl in labels:
             c = _score_tag_confidence(lbl, ev_map.get(lbl, []), review_text, rating,
                                        side=side, catalog_size=len(allowed))
             scored.append((lbl, c))
-        # Keep tags above 0.3 confidence, or top 3 if all are low
-        above_threshold = [(l, c) for l, c in scored if c >= 0.3]
+        # Keep tags above 0.25 confidence, or top 3 if all are low
+        above_threshold = [(l, c) for l, c in scored if c >= 0.25]
         if above_threshold:
             labels = [l for l, c in above_threshold]
         else:
@@ -873,18 +936,27 @@ def _default_json_load(raw: str) -> Dict[str, Any]:
 
 _RETRY_SYSTEM_PROMPT = """You are a consumer product review analyst. You are re-examining a review that an initial pass returned zero symptom tags for.
 
-Read the review carefully clause by clause. Extract EVERY explicit claim about the product — positive or negative — and quote the exact text.
+Read the review CLAUSE BY CLAUSE. For each clause:
+1. Identify the claim being made about the product.
+2. Determine polarity: is it positive, negative, or neutral? Watch for NEGATION — "didn't break" is positive, "no issues" is positive, "not loud" is a delighter.
+3. Check if the claim matches a catalog label.
+4. Quote the exact text as evidence.
 
 {catalog_section}
 
 Rules:
 1. EVIDENCE REQUIRED: Every tag must have a verbatim quote from the review.
 2. EXACT LABELS: Use catalog labels exactly as shown.
-3. Be more generous than usual — this review was missed on first pass. Look for subtle or implicit signals.
-4. If truly nothing applies, return empty arrays.
+3. NEGATION AWARENESS: "it doesn't damage hair" is NOT a Hair Damage detractor. "no noise" is NOT a Noise detractor. Read carefully.
+4. Be more generous than usual — this review was missed on first pass. Look for:
+   - Implied sentiments: "had to return it" implies defect/disappointment
+   - Hedged language: "it's okay I guess" = mild detractor
+   - Comparative claims: "better than my old one" = delighter about this product
+5. If truly nothing applies, return empty arrays.
 
 Output strict JSON:
-{{"detractors":[{{"label":"<exact>","evidence":["<verbatim>"]}}],"delighters":[{{"label":"<exact>","evidence":["<verbatim>"]}}]}}"""
+{{"detractors":[{{"label":"<exact>","evidence":["<verbatim>"]}}],"delighters":[{{"label":"<exact>","evidence":["<verbatim>"]}}],"safety":"<Safe|Minor Concern|Safety Issue|Not Mentioned>","reliability":"<Reliable|Intermittent Issue|Failure|Not Mentioned>"}}"
+"""
 
 
 def retry_zero_tag_reviews(
@@ -985,8 +1057,16 @@ def retry_zero_tag_reviews(
                     updated["ev_del"] = new_ev_del
                     retried[idx] = updated
 
-        except Exception:
-            pass  # Retry is best-effort
+            # Merge safety/reliability from retry if original was empty
+            for field, enum_str in [("safety", SAFETY_ENUM), ("reliability", RELIABILITY_ENUM)]:
+                retry_val = _validate_enum(data.get(field), enum_str)
+                if retry_val not in ("Not Mentioned", "Unknown") and retried[idx].get(field) in ("Not Mentioned", "Unknown", None):
+                    updated = dict(retried[idx])
+                    updated[field] = retry_val
+                    retried[idx] = updated
+
+        except Exception as exc:
+            logger.debug("Retry failed for review %s: %s", idx, exc)
 
     return retried
 
@@ -1297,9 +1377,9 @@ def generate_taxonomy_recommendations(
     for side, dist, allowed in [("detractor", det_dist, allowed_detractors), ("delighter", del_dist, allowed_delighters)]:
         labels_with_counts = [(l, dist.get(l, 0)) for l in allowed if dist.get(l, 0) > 0]
         for i, (l1, c1) in enumerate(labels_with_counts):
-            stems1 = _tokenize_stemmed(l1) if '_tokenize_stemmed' in dir() else set()
+            stems1 = _tokenize_stemmed(l1)
             for l2, c2 in labels_with_counts[i+1:]:
-                stems2 = _tokenize_stemmed(l2) if '_tokenize_stemmed' in dir() else set()
+                stems2 = _tokenize_stemmed(l2)
                 if stems1 and stems2:
                     overlap = len(stems1 & stems2) / max(len(stems1), len(stems2))
                     if overlap >= merge_threshold:
