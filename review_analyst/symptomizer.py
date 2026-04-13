@@ -217,7 +217,7 @@ def match_label(
     raw: str,
     allowed: Sequence[str],
     aliases: Optional[Mapping[str, Sequence[str]]] = None,
-    cutoff: float = 0.82,
+    cutoff: float = 0.72,
 ) -> Optional[str]:
     """Match a raw AI-returned label to the allowed catalog.
 
@@ -274,7 +274,7 @@ def match_label(
             if not label_stems: continue
             overlap = len(raw_stems & label_stems) / max(len(raw_stems), len(label_stems))
             if overlap > best_score: best_score, best_label = overlap, label
-        if best_score >= 0.70 and best_label:  # Raised from 0.55 to reduce false matches
+        if best_score >= 0.55 and best_label:
             return best_label
 
     return None
@@ -306,8 +306,8 @@ def validate_evidence(
     out = []
     for e in evidence_list:
         e = str(e).strip()[:max_chars]
-        # Minimum quality: 4+ chars
-        if len(e) < 4:
+        # Minimum quality: 6+ chars, 2+ words
+        if len(e) < 6 or len(e.split()) < 2:
             continue
         e_norm = re.sub(r"\s+", " ", e.lower())
         if e_norm not in rv_norm:
@@ -416,17 +416,26 @@ For each review, work in TWO mental steps:
 STEP 1: Read clause by clause. Extract every explicit claim about the product — quote verbatim.
 STEP 2: For each claim, check if it maps to a catalog label. Only emit tags with evidence.
 
-═══ RULES ═══
-1. READ FIRST: Read the full review. Understand the overall sentiment before tagging.
-2. EXACT LABELS ONLY: Use catalog labels exactly as written. No paraphrasing.
-3. EVIDENCE REQUIRED: Every tag needs 1-2 verbatim quotes (4+ chars). No evidence = no tag.
-4. HIGH RECALL: Tag every applicable symptom. Long reviews can have many tags.
+═══ RULES (apply in order) ═══
+1. READ FIRST: Read the entire review before tagging. Understand the overall sentiment arc.
+2. EXACT LABELS: Use catalog label text exactly. No paraphrasing.
+3. EVIDENCE REQUIRED: Every tag needs 1-2 verbatim quotes (6+ chars, 2+ words). No evidence = no tag.
+4. HIGH RECALL: Capture every applicable symptom. Long reviews can map to many labels.
 5. POLARITY GATE: Respect needs_detractors / needs_delighters flags.
-6. ONLY THIS PRODUCT: Only tag the product under review. Ignore claims about other products, comparisons to old models, or gifts bought for others.
-7. PREFER SPECIFIC: Use the most specific matching label. Drop broad labels (Overall Satisfaction/Dissatisfaction) when 2+ specific labels on the same side already cover the sentiment.
-8. CONTRADICTIONS: Don't assign opposite labels (e.g. Quiet + Loud) unless the review explicitly discusses both in different contexts.
-9. ZERO IS VALID: No tags is better than forced matches. Do not infer from absence.
-10. ALL IDS: Return a result for EVERY review id, even if empty. Add strong unlisted themes to unlisted arrays (Title Case, 2-5 words).
+6. NO INFERENCE: Only tag what is explicitly stated or clearly described.
+
+═══ ACCURACY RULES ═══
+7. SARCASM: "Great, another broken product" is NEGATIVE. Detect contradiction between words and context.
+8. TEMPORAL: "Loved at first, now broken" — tag based on FINAL state, not initial impression.
+9. COMPARATIVES: "Better than my old one" IS about this product. But only tag the product under review.
+10. HEDGING: "Kind of loud" — still tag, but use specific labels over broad universals.
+11. SEVERITY: Primary complaints (detailed, repeated) and passing mentions (brief) both get tagged.
+12. MULTI-PRODUCT: Only tag symptoms about THIS product. Ignore claims about other products.
+13. UNIVERSAL DISCIPLINE: Overall Satisfaction/Dissatisfaction are LAST RESORT. If 2+ specific labels on one side, DROP the universal.
+14. CONTRADICTIONS: Don't assign Quiet AND Loud unless review discusses both in different contexts.
+15. ZERO IS VALID: No tags better than forced matches.
+16. UNLISTED: Add strong missing themes to unlisted arrays. Be conservative.
+17. ALL IDS: Return a result for EVERY review id.
 
 ═══ OUTPUT (strict JSON) ═══
 {{"items":[{{
@@ -434,7 +443,10 @@ STEP 2: For each claim, check if it maps to a catalog label. Only emit tags with
   "detractors":[{{"label":"<exact catalog label>","evidence":["<verbatim>"]}}],
   "delighters":[{{"label":"<exact catalog label>","evidence":["<verbatim>"]}}],
   "unlisted_detractors":["<2-5 word theme>"],
-  "unlisted_delighters":["<2-5 word theme>"]
+  "unlisted_delighters":["<2-5 word theme>"],
+  "safety":"<{SAFETY_ENUM}>",
+  "reliability":"<{RELIABILITY_ENUM}>",
+  "sessions":"<{SESSIONS_ENUM}>"
 }}]}}"""
 
 
@@ -748,6 +760,9 @@ def _extract_side_with_confidence(
         validated = validate_evidence(raw_evs, review_text, max_ev_chars)
         if not validated:
             validated = [str(e).strip()[:max_ev_chars] for e in raw_evs if str(e).strip()][:1]
+        # Semantic coherence: does evidence actually relate to the label?
+        if not _evidence_coherent_with_label(lbl, validated):
+            continue
         labels.append(lbl)
         ev_map[lbl] = validated[:2]
         if len(labels) >= 10: break
@@ -755,7 +770,21 @@ def _extract_side_with_confidence(
     # Post-extraction intelligence
     labels, ev_map = _enforce_universal_discipline(labels, ev_map)
     labels = _check_contradictions_side(labels)
-
+    # Filter by confidence threshold — drop very low-confidence tags
+    if len(labels) > 3:
+        scored = []
+        for lbl in labels:
+            c = _score_tag_confidence(lbl, ev_map.get(lbl, []), review_text, rating,
+                                       side=side, catalog_size=len(allowed))
+            scored.append((lbl, c))
+        # Keep tags above 0.3 confidence, or top 3 if all are low
+        above_threshold = [(l, c) for l, c in scored if c >= 0.3]
+        if above_threshold:
+            labels = [l for l, c in above_threshold]
+        else:
+            scored.sort(key=lambda x: -x[1])
+            labels = [l for l, c in scored[:3]]
+        ev_map = {k: v for k, v in ev_map.items() if k in labels}
     return labels, ev_map
 
 
@@ -1310,62 +1339,3 @@ def generate_taxonomy_recommendations(
     recommendations.sort(key=lambda r: (priority_order.get(r["priority"], 9), action_order.get(r["action"], 9)))
     
     return recommendations
-
-
-
-# ---------------------------------------------------------------------------
-# Pre-run taxonomy health check
-# ---------------------------------------------------------------------------
-
-_VAGUE_LABELS = {"Overall Satisfaction", "Overall Dissatisfaction", "General Quality",
-                  "Product Quality", "Good Product", "Bad Product", "Other",
-                  "Miscellaneous", "General Issue", "Performance"}
-
-def score_taxonomy_health(detractors, delighters, *, aliases=None):
-    """Score taxonomy quality before running. Returns issues and a health score 0-100.
-    
-    Checks: vague labels, overlapping labels, very short labels, very long labels,
-    imbalanced catalog (many more detractors than delighters or vice versa).
-    """
-    issues = []
-    all_labels = list(detractors or []) + list(delighters or [])
-    
-    # 1. Vague labels
-    for label in all_labels:
-        if label in _VAGUE_LABELS:
-            issues.append({"label": label, "issue": "vague", "severity": "medium",
-                           "fix": f"Replace with a more specific label that describes the exact symptom"})
-    
-    # 2. Very short labels (< 3 words, might be ambiguous)
-    for label in all_labels:
-        if len(label.split()) < 2:
-            issues.append({"label": label, "issue": "short", "severity": "low",
-                           "fix": f"Consider expanding to be more specific (e.g., '{label} Quality' or '{label} Issues')"})
-    
-    # 3. Overlapping detractor/delighter pairs (stemmed overlap > 60%)
-    for det in (detractors or []):
-        det_stems = _tokenize_label(det)
-        for dl in (delighters or []):
-            dl_stems = _tokenize_label(dl)
-            if det_stems and dl_stems:
-                overlap = len(det_stems & dl_stems) / max(len(det_stems), len(dl_stems))
-                if overlap > 0.60:
-                    issues.append({"label": f"{det} ↔ {dl}", "issue": "overlap", "severity": "high",
-                                   "fix": "These may confuse the AI — use more distinct wording"})
-    
-    # 4. Catalog balance
-    n_det = len(detractors or [])
-    n_del = len(delighters or [])
-    if n_det > 0 and n_del > 0:
-        ratio = max(n_det, n_del) / min(n_det, n_del)
-        if ratio > 2.5:
-            heavier = "detractors" if n_det > n_del else "delighters"
-            issues.append({"label": f"{n_det} det / {n_del} del", "issue": "imbalanced", "severity": "medium",
-                           "fix": f"Consider adding more {'delighters' if heavier == 'detractors' else 'detractors'} for balance"})
-    
-    # Health score: 100 minus penalties
-    penalties = sum({"high": 12, "medium": 6, "low": 2}.get(i["severity"], 0) for i in issues)
-    health = max(0, min(100, 100 - penalties))
-    
-    return {"health_score": health, "issues": issues, "label_count": len(all_labels),
-            "detractor_count": n_det, "delighter_count": n_del}
