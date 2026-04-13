@@ -6080,6 +6080,9 @@ def _call_symptomizer_batch(*, client, items, allowed_delighters, allowed_detrac
     # ── v3 staged pipeline (extract → classify → verify) ────────────────
     if _HAS_SYMPTOMIZER_V3 and st.session_state.get("sym_staged_pipeline"):
         from review_analyst.symptomizer import extract_claims, map_claims_to_taxonomy
+        _SAFETY_KW = re.compile(r"\b(burn|fire|shock|electr|hazard|danger|injur|hospital|smoke|smoking|melted|caught fire|sparks?)\b", re.I)
+        _RELIABILITY_KW_NEG = re.compile(r"\b(broke|broken|fail|died|stopped|malfunction|defective|DOA|dead on arrival)\b", re.I)
+        _RELIABILITY_KW_MIX = re.compile(r"\b(intermittent|sometimes|occasional|inconsistent|hit.or.miss)\b", re.I)
         out_staged = {}
         for it in items:
             idx = int(it["idx"])
@@ -6103,8 +6106,18 @@ def _call_symptomizer_batch(*, client, items, allowed_delighters, allowed_detrac
                     dels = list(refined.get("dels", []))[:10]
                     ev_det = dict(refined.get("ev_det", {}) or {})
                     ev_del = dict(refined.get("ev_del", {}) or {})
+                # Infer safety/reliability/sessions from claims + review text
+                _rt = review_text.lower()
+                safety = "Safety Issue" if _SAFETY_KW.search(_rt) else "Not Mentioned"
+                if safety == "Not Mentioned" and any("safe" in c.get("aspect","").lower() for c in claims):
+                    safety = "Safe"
+                reliability = "Not Mentioned"
+                if _RELIABILITY_KW_NEG.search(_rt): reliability = "Failure"
+                elif _RELIABILITY_KW_MIX.search(_rt): reliability = "Intermittent Issue"
+                elif not dets and dels: reliability = "Reliable"
+                sessions = "Unknown"
                 out_staged[idx] = dict(dels=dels, dets=dets, ev_del=ev_del, ev_det=ev_det,
-                    unl_dels=[], unl_dets=[], safety="Not Mentioned", reliability="Not Mentioned", sessions="Unknown")
+                    unl_dels=[], unl_dets=[], safety=safety, reliability=reliability, sessions=sessions)
             else:
                 out_staged[idx] = dict(dels=[], dets=[], ev_del={}, ev_det={},
                     unl_dels=[], unl_dets=[], safety="Not Mentioned", reliability="Not Mentioned", sessions="Unknown")
@@ -6163,17 +6176,18 @@ sessions    → {SESSIONS_ENUM}
 6. NO INFERENCE: Only tag what is explicitly stated or clearly described.
 
 ═══ ACCURACY RULES ═══
-7. SARCASM: "Great, another broken product" is NEGATIVE. Look for contradiction between literal words and context.
-8. TEMPORAL CONTEXT: "Loved it at first, now it's broken" — tag based on the FINAL state, not initial impressions.
-9. COMPARATIVES: "Better than my old one" IS about this product. "My old one never did this" IS a detractor about this product.
-10. HEDGING: "Kind of loud" = still tag it, but use the most specific label, not a broad universal.
-11. SEVERITY: Distinguish primary complaints (detailed, repeated) from passing mentions (brief, parenthetical). Both get tagged.
-12. MULTI-PRODUCT: Only tag symptoms about the PRODUCT UNDER REVIEW. Ignore claims about other products.
-13. UNIVERSAL DISCIPLINE: Overall Satisfaction / Dissatisfaction are LAST-RESORT labels. If you already tagged 2+ specific labels on one side, DROP the universal.
-14. CONTRADICTIONS: Don't assign Quiet AND Loud unless review explicitly discusses both in different contexts.
-15. ZERO IS VALID: No tags is better than forced matches.
-16. UNLISTED: Add strong missing themes to unlisted arrays (Title Case, 2-5 words). Be conservative.
-17. ALL IDS: Return a result for EVERY review id.
+7. NEGATION: "didn't damage my hair" and "no issues with noise" are POSITIVE signals, NOT detractors. "it's not loud" means quiet. Read the FULL clause before deciding polarity.
+8. SARCASM: "Great, another broken product" is NEGATIVE. Look for contradiction between literal words and context. Rating is a strong signal.
+9. TEMPORAL CONTEXT: "Loved it at first, now it's broken" — tag based on the FINAL state, not initial impressions.
+10. COMPARATIVES: "Better than my old one" IS about this product. "My old one never did this" IS a detractor about this product.
+11. HEDGING: "Kind of loud" = still tag it, but use the most specific label, not a broad universal.
+12. SEVERITY: Distinguish primary complaints (detailed, repeated) from passing mentions (brief, parenthetical). Both get tagged.
+13. MULTI-PRODUCT: Only tag symptoms about the PRODUCT UNDER REVIEW. Ignore claims about other products.
+14. UNIVERSAL DISCIPLINE: Overall Satisfaction / Dissatisfaction are LAST-RESORT labels. If you already tagged 2+ specific labels on one side, DROP the universal.
+15. CONTRADICTIONS: Don't assign Quiet AND Loud unless review explicitly discusses both in different contexts.
+16. ZERO IS VALID: No tags is better than forced matches.
+17. UNLISTED: Add strong missing themes to unlisted arrays (Title Case, 2-5 words). Be conservative.
+18. ALL IDS: Return a result for EVERY review id.
 
 ═══ OUTPUT SCHEMA (strict JSON) ═══
 {{"items":[{{
@@ -8743,6 +8757,8 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
         _active_dels = list(delighters or [])
         _include_universal = bool(st.session_state.get("sym_include_universal_neutral", True))
         _ev_chars = int(st.session_state.get("sym_max_ev_chars", 120))
+        # Initialize adaptive label tracker for mid-run alerts
+        _label_tracker = _v3_LabelTracker(_active_dets, _active_dels) if _HAS_SYMPTOMIZER_V3 else None
         # Speed optimization: use larger batches for short reviews
         if _HAS_SYMPTOMIZER_V3:
             avg_words = rows_to_process.get("review_length_words", pd.Series(50)).fillna(50).mean()
@@ -8848,7 +8864,8 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                 if rc:
                     _log.info("Auto-retry recovered tags for %d review(s)", rc)
                     status.info(f"Auto-retry recovered tags for {rc} review(s)")
-            except Exception: pass
+            except Exception as retry_exc:
+                _log.warning("Auto-retry failed: %s", retry_exc)
         dataset = dict(st.session_state["analysis_dataset"])
         dataset["reviews_df"] = updated_df
         qa_baseline_map = _build_symptom_baseline_map(processed_local)
@@ -9573,4 +9590,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
