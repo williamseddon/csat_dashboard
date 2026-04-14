@@ -1051,7 +1051,7 @@ def _build_completion_token_kwargs(max_tokens):
 def _chat_complete(client, *, model, messages, temperature=0.0, response_format=None,
                    max_tokens=1200, reasoning_effort=None, _max_retries=3):
     if client is None:
-        return ""
+        raise RuntimeError("OpenAI client is not initialized. Check your API key in Settings → OpenAI API Key.")
 
     effort = _normalize_reasoning_effort_for_model(model, reasoning_effort)
     kwargs = dict(model=model, messages=_prepare_messages_for_model(model, messages))
@@ -6752,6 +6752,11 @@ def _ai_build_symptom_list(*, client, product_description, sample_reviews, produ
 
 
 def _ai_generate_product_description(*, client, sample_reviews, existing_description=""):
+    _log.info("Generating product description from %d sample reviews (desc length: %d)", len(sample_reviews or []), len(existing_description or ""))
+    if not client:
+        raise RuntimeError("OpenAI client is None — check API key configuration")
+    if not sample_reviews:
+        raise ValueError("No sample reviews provided for product description generation")
     sys = textwrap.dedent("""
         You are a product marketing and consumer-insights analyst writing a concise product description from customer reviews.
         Use only facts and recurring capabilities clearly supported by the review sample.
@@ -8786,10 +8791,19 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                 product_knowledge = _normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {})
                 sample_reviews = _sample_reviews_for_symptomizer(overall_df, sample_n)
 
-                # Single button — always visible, auto-drafts description when needed
+                # Verify client is initialized before showing generate button
+                _gen_blocked = False
+                if client is None:
+                    st.error("OpenAI client could not be initialized. Verify your API key is correct in Settings → OpenAI API Key.")
+                    _gen_blocked = True
+                elif len(sample_reviews) == 0:
+                    st.warning("No reviews available. Load reviews first, then generate the taxonomy.")
+                    _gen_blocked = True
+
                 generate_label = "🚀 Generate taxonomy" if pdesc.strip() else "🚀 Generate taxonomy from reviews"
-                if st.button(generate_label, type="primary", use_container_width=True, key="sym_generate_taxonomy"):
+                if st.button(generate_label, type="primary", use_container_width=True, key="sym_generate_taxonomy", disabled=_gen_blocked):
                     overlay = _show_thinking("Step 1/2 — Analyzing product and reviews…")
+                    _gen_success = False
                     try:
                         # Step 1: Generate/update product knowledge (also drafts description if empty)
                         desc_result = _ai_generate_product_description(client=client, sample_reviews=sample_reviews, existing_description=pdesc.strip())
@@ -8809,6 +8823,8 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                             sample_reviews=sample_reviews,
                             product_knowledge=pk,
                         )
+                        if not tax_result or (not tax_result.get("delighters") and not tax_result.get("detractors")):
+                            raise ValueError("AI returned empty taxonomy — try adding a product description or increasing sample size")
                         st.session_state["sym_ai_build_result"] = tax_result
                         st.session_state["sym_product_knowledge"] = _normalize_product_knowledge(tax_result.get("product_knowledge") or pk)
                         # Step 2b: Auto-calibrate the new taxonomy
@@ -8829,11 +8845,14 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                             except Exception:
                                 pass
                         st.session_state["sym_wizard_step"] = 2
+                        _gen_success = True
                     except Exception as exc:
                         st.error(f"Taxonomy generation failed: {exc}")
+                        _log.error("Taxonomy generation failed: %s", exc, exc_info=True)
                     finally:
                         overlay.empty()
-                    st.rerun()
+                    if _gen_success:
+                        st.rerun()
 
                 # Show existing product knowledge if available
                 ai_note = st.session_state.get("sym_product_profile_ai_note", "")
