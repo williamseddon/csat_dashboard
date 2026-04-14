@@ -7363,7 +7363,7 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
             if _HAS_SYMPTOMIZER_V3:
                 st.toggle("Enable staged pipeline", value=bool(st.session_state.get("sym_staged_pipeline", False)), key="sym_staged_pipeline", help="Three-stage pipeline: Extract claims → Map to taxonomy → Verify. Higher accuracy but ~2x API calls.")
         st.divider()
-        st.markdown("""<div class='sidebar-scope-card'>
+        st.markdown("""<div class='sidebar-scope-card sidebar-scope-card--feature'>
           <div class='sidebar-scope-title'>Beta feature</div>
           <div class='sidebar-scope-value'>Open the Social Listening demo route when you want to preview the mocked Meltwater-style workflow.</div>
         </div>""", unsafe_allow_html=True)
@@ -9842,16 +9842,16 @@ def _render_lava_lamp_background():
 
 def main():
     _render_lava_lamp_background()
-    st.markdown("""<div class='hero-card' style='margin-bottom:1rem;'>
-      <div style="display:flex;align-items:center;gap:12px;justify-content:space-between;flex-wrap:wrap;">
-        <div style="display:flex;align-items:center;gap:12px;">
-          <div style="width:36px;height:36px;background:#eff6ff;border:1px solid #bfdbfe;color:#2563eb;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;">✦</div>
+    st.markdown("""<div class='app-shell'>
+      <div class='app-header'>
+        <div class='app-brand'>
+          <div class='app-logo'>✨</div>
           <div>
-            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-              <div style="font-size:20px;font-weight:800;letter-spacing:-.03em;color:var(--navy);">StarWalk Review Analyst</div>
-              <span class='beta-chip'>Light theme</span>
+            <div class='app-title-row'>
+              <div class='app-title'>StarWalk Review Analyst</div>
+              <span class='beta-chip'>Beta</span>
             </div>
-            <div style="font-size:12px;color:var(--slate-500);margin-top:2px;">Single-file Streamlit workspace for executive review, deep-dive exploration, Review Prompt, Symptomizer, and Social Listening.</div>
+            <div class='app-subtitle'>Single-file Streamlit workspace for executive review, deep-dive exploration, Review Prompt, Symptomizer, and a mocked Social Listening Beta route that works even before reviews exist.</div>
           </div>
         </div>
       </div>
@@ -10080,10 +10080,10 @@ def main():
             </div>""", unsafe_allow_html=True)
             _render_social_listening_tab()
             return
-        st.markdown("""<div style="margin-top:1.1rem;padding:2rem;background:var(--surface,#fff);border:1px solid #dde1e8;border-radius:18px;text-align:center;box-shadow:0 1px 4px rgba(15,23,42,.08);">
+        st.markdown("""<div class='empty-state-card'>
           <div style="font-size:2.5rem;margin-bottom:.75rem;">📊</div>
-          <div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:.4rem;">No workspace loaded</div>
-          <div style="font-size:13px;color:#64748b;max-width:720px;margin:0 auto;line-height:1.55;">Build a workspace above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer. Or skip reviews entirely and open <b>Social Listening Beta</b> from the sidebar to explore the mocked FlexStyle + Meltwater experience.</div>
+          <div class='empty-state-title' style="font-size:16px;">No workspace loaded</div>
+          <div class='empty-state-sub'>Build a workspace above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer. Or skip reviews entirely and open <b>Social Listening Beta</b> from the sidebar to explore the mocked FlexStyle + Meltwater experience.</div>
         </div>""", unsafe_allow_html=True)
         if st.button("📣 Open Social Listening Beta", type="primary", key="empty_state_open_social"):
             st.session_state["workspace_active_tab"] = TAB_SOCIAL_LISTENING
