@@ -559,7 +559,6 @@ TAB_SOCIAL_LISTENING = "📣  Social Listening Beta"
 WORKSPACE_TABS = [
     TAB_DASHBOARD,
     TAB_REVIEW_EXPLORER,
-    TAB_AI_ANALYST,
     TAB_REVIEW_PROMPT,
     TAB_SYMPTOMIZER,
     TAB_SOCIAL_LISTENING,
@@ -755,7 +754,7 @@ def _esc(s):
 
 def _chip_html(items):
     if not items:
-        return "<span class='chip gray'>No active filters</span>"
+        return ""
     return "<div class='chip-wrap'>" + "".join(f"<span class='chip {c}'>{_esc(t)}</span>" for t, c in items) + "</div>"
 
 
@@ -4271,30 +4270,26 @@ def _render_active_filter_summary(filter_state: Dict[str, Any], overall_df: pd.D
 
 def _render_workspace_nav() -> str:
     current = st.session_state.get("workspace_active_tab", TAB_DASHBOARD)
-    with st.container(border=True):
-        st.markdown("<div class='nav-tabs-label'>Workspace</div>", unsafe_allow_html=True)
-        st.markdown("<div class='workspace-nav-sub'>Start with the Dashboard for the executive summary, then move into Explorer, AI, Prompting, Symptomizer, or the new Social Listening Beta demo for mocked Meltwater-style VOC before reviews even exist.</div>", unsafe_allow_html=True)
-        dash_kwargs = {"use_container_width": True, "key": "workspace_nav_dashboard"}
-        if current == TAB_DASHBOARD:
-            dash_kwargs["type"] = "primary"
-        if st.button(TAB_DASHBOARD, **dash_kwargs):
-            current = TAB_DASHBOARD
-            st.session_state["workspace_active_tab"] = TAB_DASHBOARD
-        st.markdown("<div style='height:.45rem'></div>", unsafe_allow_html=True)
-        rows = [
-            [TAB_REVIEW_EXPLORER, TAB_AI_ANALYST],
-            [TAB_REVIEW_PROMPT, TAB_SYMPTOMIZER],
-            [TAB_SOCIAL_LISTENING],
-        ]
-        for ridx, row in enumerate(rows):
-            cols = st.columns(len(row))
-            for cidx, (col, label) in enumerate(zip(cols, row)):
-                kwargs = {"use_container_width": True, "key": f"workspace_nav_{ridx}_{cidx}_{_slugify(label, fallback='tab')}"}
-                if current == label:
-                    kwargs["type"] = "primary"
-                if col.button(label, **kwargs):
-                    current = label
-                    st.session_state["workspace_active_tab"] = label
+    # Render pill-style navigation
+    nav_items = WORKSPACE_TABS
+    pill_html = "<div style='display:flex;gap:6px;flex-wrap:wrap;padding:6px 0 10px;'>"
+    for label in nav_items:
+        is_active = (current == label)
+        bg = "#6366f1" if is_active else "transparent"
+        fg = "#fff" if is_active else "var(--color-text-secondary)"
+        border = "1.5px solid #6366f1" if is_active else "1px solid var(--color-border-secondary)"
+        pill_html += f"<span style='padding:6px 14px;border-radius:20px;background:{bg};color:{fg};border:{border};font-size:13px;font-weight:{"600" if is_active else "400"};cursor:pointer;white-space:nowrap;'>{_esc(label)}</span>"
+    pill_html += "</div>"
+    st.markdown(pill_html, unsafe_allow_html=True)
+    # Streamlit can't handle onclick in raw HTML, so use button columns as the actual interaction layer
+    cols = st.columns(len(nav_items))
+    for i, (col, label) in enumerate(zip(cols, nav_items)):
+        kwargs = {"use_container_width": True, "key": f"wnav_{i}_{_slugify(label, fallback='tab')}"}
+        if current == label:
+            kwargs["type"] = "primary"
+        if col.button(label.split("  ")[-1] if "  " in label else label, **kwargs):
+            current = label
+            st.session_state["workspace_active_tab"] = label
     return current
 
 
@@ -8734,9 +8729,13 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
         else:
             st.warning("No active symptoms are configured. Add product-specific symptoms below or re-enable Universal Neutral Symptoms.")
     # ── Taxonomy status ─────────────────────────────────────────────────
-    has_taxonomy = bool(st.session_state.get("sym_delighters") or st.session_state.get("sym_detractors"))
+    # has_taxonomy is True only when product-specific symptoms exist,
+    # NOT when only universal neutrals are loaded (source: built-in/none)
+    _sym_source = st.session_state.get("sym_symptoms_source", "none")
+    _has_product_specific = bool(product_specific_dels or product_specific_dets)
+    has_taxonomy = _has_product_specific and _sym_source not in ("none", "built-in", "")
     if has_taxonomy:
-        st.markdown(f"<div class='helper-chip-row'><span class='helper-chip' style='background:rgba(5,150,105,.10);color:#059669;border-color:rgba(5,150,105,.25);'>✅ Taxonomy active — {len(st.session_state.get('sym_detractors', []))} det · {len(st.session_state.get('sym_delighters', []))} del</span></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='helper-chip-row'><span class='helper-chip' style='background:rgba(5,150,105,.10);color:#059669;border-color:rgba(5,150,105,.25);'>✅ Taxonomy active — {len(st.session_state.get('sym_detractors', []))} det · {len(st.session_state.get('sym_delighters', []))} del · Source: {_sym_source}</span></div>", unsafe_allow_html=True)
     sym_tabs = st.tabs(["🚀  Generate taxonomy", "✏️  Manual entry", "📄  Upload workbook"])
     with sym_tabs[0]:
         if not api_key:
@@ -8751,20 +8750,22 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
             elif ai_result and wizard_step < 2:
                 wizard_step = 2
             else:
-                has_taxonomy = bool(st.session_state.get("sym_delighters") or st.session_state.get("sym_detractors"))
-                if has_taxonomy and wizard_step < 3 and not ai_result:
+                # Only skip to step 3 when product-specific taxonomy exists
+                if _has_product_specific and _sym_source not in ("none", "built-in", "") and wizard_step < 3 and not ai_result:
                     wizard_step = 3
 
-            # Step indicator
+            # Step indicator — progress bar style
             steps = [("1", "Generate", wizard_step >= 1), ("2", "Review", wizard_step >= 2), ("3", "Run", wizard_step >= 3)]
-            step_html = "<div style='display:flex;align-items:center;gap:6px;margin:0 0 16px;'>"
-            for num, label, active in steps:
-                bg = "var(--color-text-info)" if active else "var(--color-border-tertiary)"
-                fg = "#fff" if active else "var(--color-text-tertiary)"
-                step_html += f"<span style='display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;background:{bg};color:{fg};font-size:12px;font-weight:600;'>{num}</span>"
-                step_html += f"<span style='font-size:13px;color:{'var(--color-text-primary)' if active else 'var(--color-text-tertiary)'};font-weight:{'600' if active else '400'};'>{label}</span>"
+            step_html = "<div style='display:flex;align-items:center;gap:4px;margin:0 0 18px;'>"
+            for i, (num, label, active) in enumerate(steps):
+                is_current = (wizard_step == int(num))
+                bg = "#6366f1" if is_current else ("rgba(99,102,241,.15)" if active else "var(--color-border-tertiary)")
+                fg = "#fff" if is_current else ("#6366f1" if active else "var(--color-text-tertiary)")
+                fw = "700" if is_current else "500"
+                step_html += f"<span style='display:inline-flex;align-items:center;justify-content:center;min-width:28px;height:28px;border-radius:14px;background:{bg};color:{fg};font-size:12px;font-weight:{fw};padding:0 10px;'>{num}. {label}</span>"
                 if num != "3":
-                    step_html += "<span style='color:var(--color-border-secondary);font-size:11px;'>→</span>"
+                    bar_color = "#6366f1" if active and int(num) < wizard_step else "var(--color-border-tertiary)"
+                    step_html += f"<div style='flex:1;height:2px;background:{bar_color};min-width:20px;'></div>"
             step_html += "</div>"
             st.markdown(step_html, unsafe_allow_html=True)
 
@@ -8983,10 +8984,7 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
             # ── STEP 3: Ready to run / already has taxonomy ───────────────
             elif wizard_step >= 3 or has_taxonomy:
                 st.session_state["sym_wizard_step"] = 3
-                st.markdown(_chip_html([
-                    (f"✅ Taxonomy active — {len(st.session_state.get('sym_detractors', []))} det · {len(st.session_state.get('sym_delighters', []))} del", "green"),
-                    (f"Source: {st.session_state.get('sym_symptoms_source', 'unknown')}", "gray"),
-                ]), unsafe_allow_html=True)
+                st.caption(f"Product-specific taxonomy loaded ({len(st.session_state.get('sym_detractors', []))} det · {len(st.session_state.get('sym_delighters', []))} del). Scroll down to Section 2 to run the symptomizer, or rebuild here.")
                 if st.button("🔄 Rebuild taxonomy from scratch", use_container_width=True, key="sym_rebuild_taxonomy"):
                     # Store old taxonomy counts for diff display in step 2
                     old_dets = list(st.session_state.get("sym_detractors") or [])
@@ -9319,12 +9317,10 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
     # ── Last run summary ─────────────────────────────────────────────────
     last_stats = st.session_state.get("sym_last_run_stats")
     if last_stats:
-        sc1, sc2, sc3, sc4, sc5 = st.columns(5)
-        sc1.metric("Reviews", f"{last_stats.get('reviews', 0):,}")
-        sc2.metric("Labels", f"{last_stats.get('labels', 0):,}")
-        sc3.metric("Avg/review", f"{last_stats.get('avg_per_review', 0):.1f}")
-        sc4.metric("Speed", f"{last_stats.get('reviews', 0) / max(last_stats.get('elapsed_sec', 1), 0.1) * 60:.0f}/min")
-        sc5.metric("Pipeline", "Staged" if last_stats.get("staged") else "Single-pass")
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Reviews tagged", f"{last_stats.get('reviews', 0):,}")
+        sc2.metric("Labels written", f"{last_stats.get('labels', 0):,} ({last_stats.get('avg_per_review', 0):.1f}/review)")
+        sc3.metric("Speed", f"{last_stats.get('reviews', 0) / max(last_stats.get('elapsed_sec', 1), 0.1) * 60:.0f}/min · {'Staged' if last_stats.get('staged') else 'Single-pass'}")
         # Sub-stats row: cache + knowledge enrichment
         sub_chips = []
         cache_s = last_stats.get("cache_stats", {})
@@ -10038,14 +10034,120 @@ def main():
         _render_dashboard(filtered_df, overall_df)
     elif active_tab == TAB_REVIEW_EXPLORER:
         _render_review_explorer(summary=summary, overall_df=overall_df, filtered_df=filtered_df, prompt_artifacts=st.session_state.get("prompt_run_artifacts"), filter_description=filter_description, active_items=filter_state["active_items"])
-    elif active_tab == TAB_AI_ANALYST:
-        _render_ai_tab(**common)
     elif active_tab == TAB_REVIEW_PROMPT:
         _render_review_prompt_tab(**common)
     elif active_tab == TAB_SYMPTOMIZER:
         _render_symptomizer_tab(**common)
     elif active_tab == TAB_SOCIAL_LISTENING:
         _render_social_listening_tab()
+
+    # ── Persistent AI chat bar (bottom of every page) ─────────────────
+    _render_bottom_chat_bar(settings=settings, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BOTTOM CHAT BAR — persistent AI assistant on every page
+# ═══════════════════════════════════════════════════════════════════════════════
+def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filter_description):
+    """Persistent AI chat bar at the bottom of every page."""
+    chat_messages = st.session_state.get("chat_messages") or []
+
+    # Styled container
+    st.markdown("""<div style='margin-top:2rem;padding-top:1rem;border-top:2px solid var(--border);'>
+        <div style='display:flex;align-items:center;gap:8px;margin-bottom:8px;'>
+            <span style='font-size:15px;'>🤖</span>
+            <span style='font-size:13px;font-weight:600;color:var(--color-text-secondary);'>Ask AI about your reviews</span>
+        </div>
+    </div>""", unsafe_allow_html=True)
+
+    # Show last AI response immediately (not behind expander)
+    if chat_messages and chat_messages[-1].get("role") == "assistant":
+        last_answer = chat_messages[-1].get("content", "")
+        with st.chat_message("assistant"):
+            st.markdown(last_answer, unsafe_allow_html=True)
+
+    # Older messages behind expander
+    if len(chat_messages) > 2:
+        older = chat_messages[:-2] if len(chat_messages) > 2 else []
+        if older:
+            with st.expander(f"Earlier messages ({len(older)})", expanded=False):
+                for msg in older[-8:]:
+                    with st.chat_message(msg.get("role", "user")):
+                        st.markdown(msg.get("content", ""), unsafe_allow_html=True)
+        cc1, _ = st.columns([1, 5])
+        if cc1.button("Clear chat", key="bottom_chat_clear"):
+            st.session_state["chat_messages"] = []
+            st.rerun()
+
+    # Chat input
+    prompt = st.chat_input("Ask about your reviews…", key="bottom_chat_input")
+    if prompt:
+        client = _get_client()
+        api_key = settings.get("api_key")
+        if not client or not api_key:
+            st.error("OpenAI API key required. Add it in Settings → OpenAI API Key.")
+            return
+
+        # Build rich context for the AI
+        n_reviews = len(filtered_df) if isinstance(filtered_df, pd.DataFrame) else 0
+        n_total = len(overall_df) if isinstance(overall_df, pd.DataFrame) else 0
+        review_sample = []
+        if isinstance(filtered_df, pd.DataFrame) and not filtered_df.empty and "review_text" in filtered_df.columns:
+            sample_df = filtered_df.sample(min(30, len(filtered_df)), random_state=42)
+            review_sample = [_trunc(str(r), 300) for r in sample_df["review_text"].dropna().tolist()]
+
+        # Include symptomizer results if available
+        sym_context = ""
+        processed = st.session_state.get("sym_processed_rows") or []
+        if processed:
+            det_freq = {}
+            del_freq = {}
+            for rec in processed:
+                for t in (rec.get("wrote_dets") or []):
+                    det_freq[t] = det_freq.get(t, 0) + 1
+                for t in (rec.get("wrote_dels") or []):
+                    del_freq[t] = del_freq.get(t, 0) + 1
+            top_dets = sorted(det_freq.items(), key=lambda x: -x[1])[:10]
+            top_dels = sorted(del_freq.items(), key=lambda x: -x[1])[:10]
+            sym_context = f"""
+Symptomizer results ({len(processed)} reviews tagged):
+Top detractors: {', '.join(f'{t} ({c})' for t,c in top_dets)}
+Top delighters: {', '.join(f'{t} ({c})' for t,c in top_dels)}"""
+
+        system_context = f"""You are an AI review analyst embedded in a consumer product review analytics platform.
+Dataset: {n_total:,} total reviews, {n_reviews:,} after filters.
+Filters: {filter_description if filter_description and 'No active' not in filter_description else 'none'}
+Product: {st.session_state.get('sym_product_profile', 'Not set')}
+{sym_context}
+
+Be concise, specific, and quantitative. Cite patterns from the data. Keep answers actionable."""
+
+        history = [{"role": "system", "content": system_context}]
+        for msg in chat_messages[-8:]:
+            history.append({"role": msg["role"], "content": msg["content"]})
+        history.append({"role": "user", "content": prompt})
+
+        if review_sample:
+            sample_text = "\n---\n".join(review_sample[:20])
+            history[-1]["content"] = f"{prompt}\n\n[REVIEW SAMPLE — {len(review_sample)} reviews]\n{sample_text}"
+
+        st.session_state.setdefault("chat_messages", []).append({"role": "user", "content": prompt})
+
+        with st.spinner("Thinking…"):
+            try:
+                answer = _chat_complete_with_fallback_models(
+                    client,
+                    model=_shared_model(),
+                    structured=False,
+                    messages=history,
+                    temperature=0.4,
+                    max_tokens=1500,
+                    reasoning_effort=_shared_reasoning(),
+                )
+                st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
+            except Exception as exc:
+                st.session_state["chat_messages"].append({"role": "assistant", "content": f"Error: {exc}"})
+        st.rerun()
 
 
 if __name__ == "__main__":
