@@ -44,148 +44,22 @@ def _normalize_tag_list(tags):
 
 def _call_symptomizer_batch(*, client, items, allowed_delighters, allowed_detractors,
                              product_profile="", product_knowledge=None, max_ev_chars=120, aliases=None, include_universal_neutral=True):
-    out_by_idx = {}
-    if not items:
-        return out_by_idx
-    det_list = "\n".join(f"  - {l}" for l in allowed_detractors) or "  (none defined)"
-    del_list = "\n".join(f"  - {l}" for l in allowed_delighters) or "  (none defined)"
-    category_info = _infer_taxonomy_category(product_profile, [it.get("review", "") for it in items[:12]])
-    category = category_info.get("category", "general")
-    product_knowledge_text = _product_knowledge_context_text(product_knowledge, limit_per_section=4)
-    product_knowledge_block = f"Product knowledge:\n{product_knowledge_text}" if product_knowledge_text else ""
-    taxonomy_context = _taxonomy_prompt_context(category)
-    system_prompt = f"""You are an expert consumer product review analyst.
-Your job is to tag customer reviews against a pre-defined symptom taxonomy for any product category.
-Work clause by clause and capture every explicit or clearly described issue or strength.
-
-{f"Product context: {product_profile[:700]}" if product_profile else ""}
-{product_knowledge_block}
-Likely category: {category}.
-{taxonomy_context}
-
-═══ ALLOWED DETRACTORS (problems / complaints) ═══
-{det_list}
-
-═══ ALLOWED DELIGHTERS (positives / strengths) ═══
-{del_list}
-
-═══ CLASSIFICATION ENUMS ═══
-safety      → {SAFETY_ENUM}
-reliability → {RELIABILITY_ENUM}
-sessions    → {SESSIONS_ENUM}
-
-═══ STRICT RULES ═══
-1. HIGH RECALL: Find EVERY applicable symptom. Long reviews can legitimately map to many labels.
-2. EXACT LABELS: Use label text EXACTLY as it appears in the catalog above. No paraphrasing for catalog labels.
-3. EVIDENCE: Each evidence string must be verbatim text from the review (4-{max_ev_chars} chars). Max 2 per label.
-3b. PRODUCT KNOWLEDGE IS CONTEXT ONLY: Use it to understand components, desired outcomes, workflow, and likely failure modes, never to invent unsupported tags.
-4. NO INFERENCE: Only tag what is explicitly stated or clearly described. Never assume missing facts.
-5. BROAD FALLBACKS: Use broad labels like Overall Satisfaction or Overall Dissatisfaction when the review is clearly broadly positive or negative and no sharper label fully covers that sentiment.
-6. PREFER SPECIFIC OVER BROAD: Keep a broad universal label only when it adds signal beyond the more specific theme.
-7. SYSTEMATIC LABELING: If an important theme is not in the catalog, add it to unlisted_detractors or unlisted_delighters using concise Title Case wording that does not duplicate an existing concept with alternate phrasing.
-7b. FAVOR SHARP CROSS-FUNCTIONAL THEMES: Prefer labels that are useful to consumer insights, CX, product, and quality teams.
-8. ZERO TAGS IS VALID: It is better to return no tag on one side than to force a weak match.
-9. NO GENERIC FILLER: Generic praise (for example "works great" or "love it") cannot justify a specific positive symptom unless the review names that concept.
-10. OPPOSITES: Do not assign opposite themes like Quiet and Loud unless the review explicitly describes both in different contexts with separate evidence.
-11. STAR RATING IS CONTEXT ONLY: Rating can help with broad satisfaction or dissatisfaction, but cannot justify a specific non-universal symptom by itself.
-12. SMALL CATALOGS: If the catalog is short, stay conservative and only tag when wording strongly matches.
-13. ALL IDS: Return a result for EVERY review id in the input, even if no symptoms apply.
-
-═══ OUTPUT SCHEMA (strict JSON) ═══
-{{"items":[{{
-  "id":"<review_id_string>",
-  "detractors":[{{"label":"<exact catalog label>","evidence":["<verbatim text>"]}}],
-  "delighters":[{{"label":"<exact catalog label>","evidence":["<verbatim text>"]}}],
-  "unlisted_detractors":["<2-5 word theme>"],
-  "unlisted_delighters":["<2-5 word theme>"],
-  "safety":"<enum value>",
-  "reliability":"<enum value>",
-  "sessions":"<enum value>"
-}}]}}"""
-    payload = dict(items=[dict(id=str(it["idx"]), review=it["review"], rating=it.get("rating"), needs_delighters=it.get("needs_del", True), needs_detractors=it.get("needs_det", True)) for it in items])
-    max_out = min(7000, max(1800, 230 * len(items) + 500))
-    result_text = _chat_complete_with_fallback_models(
-        client,
-        model=_shared_model(),
-        structured=True,
-        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": json.dumps(payload)}],
-        temperature=0.0,
-        response_format={"type": "json_object"},
-        max_tokens=max_out,
-        reasoning_effort=_shared_reasoning(),
-    )
-    data = _safe_json_load(result_text)
-    items_out = data.get("items") or (data if isinstance(data, list) else [])
-    by_id = {str(o.get("id")): o for o in items_out if isinstance(o, dict) and "id" in o}
-    for it in items:
-        idx = int(it["idx"])
-        review_text = it.get("review", "")
-        obj = by_id.get(str(idx)) or {}
-
-        def _extract_side(objs, allowed):
-            labels = []
-            ev_map = {}
-            for obj2 in (objs or []):
-                if not isinstance(obj2, dict):
-                    continue
-                raw = str(obj2.get("label", "")).strip()
-                lbl = _app()._match_label(raw, allowed, aliases=aliases)
-                if not lbl:
-                    continue
-                raw_evs = [str(e) for e in (obj2.get("evidence") or []) if isinstance(e, str)]
-                validated = _app()._validate_evidence(raw_evs, review_text, max_ev_chars)
-                if not validated:
-                    validated = [str(e).strip()[:max_ev_chars] for e in raw_evs if str(e).strip()][:1]
-                if lbl not in labels:
-                    labels.append(lbl)
-                    ev_map[lbl] = validated[:2]
-                if len(labels) >= 10:
-                    break
-            return labels, ev_map
-
-        dels, ev_del = _extract_side(obj.get("delighters", []), allowed_delighters)
-        dets, ev_det = _extract_side(obj.get("detractors", []), allowed_detractors)
-        custom_universal_dels, custom_universal_dets = _custom_universal_catalog()
-        refined = _refine_tag_assignment(
-            review_text,
-            dets,
-            dels,
-            allowed_detractors=allowed_detractors,
-            allowed_delighters=allowed_delighters,
-            evidence_det=ev_det,
-            evidence_del=ev_del,
-            aliases=aliases,
-            max_per_side=10,
-            include_universal_neutral=bool(include_universal_neutral),
-            rating=it.get("rating"),
-            extra_universal_detractors=custom_universal_dets,
-            extra_universal_delighters=custom_universal_dels,
+    """Delegates to the canonical version in app.py.
+    
+    This module previously contained a full duplicate of the symptomizer batch
+    function with its own prompt and parsing. That duplicate lacked v3 improvements
+    (fuzzy evidence, confidence scoring, negation awareness, aspect dedup).
+    Now delegates to ensure all improvements are used regardless of entry point.
+    """
+    app = _app()
+    if app and hasattr(app, '_call_symptomizer_batch'):
+        return app._call_symptomizer_batch(
+            client=client, items=items, allowed_delighters=allowed_delighters,
+            allowed_detractors=allowed_detractors, product_profile=product_profile,
+            product_knowledge=product_knowledge, max_ev_chars=max_ev_chars,
+            aliases=aliases, include_universal_neutral=include_universal_neutral,
         )
-        dets = list(refined.get("dets", []))[:10]
-        dels = list(refined.get("dels", []))[:10]
-        ev_det = dict(refined.get("ev_det", {}) or {})
-        ev_del = dict(refined.get("ev_del", {}) or {})
-        safety = str(obj.get("safety", "Not Mentioned")).strip()
-        reliability = str(obj.get("reliability", "Not Mentioned")).strip()
-        sessions = str(obj.get("sessions", "Unknown")).strip()
-        safety = safety if safety in SAFETY_ENUM else "Not Mentioned"
-        reliability = reliability if reliability in RELIABILITY_ENUM else "Not Mentioned"
-        sessions = sessions if sessions in SESSIONS_ENUM else "Unknown"
-        canon_unl_dels, _, _ = _app()._standardize_symptom_lists([str(x).strip() for x in (obj.get("unlisted_delighters") or []) if str(x).strip()][:10], [])
-        _, canon_unl_dets, _ = _app()._standardize_symptom_lists([], [str(x).strip() for x in (obj.get("unlisted_detractors") or []) if str(x).strip()][:10])
-        out_by_idx[idx] = dict(
-            dels=dels,
-            dets=dets,
-            ev_del=ev_del,
-            ev_det=ev_det,
-            unl_dels=list(canon_unl_dels)[:10],
-            unl_dets=list(canon_unl_dets)[:10],
-            safety=safety,
-            reliability=reliability,
-            sessions=sessions,
-        )
-    return out_by_idx
-
+    return {}
 
 
 def _ensure_ai_cols(df):

@@ -503,7 +503,7 @@ def validate_evidence(
         if is_negated:
             continue
         out.append(e)
-    return out[:2]
+    return out[:3]
 
 
 def _find_fuzzy_position(evidence_norm: str, review_norm: str) -> int:
@@ -629,10 +629,12 @@ For each review, work in TWO mental steps:
 STEP 1: Read clause by clause. Extract every explicit claim about the product — quote verbatim.
 STEP 2: For each claim, check if it maps to a catalog label. Only emit tags with evidence.
 
+If a review has explicit "pros" and "cons" fields, treat pros as pre-confirmed positive claims (map to delighters) and cons as pre-confirmed negative claims (map to detractors). Still require evidence quotes.
+
 ═══ RULES (apply in order) ═══
 1. READ FIRST: Read the entire review before tagging. Understand the overall sentiment arc.
 2. EXACT LABELS: Use catalog label text exactly. No paraphrasing.
-3. EVIDENCE REQUIRED: Every tag needs 1-2 verbatim quotes (6+ chars, 2+ words). No evidence = no tag.
+3. EVIDENCE REQUIRED: Every tag needs 1-3 verbatim quotes (6+ chars, 2+ words). More evidence = higher confidence. No evidence = no tag.
 4. HIGH RECALL: Capture every applicable symptom. Long reviews can map to many labels.
 5. BOTH SIDES: Tag BOTH detractors AND delighters for every review regardless of rating. A 5★ review can have minor complaints. A 1★ review can acknowledge positives. Let the evidence guide you.
 6. NO INFERENCE: Only tag what is explicitly stated or clearly described.
@@ -645,7 +647,7 @@ STEP 2: For each claim, check if it maps to a catalog label. Only emit tags with
 11. HEDGING: "Kind of loud" — still tag, but use specific labels over broad universals.
 12. SEVERITY: Primary complaints (detailed, repeated) and passing mentions (brief) both get tagged.
 13. MULTI-PRODUCT: Only tag symptoms about THIS product. Ignore claims about other products.
-14. UNIVERSAL DISCIPLINE: Overall Satisfaction/Dissatisfaction are LAST RESORT. If 2+ specific labels on one side, DROP the universal.
+14. UNIVERSAL DISCIPLINE: Overall Satisfaction/Dissatisfaction are LAST RESORT. If ANY specific label exists on one side, DROP the universal.
 15. CONTRADICTIONS: Don't assign Quiet AND Loud unless review discusses both in different contexts.
 16. ZERO IS VALID: No tags better than forced matches.
 17. UNLISTED: Add strong missing themes to unlisted arrays. Be conservative.
@@ -680,17 +682,24 @@ RIGHT: The loudness is about a DIFFERENT product. Tag "Quiet" as a delighter for
 def _build_user_payload(
     items: Sequence[Mapping[str, Any]],
 ) -> str:
-    """Build the user message. Both sides always eligible — rating informs
-    confidence downstream, not hard gating at the prompt level."""
+    """Build the user message with structured pros/cons when available."""
     payload_items = []
     for it in items:
         review_text = str(it.get("review", ""))
         rating = it.get("rating")
-        payload_items.append(dict(
+        entry = dict(
             id=str(it["idx"]),
             review=review_text,
             rating=rating,
-        ))
+        )
+        # Pass pros/cons as structured fields if available
+        pros = str(it.get("pros", "")).strip()
+        cons = str(it.get("cons", "")).strip()
+        if pros and len(pros) > 3:
+            entry["pros"] = pros
+        if cons and len(cons) > 3:
+            entry["cons"] = cons
+        payload_items.append(entry)
     return json.dumps(dict(items=payload_items))
 
 
@@ -752,17 +761,25 @@ def tag_review_batch(
     # Use uncached items for the AI call
     items_to_process = uncached_items
 
-    # Build prompt context
+    # Build prompt context — cache category inference (deterministic per product)
     category = "general"
     if infer_category_fn:
-        try:
-            cat_info = infer_category_fn(
-                product_profile,
-                [it.get("review", "") for it in items[:12]],
-            )
-            category = cat_info.get("category", "general")
-        except Exception:
-            pass
+        _cat_cache_key = f"cat_{hashlib.sha256(product_profile.encode('utf-8', errors='replace')).hexdigest()[:12]}"
+        _cached_cat = getattr(tag_review_batch, '_category_cache', {}).get(_cat_cache_key)
+        if _cached_cat:
+            category = _cached_cat
+        else:
+            try:
+                cat_info = infer_category_fn(
+                    product_profile,
+                    [it.get("review", "") for it in items_to_process[:12]],
+                )
+                category = cat_info.get("category", "general")
+                if not hasattr(tag_review_batch, '_category_cache'):
+                    tag_review_batch._category_cache = {}
+                tag_review_batch._category_cache[_cat_cache_key] = category
+            except Exception:
+                pass
 
     taxonomy_context = ""
     if taxonomy_context_fn:
@@ -847,34 +864,27 @@ def tag_review_batch(
             max_ev_chars=max_ev_chars,
         )
 
-        # Refinement pass (v2 engine)
-        if refine_fn:
-            custom_dels, custom_dets = ([], [])
-            if custom_universal_fn:
-                try:
-                    custom_dels, custom_dets = custom_universal_fn()
-                except Exception:
-                    pass
+        # NOTE: v2 refinement (TagRefiner from tag_quality.py) is intentionally
+        # SKIPPED here. The v3 _extract_side_with_confidence pipeline already
+        # handles everything the v2 refiner does — and does it better:
+        #   - Confidence scoring with polarity_confidence_modifier
+        #   - Aspect-level deduplication (_dedup_same_concept_labels)
+        #   - Evidence-weighted contradiction resolution
+        #   - Universal discipline (drop universals when 2+ specifics exist)
+        #   - Fuzzy evidence validation with NegationDetector
+        #   - Evidence coherence checking
+        #
+        # Running the v2 refiner AFTER v3 caused the "dual engine conflict":
+        # the refiner used a different scoring algorithm (FragmentScorer) that
+        # sometimes contradicted v3's decisions, AND it replaced v3's AI-sourced
+        # evidence maps with its own snippet-based evidence. This made tag
+        # decisions unpredictable and evidence display unreliable.
+        #
+        # The v2 refiner is still used by the inline fallback tagger (when v3
+        # import fails) where it remains the only post-processing layer.
 
-            refined = refine_fn(
-                review_text,
-                dets,
-                dels,
-                allowed_detractors=allowed_detractors,
-                allowed_delighters=allowed_delighters,
-                evidence_det=ev_det,
-                evidence_del=ev_del,
-                aliases=aliases,
-                max_per_side=10,
-                include_universal_neutral=bool(include_universal_neutral),
-                rating=rating,
-                extra_universal_detractors=custom_dets,
-                extra_universal_delighters=custom_dels,
-            )
-            dets = list(refined.get("dets", []))[:10]
-            dels = list(refined.get("dels", []))[:10]
-            ev_det = dict(refined.get("ev_det", {}) or {})
-            ev_del = dict(refined.get("ev_del", {}) or {})
+        # Cross-side coherence: check for contradictory evidence reuse
+        dets, dels, ev_det, ev_del = _cross_side_coherence(dets, dels, ev_det, ev_del)
 
         # Enum validation
         safety = _validate_enum(obj.get("safety", "Not Mentioned"), SAFETY_ENUM)
@@ -886,8 +896,10 @@ def tag_review_batch(
         unl_dets = _standardize_unlisted([str(x).strip() for x in (obj.get("unlisted_detractors") or []) if str(x).strip()])[:10]
         if standardize_fn:
             try:
-                unl_dels, _, _ = standardize_fn(unl_dels, [])
-                _, unl_dets, _ = standardize_fn([], unl_dets)
+                std_result = standardize_fn(unl_dels, unl_dets)
+                if isinstance(std_result, (list, tuple)) and len(std_result) >= 2:
+                    unl_dels = list(std_result[0] or [])
+                    unl_dets = list(std_result[1] or [])
             except Exception:
                 pass
 
@@ -937,10 +949,61 @@ _CONTRADICTION_PAIRS = [
     ({"Multiple Attachments","Good Accessories"}, {"Missing Attachments","Needs More Attachments"}),
 ]
 
+def _cross_side_coherence(
+    dets: List[str], dels: List[str],
+    ev_det: Dict[str, List[str]], ev_del: Dict[str, List[str]],
+) -> Tuple[List[str], List[str], Dict[str, List[str]], Dict[str, List[str]]]:
+    """Cross-side validation: catch contradictory labels across detractor/delighter sides.
+    
+    When a detractor and delighter are from the same contradiction pair (e.g.,
+    "Loud Noise" as detractor AND "Quiet" as delighter), keep the one with
+    stronger evidence. Also checks for shared evidence strings across sides.
+    """
+    if not dets or not dels:
+        return dets, dels, ev_det, ev_del
+
+    # 1. Contradiction pairs across sides
+    for set_a, set_b in _CONTRADICTION_PAIRS:
+        # set_a = positive side, set_b = negative side
+        det_hits = set_b & set(dets)  # detractors matching negative side
+        del_hits = set_a & set(dels)  # delighters matching positive side
+        if det_hits and del_hits:
+            # Both sides of a contradiction tagged — keep stronger evidence
+            det_ev_score = sum(sum(len(e) for e in ev_det.get(l, [])) for l in det_hits)
+            del_ev_score = sum(sum(len(e) for e in ev_del.get(l, [])) for l in del_hits)
+            if det_ev_score >= del_ev_score:
+                dels = [l for l in dels if l not in del_hits]
+                for d in del_hits:
+                    ev_del.pop(d, None)
+            else:
+                dets = [l for l in dets if l not in det_hits]
+                for d in det_hits:
+                    ev_det.pop(d, None)
+
+    # 2. Shared evidence: same short snippet used on both sides is suspicious
+    det_ev_strings = set()
+    for evs in ev_det.values():
+        for e in evs:
+            if len(e) >= 10:
+                det_ev_strings.add(e.lower().strip()[:50])
+    for del_label in list(dels):
+        for e in ev_del.get(del_label, []):
+            if len(e) >= 10 and e.lower().strip()[:50] in det_ev_strings:
+                # Same evidence used for both a detractor and delighter — drop the delighter tag
+                # (detractors are typically more specific/actionable)
+                dels = [l for l in dels if l != del_label]
+                ev_del.pop(del_label, None)
+                break
+
+    return dets, dels, ev_det, ev_del
+
+
 def _enforce_universal_discipline(labels, ev_map):
-    """Rule 13: Drop universal labels when 2+ specific labels cover the sentiment."""
+    """Drop universal labels when 1+ specific labels cover the sentiment.
+    A review tagged with 'Loud Noise' + 'Overall Dissatisfaction' should drop
+    the universal — the noise IS the dissatisfaction."""
     specific = [l for l in labels if l not in _UNIVERSAL_LABELS]
-    if len(specific) >= 2:
+    if len(specific) >= 1:
         return [l for l in labels if l not in _UNIVERSAL_LABELS], {k:v for k,v in ev_map.items() if k not in _UNIVERSAL_LABELS}
     return labels, ev_map
 
@@ -1037,7 +1100,7 @@ def _extract_side_with_confidence(
         if not validated and not is_coherent:
             continue
         labels.append(lbl)
-        ev_map[lbl] = validated[:2]
+        ev_map[lbl] = validated[:3]
         if len(labels) >= 10: break
 
     # Aspect-level dedup: "Loud Noise" + "Noisy Motor" = same concept — keep best evidence
@@ -1046,17 +1109,28 @@ def _extract_side_with_confidence(
     # Post-extraction intelligence
     labels, ev_map = _enforce_universal_discipline(labels, ev_map)
     labels = _check_contradictions_with_evidence(labels, ev_map)
-    # Filter by confidence threshold
+    # Filter by confidence threshold — scales with catalog size
     if len(labels) >= 2:
+        # Dynamic threshold: large catalogs dilute scores, small catalogs inflate them
+        cat_size = len(allowed)
+        if cat_size >= 50:
+            conf_threshold = 0.18  # Large catalog — be permissive
+        elif cat_size >= 30:
+            conf_threshold = 0.22
+        elif cat_size >= 15:
+            conf_threshold = 0.25
+        else:
+            conf_threshold = 0.30  # Small catalog — be stricter
+
         scored = []
         for lbl in labels:
             c = _score_tag_confidence(lbl, ev_map.get(lbl, []), review_text, rating,
-                                       side=side, catalog_size=len(allowed))
+                                       side=side, catalog_size=cat_size)
             # Coherence penalty: -0.12 for incoherent evidence
             if not coherence_flags.get(lbl, True):
                 c -= 0.12
             scored.append((lbl, c))
-        above_threshold = [(l, c) for l, c in scored if c >= 0.25]
+        above_threshold = [(l, c) for l, c in scored if c >= conf_threshold]
         if above_threshold:
             labels = [l for l, c in above_threshold]
         else:
@@ -1067,12 +1141,18 @@ def _extract_side_with_confidence(
 
 
 def _dedup_same_concept_labels(labels: List[str], ev_map: Dict[str, List[str]]) -> Tuple[List[str], Dict[str, List[str]]]:
-    """Remove same-concept duplicates: 'Loud Noise' + 'Noisy Motor' → keep the one with better evidence."""
+    """Remove same-concept duplicates: 'Loud Noise' + 'Noisy Motor' → keep the one with better evidence.
+    
+    Sorts by evidence quality first so the strongest label for each concept
+    is always the one that gets kept, regardless of AI return order.
+    """
     if len(labels) < 2:
         return labels, ev_map
+    # Sort by evidence quality (descending) so best labels are registered first
+    sorted_labels = sorted(labels, key=lambda l: sum(len(e) for e in ev_map.get(l, [])), reverse=True)
     seen_stems: Dict[str, Tuple[str, int]] = {}  # stem_key → (label, evidence_score)
     out_labels = []
-    for lbl in labels:
+    for lbl in sorted_labels:
         stems = frozenset(_tokenize_stemmed(lbl))
         if not stems:
             out_labels.append(lbl)
@@ -1091,7 +1171,7 @@ def _dedup_same_concept_labels(labels: List[str], ev_map: Dict[str, List[str]]) 
                     seen_stems["|".join(sorted(stems))] = (lbl, ev_score)
                     # Merge evidence: combine best from both
                     combined_ev = list(ev_map.get(existing_lbl, [])) + list(ev_map.get(lbl, []))
-                    ev_map[lbl] = sorted(set(combined_ev), key=lambda x: -len(x))[:2]
+                    ev_map[lbl] = sorted(set(combined_ev), key=lambda x: -len(x))[:3]
                     if existing_lbl in ev_map and existing_lbl != lbl:
                         del ev_map[existing_lbl]
                 # else: keep existing, discard new
@@ -1361,7 +1441,7 @@ def retry_zero_tag_reviews(
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_msg},
                 ],
-                temperature=0.0,
+                temperature=0.3,  # Higher than main pass to explore different interpretations
                 response_format={"type": "json_object"},
                 max_tokens=1200,
                 reasoning_effort=_reasoning,

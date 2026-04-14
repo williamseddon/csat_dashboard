@@ -811,9 +811,33 @@ def _first_non_empty(series):
 
 
 def _clean_text(x):
+    """Clean review text for AI processing.
+    
+    Strips HTML tags, normalizes smart quotes/dashes, collapses whitespace,
+    and removes embedded URLs. BazaarVoice reviews often contain HTML entities,
+    smart punctuation, and URLs that waste AI tokens.
+    """
     if pd.isna(x):
         return ""
-    return str(x).strip()
+    s = str(x).strip()
+    if not s:
+        return ""
+    # Strip HTML tags
+    s = re.sub(r"<[^>]+>", " ", s)
+    # Decode common HTML entities
+    s = s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    s = s.replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " ")
+    s = s.replace("&#x27;", "'").replace("&#x2F;", "/")
+    # Normalize smart quotes and dashes
+    s = s.replace("\u2018", "'").replace("\u2019", "'")  # single smart quotes
+    s = s.replace("\u201c", '"').replace("\u201d", '"')  # double smart quotes
+    s = s.replace("\u2013", "-").replace("\u2014", " - ")  # en/em dashes
+    s = s.replace("\u2026", "...")  # ellipsis
+    # Remove URLs (waste tokens, confuse matching)
+    s = re.sub(r"https?://\S+", "", s)
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def _is_filled(val):
@@ -5359,6 +5383,12 @@ def _symptomizer_review_text(row):
     if title_and_text:
         values.append(title_and_text)
         seen.add(_clean_text(title_and_text).lower())
+        # Also mark individual title and review_text as seen to prevent double-counting
+        # since title_and_text = title + " " + review_text
+        _t = _clean_text(_safe_text(row.get("title"))).lower()
+        _r = _clean_text(_safe_text(row.get("review_text"))).lower()
+        if _t: seen.add(_t)
+        if _r: seen.add(_r)
 
     def _append_field(value, prefix=""):
         text = _safe_text(value)
@@ -5394,7 +5424,27 @@ def _symptomizer_review_text(row):
             text = text[:400]
         _append_field(text, prefix=f"{key_text.replace('_', ' ').title()}: ")
 
-    return _clean_text(" \n ".join(values))
+    assembled = _clean_text(" \n ".join(values))
+    # Intelligent truncation: cap at 1500 chars to prevent one long review
+    # from consuming the entire batch's token budget
+    if len(assembled) > 1500:
+        # Keep first 600 chars (opening sentiment) + last 400 chars (conclusion/summary)
+        # + keyword-dense middle section
+        first = assembled[:600]
+        last = assembled[-400:]
+        middle = assembled[600:-400]
+        # Find the most signal-dense 500-char window in the middle
+        if len(middle) > 500:
+            _signal_kw = re.compile(r"\b(love|hate|broke|broken|great|terrible|loud|quiet|easy|hard|damage|perfect|worst|best|recommend|return|refund|issue|problem)\b", re.I)
+            best_start, best_score = 0, 0
+            for i in range(0, len(middle) - 500, 50):
+                window = middle[i:i + 500]
+                score = len(_signal_kw.findall(window))
+                if score > best_score:
+                    best_start, best_score = i, score
+            middle = middle[best_start:best_start + 500]
+        assembled = first + " [...] " + middle + " [...] " + last
+    return assembled
 
 
 def _sample_reviews_for_symptomizer(df, sample_n):
@@ -5637,6 +5687,51 @@ def _enrich_product_knowledge_from_run(processed_rows, *, min_mentions=3, max_pe
         _log.info("Product knowledge enriched: %s", {k: len(v) for k, v in enrichments.items() if v})
     
     return enrichments
+
+
+def _auto_learn_aliases_from_run(processed_rows):
+    """Post-run alias learning: discover consumer language variants.
+    
+    Checks unlisted candidates from the run against the existing catalog.
+    Near-misses (fuzzy match score 0.55-0.72) are auto-added as aliases
+    for the matched catalog label. This teaches the system consumer language
+    like "makes a racket" → alias for "Loud Noise".
+    """
+    delighters = list(st.session_state.get("sym_delighters") or [])
+    detractors = list(st.session_state.get("sym_detractors") or [])
+    aliases = dict(st.session_state.get("sym_aliases") or {})
+    all_catalog = delighters + detractors
+    if not all_catalog or not processed_rows:
+        return 0
+
+    # Collect all unlisted candidates with their frequencies
+    unl_freq: Dict[str, int] = {}
+    for rec in processed_rows:
+        for tag in (rec.get("unl_dets") or []) + (rec.get("unl_dels") or []):
+            t = str(tag).strip()
+            if t and len(t) >= 4:
+                unl_freq[t] = unl_freq.get(t, 0) + 1
+
+    added = 0
+    for candidate, count in unl_freq.items():
+        if count < 2:
+            continue  # Need at least 2 mentions to be worth aliasing
+        # Check if this candidate is a near-miss to an existing label
+        # Use a lower cutoff than normal matching to catch fuzzy variants
+        matched = _v3_match_label(candidate, all_catalog, aliases=aliases, cutoff=0.55) if _HAS_SYMPTOMIZER_V3 else None
+        if matched and matched != candidate:
+            # It's a near-miss — add as alias if not already there
+            existing_aliases = list(aliases.get(matched) or [])
+            if candidate not in existing_aliases and len(existing_aliases) < 10:
+                existing_aliases.append(candidate)
+                aliases[matched] = existing_aliases
+                added += 1
+                _log.info("Auto-alias: '%s' → '%s' (%d mentions)", candidate, matched, count)
+
+    if added:
+        st.session_state["sym_aliases"] = aliases
+        _log.info("Auto-learned %d new aliases from unlisted candidates", added)
+    return added
 
 
 def _render_product_knowledge_panel(knowledge):
@@ -6261,71 +6356,39 @@ def _call_symptomizer_batch(*, client, items, allowed_delighters, allowed_detrac
         )
     # ── Fallback: original inline tagger ─────────────────────────────────
     out_by_idx = {}
-    det_list = "\n".join(f"  - {l}" for l in allowed_detractors) or "  (none defined)"
-    del_list = "\n".join(f"  - {l}" for l in allowed_delighters) or "  (none defined)"
     category_info = _infer_taxonomy_category(product_profile, [it.get("review", "") for it in items[:12]])
     category = category_info.get("category", "general")
     product_knowledge_text = _product_knowledge_context_text(product_knowledge, limit_per_section=4)
-    product_knowledge_block = f"Product knowledge:\n{product_knowledge_text}" if product_knowledge_text else ""
     taxonomy_context = _taxonomy_prompt_context(category)
-    system_prompt = f"""You are an expert consumer product review analyst.
-Your job is to tag customer reviews against a pre-defined symptom taxonomy for any product category.
-Work clause by clause and capture every explicit or clearly described issue or strength.
+    # Try to use the v3 prompt builder for consistency even in fallback mode
+    try:
+        from review_analyst.symptomizer import _build_system_prompt as _v3_build_prompt
+        system_prompt = _v3_build_prompt(
+            allowed_detractors=allowed_detractors, allowed_delighters=allowed_delighters,
+            product_profile=product_profile, product_knowledge_text=product_knowledge_text,
+            taxonomy_context=taxonomy_context, category=category, max_ev_chars=max_ev_chars,
+        )
+    except Exception:
+        # Ultimate fallback: minimal prompt
+        det_list = "\n".join(f"  - {l}" for l in allowed_detractors) or "  (none defined)"
+        del_list = "\n".join(f"  - {l}" for l in allowed_delighters) or "  (none defined)"
+        system_prompt = f"""You are an expert consumer product review analyst.
+Tag reviews against this symptom taxonomy. Evidence required for every tag.
 
-{f"Product context: {product_profile[:700]}" if product_profile else ""}
-{product_knowledge_block}
-Likely category: {category}.
-{taxonomy_context}
+{f"Product: {product_profile[:500]}" if product_profile else ""}
 
-═══ ALLOWED DETRACTORS (problems / complaints) ═══
-{det_list}
+DETRACTORS: {det_list}
+DELIGHTERS: {del_list}
 
-═══ ALLOWED DELIGHTERS (positives / strengths) ═══
-{del_list}
+Rules: exact labels only, verbatim evidence (4-{max_ev_chars} chars), tag both sides regardless of rating,
+watch for negation ("didn't break" = positive), no inference.
 
-═══ CLASSIFICATION ENUMS ═══
-safety      → {SAFETY_ENUM}
-reliability → {RELIABILITY_ENUM}
-sessions    → {SESSIONS_ENUM}
-
-═══ RULES (apply in order) ═══
-1. READ FIRST: Read the entire review before assigning any tags. Understand the overall sentiment arc.
-2. EXACT LABELS: Use catalog label text EXACTLY. No paraphrasing.
-3. EVIDENCE REQUIRED: Each evidence string must be verbatim text from the review (4-{max_ev_chars} chars). Max 2 per label. No evidence = no tag.
-4. HIGH RECALL: Find EVERY applicable symptom. Long reviews can legitimately map to many labels.
-5. BOTH SIDES: Tag BOTH detractors AND delighters for every review regardless of rating. A 5★ review can have minor complaints. A 1★ review can acknowledge positives.
-6. NO INFERENCE: Only tag what is explicitly stated or clearly described.
-
-═══ ACCURACY RULES ═══
-7. NEGATION: "didn't damage my hair" and "no issues with noise" are POSITIVE signals, NOT detractors. "it's not loud" means quiet. Read the FULL clause before deciding polarity.
-8. SARCASM: "Great, another broken product" is NEGATIVE. Look for contradiction between literal words and context. Rating is a strong signal.
-9. TEMPORAL CONTEXT: "Loved it at first, now it's broken" — tag based on the FINAL state, not initial impressions.
-10. COMPARATIVES: "Better than my old one" IS about this product. "My old one never did this" IS a detractor about this product.
-11. HEDGING: "Kind of loud" = still tag it, but use the most specific label, not a broad universal.
-12. SEVERITY: Distinguish primary complaints (detailed, repeated) from passing mentions (brief, parenthetical). Both get tagged.
-13. MULTI-PRODUCT: Only tag symptoms about the PRODUCT UNDER REVIEW. Ignore claims about other products.
-14. UNIVERSAL DISCIPLINE: Overall Satisfaction / Dissatisfaction are LAST-RESORT labels. If you already tagged 2+ specific labels on one side, DROP the universal.
-15. CONTRADICTIONS: Don't assign Quiet AND Loud unless review explicitly discusses both in different contexts.
-16. ZERO IS VALID: No tags is better than forced matches.
-17. UNLISTED: Add strong missing themes to unlisted arrays (Title Case, 2-5 words). Be conservative.
-18. ALL IDS: Return a result for EVERY review id.
-
-═══ COMMON MISTAKES TO AVOID ═══
-WRONG: "I was worried it would damage my hair but it didn't" → tagging "Hair Damage". RIGHT: This is a DELIGHTER — no damage occurred.
-WRONG: "my OLD dryer was so loud, this one is quiet" → tagging "Loud". RIGHT: Loudness is about a DIFFERENT product. Tag "Quiet" for THIS product.
-WRONG: "cord is short but manageable" → not tagging. RIGHT: Tag it — hedging lowers confidence, not tagging.
-
-═══ OUTPUT SCHEMA (strict JSON) ═══
-{{"items":[{{
-  "id":"<review_id_string>",
-  "detractors":[{{"label":"<exact catalog label>","evidence":["<verbatim text>"]}}],
-  "delighters":[{{"label":"<exact catalog label>","evidence":["<verbatim text>"]}}],
-  "unlisted_detractors":["<2-5 word theme>"],
-  "unlisted_delighters":["<2-5 word theme>"],
-  "safety":"<enum value>",
-  "reliability":"<enum value>",
-  "sessions":"<enum value>"
-}}]}}"""
+Output JSON: {{"items":[{{"id":"<id>","detractors":[{{"label":"<exact>","evidence":["<verbatim>"]}}],
+"delighters":[{{"label":"<exact>","evidence":["<verbatim>"]}}],
+"unlisted_detractors":[],"unlisted_delighters":[],
+"safety":"<Safe|Minor Concern|Safety Issue|Not Mentioned>",
+"reliability":"<Reliable|Intermittent Issue|Failure|Not Mentioned>",
+"sessions":"<1-5|6-20|21-50|50+|Unknown>"}}]}}"""
     payload = dict(items=[dict(id=str(it["idx"]), review=it["review"], rating=it.get("rating")) for it in items])
     catalog_size = len(allowed_detractors) + len(allowed_delighters)
     catalog_mult = 1.0 + min(0.5, max(0, catalog_size - 20) / 80)
@@ -7578,40 +7641,44 @@ def _highlight_keywords_in_text(text, keywords):
 
 
 def _highlight_evidence(text, evidence_items):
-    """Highlight evidence in review text with fuzzy matching.
+    """Highlight evidence in review text with fuzzy matching and side-colored tints.
+    
+    Detractor evidence highlights in coral, delighter evidence in green.
+    Falls back to yellow when side info is not available.
     
     Tier 1: Exact regex match (case-insensitive)
-    Tier 2: Fuzzy — find the best overlapping window in the review text
-            where all significant words from the evidence appear nearby
+    Tier 2: Fuzzy — find the best overlapping window containing all content words
     """
     text_str = str(text)
     if not evidence_items or not text_str.strip():
         return f"<div class='review-body'>{html.escape(text_str)}</div>"
     hits = []
     text_lower = text_str.lower()
-    for ev_text, tag_label in evidence_items:
+    for item in evidence_items:
+        # Support both (text, label) and (text, label, side) tuples
+        ev_text = item[0] if len(item) >= 1 else ""
+        tag_label = item[1] if len(item) >= 2 else ""
+        side = item[2] if len(item) >= 3 else ""
         ev_clean = ev_text.strip()
         if not ev_clean:
             continue
         # Tier 1: Exact match
         found = False
         for m in re.compile(re.escape(ev_clean), re.IGNORECASE).finditer(text_str):
-            hits.append((m.start(), m.end(), tag_label, m.group()))
+            hits.append((m.start(), m.end(), tag_label, m.group(), side))
             found = True
-        # Tier 2: Fuzzy match — find the tightest window containing all content words
+        # Tier 2: Fuzzy match
         if not found:
             ev_words = [w for w in ev_clean.lower().split() if len(w) > 2 and w.lower() not in {"the","a","an","and","to","for","of","in","on","with","is","it","very","really","so"}]
             if len(ev_words) >= 2:
                 best_start, best_end, best_len = -1, -1, 999
-                for i, w in enumerate(ev_words):
+                for w in ev_words:
                     pos = text_lower.find(w)
                     while pos >= 0:
-                        # Check if all other words appear within 120 chars
                         window_start = max(0, pos - 10)
                         window_end = min(len(text_lower), pos + 120)
                         window = text_lower[window_start:window_end]
                         if all(ew in window for ew in ev_words):
-                            # Find tightest bounds
                             positions = []
                             for ew in ev_words:
                                 wp = window.find(ew)
@@ -7624,7 +7691,7 @@ def _highlight_evidence(text, evidence_items):
                                     best_start, best_end, best_len = s, e, e - s
                         pos = text_lower.find(w, pos + 1)
                 if best_start >= 0 and best_len < 150:
-                    hits.append((best_start, best_end, tag_label, text_str[best_start:best_end]))
+                    hits.append((best_start, best_end, tag_label, text_str[best_start:best_end], side))
     if not hits:
         return f"<div class='review-body'>{html.escape(text_str)}</div>"
     hits.sort(key=lambda h: h[0])
@@ -7636,10 +7703,11 @@ def _highlight_evidence(text, evidence_items):
             cursor = h[1]
     parts = []
     cursor = 0
-    for start, end, tag_label, matched in deduped:
+    for start, end, tag_label, matched, side in deduped:
         parts.append(html.escape(text_str[cursor:start]))
-        tip = html.escape(f"AI tag: {tag_label}")
-        parts.append(f'<span class="ev-highlight" data-tag="{tip}">{html.escape(matched)}</span>')
+        tip = html.escape(f"{'Issue' if side == 'det' else 'Strength' if side == 'del' else 'Tag'}: {tag_label}")
+        side_class = f" ev-{side}" if side in ("det", "del") else ""
+        parts.append(f'<span class="ev-highlight{side_class}" data-tag="{tip}">{html.escape(matched)}</span>')
         cursor = end
     parts.append(html.escape(text_str[cursor:]))
     return f"<div class='review-body'>{''.join(parts)}</div>"
@@ -7662,11 +7730,11 @@ def _build_evidence_lookup(processed_rows):
         for lab, evs in (rec.get("ev_det", {}) or {}).items():
             for e in (evs or []):
                 if e and e.strip():
-                    entries.append((e.strip(), lab))
+                    entries.append((e.strip(), lab, "det"))
         for lab, evs in (rec.get("ev_del", {}) or {}).items():
             for e in (evs or []):
                 if e and e.strip():
-                    entries.append((e.strip(), lab))
+                    entries.append((e.strip(), lab, "del"))
         if entries:
             if idx:
                 lookup[idx] = entries
@@ -7683,8 +7751,16 @@ def _symptom_tags_html(det_tags, del_tags, *, ev_det=None, ev_del=None):
     def _chip(tag, color, ev_map):
         ev = ev_map.get(tag, [])
         tooltip = _esc(" | ".join(str(e)[:80] for e in ev)) if ev else "No evidence captured"
-        ev_indicator = f"<span style='font-size:9px;opacity:.6;margin-left:2px;'>({len(ev)})</span>" if ev else ""
-        return f"<span class='chip {color}' style='font-size:11px;padding:3px 8px;cursor:help;' title='{tooltip}'>{_esc(tag)}{ev_indicator}</span>"
+        # Confidence visual: opacity + border style based on evidence quality
+        ev_total_chars = sum(len(str(e)) for e in ev)
+        if len(ev) >= 2 and ev_total_chars >= 30:
+            conf_style = "opacity:1;border:1.5px solid;"  # Strong
+        elif len(ev) >= 1 and ev_total_chars >= 15:
+            conf_style = "opacity:.88;border:1px solid;"  # Moderate
+        else:
+            conf_style = "opacity:.65;border:1px dashed;"  # Weak — dashed border signals low confidence
+        ev_indicator = f"<span style='font-size:9px;opacity:.5;margin-left:2px;'>{len(ev)}ev</span>" if ev else "<span style='font-size:9px;opacity:.4;margin-left:2px;'>0ev</span>"
+        return f"<span class='chip {color}' style='font-size:11px;padding:3px 8px;cursor:help;{conf_style}' title='{tooltip}'>{_esc(tag)}{ev_indicator}</span>"
     sym_html = "<div style='margin-top:9px;padding-top:9px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px;'>"
     if det_tags:
         det_chips = "".join(_chip(t, "red", ev_det) for t in det_tags)
@@ -9016,6 +9092,8 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                     idx=int(idx),
                     review=_symptomizer_review_text(row),
                     rating=row.get("rating"),
+                    pros=_safe_text(row.get("pros")),
+                    cons=_safe_text(row.get("cons")),
                 )
                 for idx, row in batch
             ]
@@ -9151,6 +9229,13 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                 _log.info("Knowledge enrichment: %d new themes discovered", enrichment_count)
         except Exception as enrich_exc:
             _log.warning("Knowledge enrichment failed: %s", enrich_exc)
+        # ── Post-run alias learning: teach the system consumer language ───
+        try:
+            aliases_learned = _auto_learn_aliases_from_run(processed_local)
+            if aliases_learned > 0:
+                st.session_state["sym_last_run_stats"]["aliases_learned"] = aliases_learned
+        except Exception as alias_exc:
+            _log.warning("Alias learning failed: %s", alias_exc)
         st.rerun()
     st.divider()
     processed = st.session_state.get("sym_processed_rows") or []
@@ -9174,6 +9259,9 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
         ke = last_stats.get("knowledge_enriched", 0)
         if ke > 0:
             sub_chips.append((f"Knowledge enriched: {ke} new themes", "green"))
+        al = last_stats.get("aliases_learned", 0)
+        if al > 0:
+            sub_chips.append((f"Aliases learned: {al} consumer terms", "blue"))
         if sub_chips:
             st.markdown(_chip_html(sub_chips), unsafe_allow_html=True)
     st.markdown("### 3 · Results")
