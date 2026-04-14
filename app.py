@@ -6277,7 +6277,12 @@ def _call_symptomizer_batch(*, client, items, allowed_delighters, allowed_detrac
     if not items:
         return {}
     # ── v3 staged pipeline (extract → classify → verify) ────────────────
-    if _HAS_SYMPTOMIZER_V3 and st.session_state.get("sym_staged_pipeline"):
+    # Auto-activates for long reviews (>100 avg words) where the quality gain
+    # from taxonomy-free claim extraction justifies the extra API call.
+    _user_staged = bool(st.session_state.get("sym_staged_pipeline"))
+    _avg_review_words = sum(len(str(it.get("review", "")).split()) for it in items) / max(len(items), 1)
+    _auto_staged = _avg_review_words > 100 and len(items) <= 5  # Only for small batches of long reviews
+    if _HAS_SYMPTOMIZER_V3 and (_user_staged or _auto_staged):
         from review_analyst.symptomizer import extract_claims, map_claims_to_taxonomy
         _SAFETY_KW = re.compile(r"\b(burn|fire|shock|electr|hazard|danger|injur|hospital|smoke|smoking|melted|caught fire|sparks?)\b", re.I)
         _RELIABILITY_KW_NEG = re.compile(r"\b(broke|broken|fail|died|stopped|malfunction|defective|DOA|dead on arrival)\b", re.I)
@@ -8735,12 +8740,15 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
             # ── Unified 3-step wizard ─────────────────────────────────────
             wizard_step = st.session_state.get("sym_wizard_step", 1)
             ai_result = st.session_state.get("sym_ai_build_result")
-            # If taxonomy was already accepted, show step 3 ready state
-            if ai_result and wizard_step < 2:
+            _wizard_forced = st.session_state.pop("_sym_wizard_force_step", None)
+            if _wizard_forced is not None:
+                wizard_step = _wizard_forced
+            elif ai_result and wizard_step < 2:
                 wizard_step = 2
-            has_taxonomy = bool(st.session_state.get("sym_delighters") or st.session_state.get("sym_detractors"))
-            if has_taxonomy and wizard_step < 3 and not ai_result:
-                wizard_step = 3
+            else:
+                has_taxonomy = bool(st.session_state.get("sym_delighters") or st.session_state.get("sym_detractors"))
+                if has_taxonomy and wizard_step < 3 and not ai_result:
+                    wizard_step = 3
 
             # Step indicator
             steps = [("1", "Generate", wizard_step >= 1), ("2", "Review", wizard_step >= 2), ("3", "Run", wizard_step >= 3)]
@@ -8757,8 +8765,12 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
 
             # ── STEP 1: Product description + Generate ────────────────────
             if wizard_step == 1:
+                _has_existing_knowledge = bool(st.session_state.get("sym_product_knowledge"))
+                if _has_existing_knowledge:
+                    st.caption("Rebuilding with existing product knowledge. Your previous product description and knowledge are preserved.")
+
                 pdesc = st.text_area(
-                    "Product description",
+                    "Product description (optional — AI will draft from reviews if blank)",
                     value=st.session_state.get("sym_product_profile", ""),
                     placeholder="e.g. SharkNinja FlexStyle HD440 — air styling tool with 4 attachments for curl, smooth, volumize, and dry",
                     height=80,
@@ -8774,59 +8786,60 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                 product_knowledge = _normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {})
                 sample_reviews = _sample_reviews_for_symptomizer(overall_df, sample_n)
 
-                # Optional: draft description from reviews first
-                if not pdesc.strip():
-                    st.info("No product description yet. Click below to have AI draft one from the reviews, or type one manually.")
-                    if st.button("✨ Draft product description from reviews", use_container_width=True, key="sym_ai_desc"):
-                        overlay = _show_thinking("Reading reviews to draft product description…")
-                        try:
-                            result = _ai_generate_product_description(client=client, sample_reviews=sample_reviews, existing_description="")
-                            if result.get("description"):
-                                st.session_state["sym_product_profile"] = result["description"]
-                                st.session_state["sym_product_knowledge"] = _normalize_product_knowledge(result.get("product_knowledge") or {})
-                                st.session_state["sym_product_profile_ai_note"] = result.get("confidence_note", "Generated from the current review sample.")
-                        except Exception as exc:
-                            st.error(f"AI product description failed: {exc}")
-                        finally:
+                # Single button — always visible, auto-drafts description when needed
+                generate_label = "🚀 Generate taxonomy" if pdesc.strip() else "🚀 Generate taxonomy from reviews"
+                if st.button(generate_label, type="primary", use_container_width=True, key="sym_generate_taxonomy"):
+                    overlay = _show_thinking("Step 1/2 — Analyzing product and reviews…")
+                    try:
+                        # Step 1: Generate/update product knowledge (also drafts description if empty)
+                        desc_result = _ai_generate_product_description(client=client, sample_reviews=sample_reviews, existing_description=pdesc.strip())
+                        if desc_result.get("description"):
+                            st.session_state["sym_product_profile"] = desc_result["description"]
+                            pk = _normalize_product_knowledge(desc_result.get("product_knowledge") or product_knowledge)
+                            st.session_state["sym_product_knowledge"] = pk
+                            st.session_state["sym_product_profile_ai_note"] = desc_result.get("confidence_note", "")
+                        else:
+                            pk = product_knowledge
+                        overlay.empty()
+                        overlay = _show_thinking("Step 2/2 — Building symptom taxonomy…")
+                        # Step 2: Generate taxonomy from knowledge + reviews
+                        tax_result = _ai_build_symptom_list(
+                            client=client,
+                            product_description=st.session_state.get("sym_product_profile", pdesc),
+                            sample_reviews=sample_reviews,
+                            product_knowledge=pk,
+                        )
+                        st.session_state["sym_ai_build_result"] = tax_result
+                        st.session_state["sym_product_knowledge"] = _normalize_product_knowledge(tax_result.get("product_knowledge") or pk)
+                        # Step 2b: Auto-calibrate the new taxonomy
+                        if _HAS_SYMPTOMIZER_V3:
                             overlay.empty()
-                        st.rerun()
-                else:
-                    # Main action: Generate Taxonomy (runs both steps internally)
-                    if st.button("🚀 Generate taxonomy", type="primary", use_container_width=True, key="sym_generate_taxonomy"):
-                        overlay = _show_thinking("Step 1/2 — Analyzing product and reviews…")
-                        try:
-                            # Step 1: Generate/update product knowledge
-                            desc_result = _ai_generate_product_description(client=client, sample_reviews=sample_reviews, existing_description=pdesc)
-                            if desc_result.get("description"):
-                                st.session_state["sym_product_profile"] = desc_result["description"]
-                                pk = _normalize_product_knowledge(desc_result.get("product_knowledge") or product_knowledge)
-                                st.session_state["sym_product_knowledge"] = pk
-                                st.session_state["sym_product_profile_ai_note"] = desc_result.get("confidence_note", "")
-                            else:
-                                pk = product_knowledge
-                            overlay.empty()
-                            overlay = _show_thinking("Step 2/2 — Building symptom taxonomy…")
-                            # Step 2: Generate taxonomy from knowledge + reviews
-                            tax_result = _ai_build_symptom_list(
-                                client=client,
-                                product_description=st.session_state.get("sym_product_profile", pdesc),
-                                sample_reviews=sample_reviews,
-                                product_knowledge=pk,
-                            )
-                            st.session_state["sym_ai_build_result"] = tax_result
-                            st.session_state["sym_product_knowledge"] = _normalize_product_knowledge(tax_result.get("product_knowledge") or pk)
-                            st.session_state["sym_wizard_step"] = 2
-                        except Exception as exc:
-                            st.error(f"Taxonomy generation failed: {exc}")
-                        finally:
-                            overlay.empty()
-                        st.rerun()
+                            overlay = _show_thinking("Calibrating taxonomy fit…")
+                            try:
+                                _tax_dels = _normalize_tag_list([item.get("label", item) if isinstance(item, dict) else item for item in tax_result.get("delighters", [])])
+                                _tax_dets = _normalize_tag_list([item.get("label", item) if isinstance(item, dict) else item for item in tax_result.get("detractors", [])])
+                                calib = _v3_calibration_preflight(
+                                    client=client, sample_reviews=_sample_reviews_for_symptomizer(overall_df, 8),
+                                    allowed_detractors=_tax_dets, allowed_delighters=_tax_dels,
+                                    product_profile=st.session_state.get("sym_product_profile", ""),
+                                    chat_complete_fn=_chat_complete_with_fallback_models,
+                                    safe_json_load_fn=_safe_json_load, model_fn=_shared_model, reasoning_fn=_shared_reasoning,
+                                )
+                                st.session_state["sym_calibration_result"] = calib
+                            except Exception:
+                                pass
+                        st.session_state["sym_wizard_step"] = 2
+                    except Exception as exc:
+                        st.error(f"Taxonomy generation failed: {exc}")
+                    finally:
+                        overlay.empty()
+                    st.rerun()
 
-                    # Show existing product knowledge if available
-                    ai_note = st.session_state.get("sym_product_profile_ai_note", "")
-                    if ai_note:
-                        st.caption(ai_note)
-                    _render_product_knowledge_panel(product_knowledge)
+                # Show existing product knowledge if available
+                ai_note = st.session_state.get("sym_product_profile_ai_note", "")
+                if ai_note:
+                    st.caption(ai_note)
+                _render_product_knowledge_panel(product_knowledge)
 
             # ── STEP 2: Review taxonomy + Approve ─────────────────────────
             elif wizard_step == 2 and ai_result:
@@ -8837,6 +8850,19 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                 det_bucket_counts = Counter(str(item.get("bucket") or "Product Specific") for item in preview_dets)
 
                 st.markdown("**Generated taxonomy — review before running:**")
+                # Show calibration result if available
+                cr = st.session_state.get("sym_calibration_result")
+                if cr:
+                    rec = cr.get("recommendation", "")
+                    hit = cr.get("hit_rate", 0)
+                    avg = cr.get("avg_tags_per_review", 0)
+                    unu = len(cr.get("unused_detractors", [])) + len(cr.get("unused_delighters", []))
+                    if rec == "ready":
+                        st.success(f"✅ Calibration passed — {hit:.0%} hit rate, {avg:.1f} avg tags/review. {unu} unused labels.")
+                    elif rec == "needs_tuning":
+                        st.warning(f"⚠️ Calibration: {hit:.0%} hit rate — consider editing. {unu} unused labels.")
+                    else:
+                        st.error(f"🔴 Low coverage — {hit:.0%} hit rate. Review the taxonomy before running.")
                 st.markdown(_chip_html([
                     (f"Category: {str(ai_result.get('category') or 'general').replace('_', ' ').title()}", "blue"),
                     (f"Delighters: {len(ai_result.get('delighters', []))}", "green"),
@@ -8844,6 +8870,28 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                     (f"Category drivers: {del_bucket_counts.get('Category Driver', 0) + det_bucket_counts.get('Category Driver', 0)}", "indigo"),
                     (f"Product specific: {del_bucket_counts.get('Product Specific', 0) + det_bucket_counts.get('Product Specific', 0)}", "gray"),
                 ]), unsafe_allow_html=True)
+                # Show diff vs old taxonomy if rebuilding
+                _old_tax = st.session_state.pop("_sym_old_taxonomy", None)
+                if _old_tax:
+                    new_det_count = len(ai_result.get("detractors", []))
+                    new_del_count = len(ai_result.get("delighters", []))
+                    old_det_count = _old_tax.get("det_count", 0)
+                    old_del_count = _old_tax.get("del_count", 0)
+                    new_det_set = set(str(l.get("label", l) if isinstance(l, dict) else l).lower() for l in ai_result.get("detractors", []))
+                    new_del_set = set(str(l.get("label", l) if isinstance(l, dict) else l).lower() for l in ai_result.get("delighters", []))
+                    old_det_set = set(str(l).lower() for l in _old_tax.get("det_labels", []))
+                    old_del_set = set(str(l).lower() for l in _old_tax.get("del_labels", []))
+                    added_det = len(new_det_set - old_det_set)
+                    removed_det = len(old_det_set - new_det_set)
+                    added_del = len(new_del_set - old_del_set)
+                    removed_del = len(old_del_set - new_del_set)
+                    if added_det or removed_det or added_del or removed_del:
+                        diff_parts = []
+                        if added_det: diff_parts.append(f"+{added_det} det")
+                        if removed_det: diff_parts.append(f"-{removed_det} det")
+                        if added_del: diff_parts.append(f"+{added_del} del")
+                        if removed_del: diff_parts.append(f"-{removed_del} del")
+                        st.caption(f"Changes vs previous taxonomy: {' · '.join(diff_parts)} (was {old_det_count} det / {old_del_count} del)")
                 if ai_result.get("taxonomy_note"):
                     st.caption(str(ai_result.get("taxonomy_note")))
 
@@ -8906,9 +8954,11 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                 if btn_cols[1].button("🔄 Regenerate", use_container_width=True, key="sym_regenerate"):
                     st.session_state.pop("sym_ai_build_result", None)
                     st.session_state["sym_wizard_step"] = 1
+                    st.session_state["_sym_wizard_force_step"] = 1
                     st.rerun()
                 if btn_cols[2].button("← Back", use_container_width=True, key="sym_wizard_back"):
                     st.session_state["sym_wizard_step"] = 1
+                    st.session_state["_sym_wizard_force_step"] = 1
                     st.rerun()
 
             # ── STEP 3: Ready to run / already has taxonomy ───────────────
@@ -8919,7 +8969,12 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                     (f"Source: {st.session_state.get('sym_symptoms_source', 'unknown')}", "gray"),
                 ]), unsafe_allow_html=True)
                 if st.button("🔄 Rebuild taxonomy from scratch", use_container_width=True, key="sym_rebuild_taxonomy"):
+                    # Store old taxonomy counts for diff display in step 2
+                    old_dets = list(st.session_state.get("sym_detractors") or [])
+                    old_dels = list(st.session_state.get("sym_delighters") or [])
+                    st.session_state["_sym_old_taxonomy"] = {"det_count": len(old_dets), "del_count": len(old_dels), "det_labels": old_dets[:30], "del_labels": old_dels[:30]}
                     st.session_state["sym_wizard_step"] = 1
+                    st.session_state["_sym_wizard_force_step"] = 1
                     st.session_state.pop("sym_ai_build_result", None)
                     st.rerun()
                 _render_product_knowledge_panel(_normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {}))
