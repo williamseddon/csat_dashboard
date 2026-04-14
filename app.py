@@ -10464,7 +10464,7 @@ def main():
               <div class='app-title'>StarWalk Review Analyst</div>
               <span class='beta-chip'>Beta</span>
             </div>
-            <div class='app-subtitle'>Single-file Streamlit workspace for executive review, deep-dive exploration, Review Prompt, Symptomizer, and a mocked Social Listening Beta route that works even before reviews exist.</div>
+            <div class='app-subtitle'>Single-file Streamlit workspace for executive review, deep-dive exploration, Review Prompt, Symptomizer, and a demo Social Listening studio that previews the future Meltwater + AI workflow even before live sources are wired.</div>
           </div>
         </div>
       </div>
@@ -10752,14 +10752,14 @@ def main():
         active_tab = st.session_state.get("workspace_active_tab", TAB_DASHBOARD)
         if active_tab == TAB_SOCIAL_LISTENING:
             st.markdown("""<div class='soft-panel' style='margin-top:.55rem;'>
-              <b>Social-only beta mode</b> · No uploaded review file is required here. The mocked FlexStyle experience below is designed to preview the future Meltwater-powered social listening workflow before Bazaarvoice / PowerReviews / uploads are brought in.
+              <b>Social-only beta mode</b> · No uploaded review file is required here. The demo Social Listening studio below previews the future Meltwater + AI workflow with polished placeholder content while live source rules are still being finalized.
             </div>""", unsafe_allow_html=True)
             _render_social_listening_tab()
             return
         st.markdown("""<div class='empty-state-card'>
           <div style="font-size:2.5rem;margin-bottom:.75rem;">📊</div>
           <div class='empty-state-title' style="font-size:16px;">No workspace loaded</div>
-          <div class='empty-state-sub'>Build a workspace above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer. Or skip reviews entirely and open <b>Social Listening Beta</b> from the sidebar to explore the mocked FlexStyle + Meltwater experience.</div>
+          <div class='empty-state-sub'>Build a workspace above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer. Or skip reviews entirely and open <b>Social Listening Beta</b> from the sidebar to explore the demo social studio and preview the future Meltwater + AI experience.</div>
         </div>""", unsafe_allow_html=True)
         if st.button("📣 Open Social Listening Beta", type="primary", key="empty_state_open_social"):
             st.session_state["workspace_active_tab"] = TAB_SOCIAL_LISTENING
