@@ -76,15 +76,52 @@ def _highlight_keywords_in_text(text, keywords):
 
 
 def _highlight_evidence(text, evidence_items):
+    """Highlight evidence in review text with fuzzy matching.
+    
+    Tier 1: Exact regex match (case-insensitive)
+    Tier 2: Fuzzy — find the best overlapping window in the review text
+            where all significant words from the evidence appear nearby
+    """
     text_str = str(text)
     if not evidence_items or not text_str.strip():
         return f"<div class='review-body'>{html.escape(text_str)}</div>"
+    _STOP = {"the","a","an","and","to","for","of","in","on","with","is","it","very","really","so"}
     hits = []
+    text_lower = text_str.lower()
     for ev_text, tag_label in evidence_items:
-        if not ev_text.strip():
+        ev_clean = ev_text.strip()
+        if not ev_clean:
             continue
-        for m in re.compile(re.escape(ev_text.strip()), re.IGNORECASE).finditer(text_str):
+        # Tier 1: Exact match
+        found = False
+        for m in re.compile(re.escape(ev_clean), re.IGNORECASE).finditer(text_str):
             hits.append((m.start(), m.end(), tag_label, m.group()))
+            found = True
+        # Tier 2: Fuzzy match — find the tightest window containing all content words
+        if not found:
+            ev_words = [w for w in ev_clean.lower().split() if len(w) > 2 and w not in _STOP]
+            if len(ev_words) >= 2:
+                best_start, best_end, best_len = -1, -1, 999
+                for w in ev_words:
+                    pos = text_lower.find(w)
+                    while pos >= 0:
+                        window_start = max(0, pos - 10)
+                        window_end = min(len(text_lower), pos + 120)
+                        window = text_lower[window_start:window_end]
+                        if all(ew in window for ew in ev_words):
+                            positions = []
+                            for ew in ev_words:
+                                wp = window.find(ew)
+                                if wp >= 0:
+                                    positions.append((window_start + wp, window_start + wp + len(ew)))
+                            if positions:
+                                s = min(p[0] for p in positions)
+                                e = max(p[1] for p in positions)
+                                if (e - s) < best_len:
+                                    best_start, best_end, best_len = s, e, e - s
+                        pos = text_lower.find(w, pos + 1)
+                if best_start >= 0 and best_len < 150:
+                    hits.append((best_start, best_end, tag_label, text_str[best_start:best_end]))
     if not hits:
         return f"<div class='review-body'>{html.escape(text_str)}</div>"
     hits.sort(key=lambda h: h[0])

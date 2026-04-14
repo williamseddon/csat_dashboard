@@ -5537,6 +5537,108 @@ def _product_knowledge_context_text(knowledge, *, limit_per_section=5):
     return "\n".join(lines)
 
 
+def _enrich_product_knowledge_from_run(processed_rows, *, min_mentions=3, max_per_field=20):
+    """Post-run feedback loop: enrich product knowledge from tagging results.
+    
+    Analyzes the completed run to discover:
+    - New failure modes from frequent detractor tags
+    - New delighter themes from frequent delighter tags  
+    - Unlisted candidates that appeared often enough to be real themes
+    - Watchouts from safety/reliability findings
+    
+    Updates session state product knowledge so subsequent runs and
+    taxonomy rebuilds benefit from what the tagger learned.
+    """
+    if not processed_rows or len(processed_rows) < 5:
+        return {}
+    
+    knowledge = _normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {})
+    existing_failure_modes = set(str(x).lower() for x in (knowledge.get("likely_failure_modes") or []))
+    existing_del_themes = set(str(x).lower() for x in (knowledge.get("likely_delighter_themes") or []))
+    existing_det_themes = set(str(x).lower() for x in (knowledge.get("likely_detractor_themes") or []))
+    existing_watchouts = set(str(x).lower() for x in (knowledge.get("watchouts") or []))
+    
+    # Count tag frequencies
+    det_freq = {}
+    del_freq = {}
+    unl_det_freq = {}
+    unl_del_freq = {}
+    safety_issues = 0
+    reliability_failures = 0
+    
+    for rec in processed_rows:
+        for tag in (rec.get("wrote_dets") or []):
+            det_freq[tag] = det_freq.get(tag, 0) + 1
+        for tag in (rec.get("wrote_dels") or []):
+            del_freq[tag] = del_freq.get(tag, 0) + 1
+        for tag in (rec.get("unl_dets") or []):
+            t = str(tag).strip()
+            if t:
+                unl_det_freq[t] = unl_det_freq.get(t, 0) + 1
+        for tag in (rec.get("unl_dels") or []):
+            t = str(tag).strip()
+            if t:
+                unl_del_freq[t] = unl_del_freq.get(t, 0) + 1
+        if str(rec.get("safety", "")).strip() in ("Safety Issue", "Minor Concern"):
+            safety_issues += 1
+        if str(rec.get("reliability", "")).strip() == "Failure":
+            reliability_failures += 1
+    
+    n = max(len(processed_rows), 1)
+    enrichments = {"failure_modes": [], "delighter_themes": [], "detractor_themes": [], "watchouts": []}
+    
+    # Discover new failure modes from high-frequency detractors
+    for tag, count in sorted(det_freq.items(), key=lambda x: -x[1]):
+        if count >= min_mentions and tag.lower() not in existing_failure_modes and tag.lower() not in existing_det_themes:
+            enrichments["detractor_themes"].append(tag)
+            # Tags appearing in >15% of reviews are likely failure modes
+            if count / n >= 0.15:
+                enrichments["failure_modes"].append(tag)
+    
+    # Discover new delighter themes
+    for tag, count in sorted(del_freq.items(), key=lambda x: -x[1]):
+        if count >= min_mentions and tag.lower() not in existing_del_themes:
+            enrichments["delighter_themes"].append(tag)
+    
+    # Promote frequent unlisted candidates
+    for tag, count in sorted(unl_det_freq.items(), key=lambda x: -x[1]):
+        if count >= max(min_mentions, 3) and tag.lower() not in existing_det_themes and tag.lower() not in existing_failure_modes:
+            enrichments["detractor_themes"].append(tag)
+    for tag, count in sorted(unl_del_freq.items(), key=lambda x: -x[1]):
+        if count >= max(min_mentions, 3) and tag.lower() not in existing_del_themes:
+            enrichments["delighter_themes"].append(tag)
+    
+    # Safety/reliability findings → watchouts
+    if safety_issues >= 2 and "safety concerns reported" not in existing_watchouts:
+        enrichments["watchouts"].append(f"Safety concerns in {safety_issues}/{n} reviews")
+    if reliability_failures >= max(3, n * 0.1) and "reliability failures reported" not in existing_watchouts:
+        enrichments["watchouts"].append(f"Reliability failures in {reliability_failures}/{n} reviews")
+    
+    # Apply enrichments to session state
+    updated = dict(knowledge)
+    changed = False
+    for field, session_key in [
+        ("failure_modes", "likely_failure_modes"),
+        ("delighter_themes", "likely_delighter_themes"),
+        ("detractor_themes", "likely_detractor_themes"),
+        ("watchouts", "watchouts"),
+    ]:
+        new_items = enrichments.get(field, [])
+        if new_items:
+            current = list(updated.get(session_key) or [])
+            for item in new_items[:max_per_field - len(current)]:
+                if item not in current:
+                    current.append(item)
+                    changed = True
+            updated[session_key] = current[:max_per_field]
+    
+    if changed:
+        st.session_state["sym_product_knowledge"] = updated
+        _log.info("Product knowledge enriched: %s", {k: len(v) for k, v in enrichments.items() if v})
+    
+    return enrichments
+
+
 def _render_product_knowledge_panel(knowledge):
     knowledge = _normalize_product_knowledge(knowledge)
     visible_keys = [
@@ -7476,15 +7578,53 @@ def _highlight_keywords_in_text(text, keywords):
 
 
 def _highlight_evidence(text, evidence_items):
+    """Highlight evidence in review text with fuzzy matching.
+    
+    Tier 1: Exact regex match (case-insensitive)
+    Tier 2: Fuzzy — find the best overlapping window in the review text
+            where all significant words from the evidence appear nearby
+    """
     text_str = str(text)
     if not evidence_items or not text_str.strip():
         return f"<div class='review-body'>{html.escape(text_str)}</div>"
     hits = []
+    text_lower = text_str.lower()
     for ev_text, tag_label in evidence_items:
-        if not ev_text.strip():
+        ev_clean = ev_text.strip()
+        if not ev_clean:
             continue
-        for m in re.compile(re.escape(ev_text.strip()), re.IGNORECASE).finditer(text_str):
+        # Tier 1: Exact match
+        found = False
+        for m in re.compile(re.escape(ev_clean), re.IGNORECASE).finditer(text_str):
             hits.append((m.start(), m.end(), tag_label, m.group()))
+            found = True
+        # Tier 2: Fuzzy match — find the tightest window containing all content words
+        if not found:
+            ev_words = [w for w in ev_clean.lower().split() if len(w) > 2 and w.lower() not in {"the","a","an","and","to","for","of","in","on","with","is","it","very","really","so"}]
+            if len(ev_words) >= 2:
+                best_start, best_end, best_len = -1, -1, 999
+                for i, w in enumerate(ev_words):
+                    pos = text_lower.find(w)
+                    while pos >= 0:
+                        # Check if all other words appear within 120 chars
+                        window_start = max(0, pos - 10)
+                        window_end = min(len(text_lower), pos + 120)
+                        window = text_lower[window_start:window_end]
+                        if all(ew in window for ew in ev_words):
+                            # Find tightest bounds
+                            positions = []
+                            for ew in ev_words:
+                                wp = window.find(ew)
+                                if wp >= 0:
+                                    positions.append((window_start + wp, window_start + wp + len(ew)))
+                            if positions:
+                                s = min(p[0] for p in positions)
+                                e = max(p[1] for p in positions)
+                                if (e - s) < best_len:
+                                    best_start, best_end, best_len = s, e, e - s
+                        pos = text_lower.find(w, pos + 1)
+                if best_start >= 0 and best_len < 150:
+                    hits.append((best_start, best_end, tag_label, text_str[best_start:best_end]))
     if not hits:
         return f"<div class='review-body'>{html.escape(text_str)}</div>"
     hits.sort(key=lambda h: h[0])
@@ -7506,10 +7646,17 @@ def _highlight_evidence(text, evidence_items):
 
 
 def _build_evidence_lookup(processed_rows):
+    """Build evidence lookup keyed by BOTH DataFrame index AND review_id.
+    
+    The review explorer resets the index after sorting, so lookups by
+    sequential position fail. Keying by review_id ensures evidence
+    highlighting works regardless of sort order.
+    """
     lookup = {}
     for rec in processed_rows:
         idx = str(rec.get("idx", ""))
-        if not idx:
+        rid = str(rec.get("review_id", rec.get("rid", "")))
+        if not idx and not rid:
             continue
         entries = []
         for lab, evs in (rec.get("ev_det", {}) or {}).items():
@@ -7521,19 +7668,29 @@ def _build_evidence_lookup(processed_rows):
                 if e and e.strip():
                     entries.append((e.strip(), lab))
         if entries:
-            lookup[idx] = entries
+            if idx:
+                lookup[idx] = entries
+            if rid and rid != idx:
+                lookup[rid] = entries
     return lookup
 
 
-def _symptom_tags_html(det_tags, del_tags):
+def _symptom_tags_html(det_tags, del_tags, *, ev_det=None, ev_del=None):
     if not det_tags and not del_tags:
         return ""
+    ev_det = ev_det or {}
+    ev_del = ev_del or {}
+    def _chip(tag, color, ev_map):
+        ev = ev_map.get(tag, [])
+        tooltip = _esc(" | ".join(str(e)[:80] for e in ev)) if ev else "No evidence captured"
+        ev_indicator = f"<span style='font-size:9px;opacity:.6;margin-left:2px;'>({len(ev)})</span>" if ev else ""
+        return f"<span class='chip {color}' style='font-size:11px;padding:3px 8px;cursor:help;' title='{tooltip}'>{_esc(tag)}{ev_indicator}</span>"
     sym_html = "<div style='margin-top:9px;padding-top:9px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px;'>"
     if det_tags:
-        det_chips = "".join(f"<span class='chip red' style='font-size:11px;padding:3px 8px;'>{_esc(t)}</span>" for t in det_tags)
+        det_chips = "".join(_chip(t, "red", ev_det) for t in det_tags)
         sym_html += f"<div style='display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;'><span style='font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--danger);font-weight:700;white-space:nowrap;padding-top:3px;'>Issues</span><div style='display:flex;gap:4px;flex-wrap:wrap;'>{det_chips}</div></div>"
     if del_tags:
-        del_chips = "".join(f"<span class='chip green' style='font-size:11px;padding:3px 8px;'>{_esc(t)}</span>" for t in del_tags)
+        del_chips = "".join(_chip(t, "green", ev_del) for t in del_tags)
         sym_html += f"<div style='display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;'><span style='font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--success);font-weight:700;white-space:nowrap;padding-top:3px;'>Strengths</span><div style='display:flex;gap:4px;flex-wrap:wrap;'>{del_chips}</div></div>"
     sym_html += "</div>"
     return sym_html
@@ -7572,7 +7729,21 @@ def _render_review_card(row, evidence_items=None):
                 st.markdown(f"<div class='review-body'>{highlighted}</div>", unsafe_allow_html=True)
             else:
                 st.markdown(f"<div class='review-body'>{html.escape(review_text)}</div>", unsafe_allow_html=True)
-        tag_html = _symptom_tags_html(det_tags, del_tags)
+        # Collect evidence maps from processed symptomizer records
+        _ev_det_map, _ev_del_map = {}, {}
+        try:
+            _rid = _safe_text(row.get("review_id"))
+            _oidx = str(row.get("_orig_idx", ""))
+            for pr in (st.session_state.get("sym_processed_rows") or []):
+                pr_idx = str(pr.get("idx", ""))
+                pr_rid = str(pr.get("review_id", pr.get("rid", "")))
+                if pr_idx == _oidx or pr_rid == _rid or (pr_idx and pr_idx == str(getattr(row, "name", ""))):
+                    _ev_det_map = pr.get("ev_det", {})
+                    _ev_del_map = pr.get("ev_del", {})
+                    break
+        except Exception:
+            pass
+        tag_html = _symptom_tags_html(det_tags, del_tags, ev_det=_ev_det_map, ev_del=_ev_del_map)
         if tag_html:
             st.markdown(tag_html, unsafe_allow_html=True)
         footer_bits = []
@@ -8077,7 +8248,11 @@ def _render_review_explorer(*, summary, overall_df, filtered_df, prompt_artifact
     show_ev = tc[3].toggle("Evidence highlights", value=True, key="re_show_highlights", help="Highlight Symptomizer evidence in yellow — hover to see the AI tag")
     if bundle_error is not None:
         st.warning(f"Current-view export is temporarily unavailable: {bundle_error}")
-    ordered_df = _sort_reviews(filtered_df, sort_mode).reset_index(drop=True)
+    ordered_df = _sort_reviews(filtered_df, sort_mode)
+    # Preserve original DataFrame index as a column for evidence lookup
+    if "_orig_idx" not in ordered_df.columns:
+        ordered_df = ordered_df.assign(_orig_idx=ordered_df.index)
+    ordered_df = ordered_df.reset_index(drop=True)
     if ordered_df.empty:
         st.info("No reviews match the current filters.")
         return
@@ -8089,7 +8264,9 @@ def _render_review_explorer(*, summary, overall_df, filtered_df, prompt_artifact
     page_df = ordered_df.iloc[start:start + per_page]
     ev_lookup = _build_evidence_lookup(st.session_state.get("sym_processed_rows") or [])
     for orig_idx, row in page_df.iterrows():
-        ev_items = (ev_lookup.get(str(orig_idx)) or ev_lookup.get(str(row.get("review_id", "")))) if show_ev else None
+        _oidx = str(row.get("_orig_idx", orig_idx))
+        _rid = str(row.get("review_id", ""))
+        ev_items = (ev_lookup.get(_oidx) or ev_lookup.get(_rid) or ev_lookup.get(str(orig_idx))) if show_ev else None
         _render_review_card(row, evidence_items=ev_items)
         st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
     with st.container(border=True):
@@ -8470,133 +8647,120 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
             st.info("Using only the Universal Neutral Symptoms pack right now. Add product-specific symptoms below for better recall and cleaner reporting.")
         else:
             st.warning("No active symptoms are configured. Add product-specific symptoms below or re-enable Universal Neutral Symptoms.")
-    # ── Phase 2: One-click auto-build ────────────────────────────────────
-    has_knowledge = bool(st.session_state.get("sym_product_knowledge"))
-    has_profile = bool(st.session_state.get("sym_product_profile", "").strip())
+    # ── Taxonomy status ─────────────────────────────────────────────────
     has_taxonomy = bool(st.session_state.get("sym_delighters") or st.session_state.get("sym_detractors"))
-    if has_profile and api_key and not has_taxonomy:
-        with st.container(border=True):
-            st.markdown("**🚀 Auto-build taxonomy**")
-            st.caption("Product profile detected. One click to generate a symptom taxonomy from product knowledge, calibrate it, and activate it.")
-            ab_cols = st.columns([2, 1])
-            if ab_cols[0].button("🚀 Auto-build & calibrate", type="primary", use_container_width=True, key="sym_auto_build_btn"):
-                client_ab = _get_client()
-                if client_ab:
-                    with st.spinner("Building taxonomy from product knowledge…"):
-                        try:
-                            profile_ab = st.session_state.get("sym_product_profile", "")
-                            knowledge_ab = st.session_state.get("sym_product_knowledge") or {}
-                            sample_ab = _sample_reviews_for_symptomizer(overall_df, 40)
-                            result = _ai_build_symptom_list(
-                                client=client_ab,
-                                product_description=profile_ab,
-                                sample_reviews=sample_ab,
-                                product_knowledge=knowledge_ab,
-                            )
-                            if result:
-                                ai_dels = _normalize_tag_list([item.get("label") for item in result.get("delighters", [])])
-                                ai_dets = _normalize_tag_list([item.get("label") for item in result.get("detractors", [])])
-                                ai_aliases = {}
-                                for item in result.get("delighters", []) + result.get("detractors", []):
-                                    if item.get("aliases"):
-                                        ai_aliases[item["label"]] = item["aliases"]
-                                # Activate taxonomy
-                                include_neutral = bool(st.session_state.get("sym_include_universal_neutral", True))
-                                final_dets, final_dels = _ensure_universal_taxonomy(ai_dets, ai_dels, include_universal_neutral=include_neutral)
-                                st.session_state["sym_detractors"] = final_dets
-                                st.session_state["sym_delighters"] = final_dels
-                                st.session_state["sym_aliases"] = _alias_map_for_catalog(final_dels, final_dets, extra_aliases=ai_aliases)
-                                st.session_state["sym_symptoms_source"] = "ai-auto-build"
-                                st.session_state["sym_taxonomy_category"] = result.get("category", "general")
-                                st.session_state["sym_taxonomy_preview_items"] = _taxonomy_preview_items_with_side(result)
-                                st.session_state["sym_ai_build_result"] = result
-                                # Run calibration
-                                if _HAS_SYMPTOMIZER_V3:
-                                    calib = _v3_calibration_preflight(
-                                        client=client_ab,
-                                        sample_reviews=_sample_reviews_for_symptomizer(overall_df, 8),
-                                        allowed_detractors=final_dets,
-                                        allowed_delighters=final_dels,
-                                        product_profile=profile_ab,
-                                        chat_complete_fn=_chat_complete_with_fallback_models,
-                                        safe_json_load_fn=_safe_json_load,
-                                        model_fn=_shared_model,
-                                        reasoning_fn=_shared_reasoning,
-                                    )
-                                    st.session_state["sym_calibration_result"] = calib
-                                    rec = calib.get("recommendation", "")
-                                    if rec == "ready":
-                                        st.success(f"✅ Taxonomy built & calibrated — {len(final_dets)} detractors, {len(final_dels)} delighters, {calib.get('hit_rate', 0):.0%} hit rate. Ready to run!")
-                                    elif rec == "needs_tuning":
-                                        st.warning(f"⚠️ Taxonomy built but needs tuning — {calib.get('hit_rate', 0):.0%} hit rate. Review the catalog below before running.")
-                                    else:
-                                        st.error(f"🔴 Low calibration — {calib.get('hit_rate', 0):.0%} hit rate. Consider editing the taxonomy.")
-                                else:
-                                    st.success(f"✅ Taxonomy built — {len(final_dets)} detractors, {len(final_dels)} delighters. Ready to run!")
-                                st.rerun()
-                        except Exception as exc:
-                            st.error(f"Auto-build failed: {exc}")
-            if has_knowledge:
-                ab_cols[1].markdown(f"<span style='color:var(--slate-400);font-size:12px;'>Knowledge: {sum(len(v) for v in (st.session_state.get('sym_product_knowledge') or {}).values() if isinstance(v, list))} items</span>", unsafe_allow_html=True)
-    elif has_profile and has_taxonomy:
+    if has_taxonomy:
         st.markdown(f"<div class='helper-chip-row'><span class='helper-chip' style='background:rgba(5,150,105,.10);color:#059669;border-color:rgba(5,150,105,.25);'>✅ Taxonomy active — {len(st.session_state.get('sym_detractors', []))} det · {len(st.session_state.get('sym_delighters', []))} del</span></div>", unsafe_allow_html=True)
-    sym_tabs = st.tabs(["🤖  AI builder", "✏️  Manual entry", "📄  Upload workbook"])
+    sym_tabs = st.tabs(["🚀  Generate taxonomy", "✏️  Manual entry", "📄  Upload workbook"])
     with sym_tabs[0]:
         if not api_key:
             st.warning("OpenAI API key required.")
         else:
-            pdesc = st.text_area("Product description", value=st.session_state.get("sym_product_profile", ""), placeholder="e.g. SharkNinja Ninja Air Fryer XL — 6-in-1 countertop air fryer with 6 qt basket", height=100, key="sym_pdesc")
-            if not overall_df.empty and "review_text" in overall_df.columns:
-                max_samples = min(250, max(5, len(overall_df)))
-                sample_n = st.slider("Sample reviews", min_value=5, max_value=max_samples, value=min(50, max_samples), step=5, key="sym_sample_n")
-                st.caption(f"Using {sample_n} of {len(overall_df):,} reviews.")
-            else:
-                sample_n = 50
-            ai_note = st.session_state.get("sym_product_profile_ai_note", "")
-            if ai_note:
-                st.caption(ai_note)
-
-            product_knowledge = _normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {})
-            sample_reviews = _sample_reviews_for_symptomizer(overall_df, sample_n)
-
-            desc_col, sym_col = st.columns([1.2, 1.4])
-            if desc_col.button("✨ AI draft product description", use_container_width=True, key="sym_ai_desc"):
-                overlay = _show_thinking("Drafting product description from reviews…")
-                try:
-                    result = _ai_generate_product_description(client=client, sample_reviews=sample_reviews, existing_description=pdesc)
-                    if result.get("description"):
-                        st.session_state["sym_product_profile"] = result["description"]
-                        st.session_state["sym_product_knowledge"] = _normalize_product_knowledge(result.get("product_knowledge") or {})
-                        st.session_state["_sym_pdesc_pending"] = result["description"]
-                        st.session_state["sym_product_profile_ai_note"] = result.get("confidence_note", "Generated from the current review sample.")
-                    else:
-                        st.session_state["sym_product_profile_ai_note"] = "No product description could be drafted from the current sample."
-                except Exception as exc:
-                    st.error(f"AI product description failed: {exc}")
-                finally:
-                    overlay.empty()
-                st.rerun()
-
-            if sym_col.button("🤖 Generate symptom list", type="primary", use_container_width=True, key="sym_ai_build"):
-                overlay = _show_thinking("Generating symptom catalog…")
-                try:
-                    result = _ai_build_symptom_list(client=client, product_description=pdesc, sample_reviews=sample_reviews, product_knowledge=product_knowledge)
-                    st.session_state["sym_ai_build_result"] = result
-                    st.session_state["sym_product_profile"] = pdesc
-                    st.session_state["sym_product_knowledge"] = _normalize_product_knowledge(result.get("product_knowledge") or product_knowledge)
-                except Exception as exc:
-                    st.error(f"AI builder failed: {exc}")
-                finally:
-                    overlay.empty()
-                st.rerun()
-            _render_product_knowledge_panel(product_knowledge)
+            # ── Unified 3-step wizard ─────────────────────────────────────
+            wizard_step = st.session_state.get("sym_wizard_step", 1)
             ai_result = st.session_state.get("sym_ai_build_result")
-            if ai_result:
+            # If taxonomy was already accepted, show step 3 ready state
+            if ai_result and wizard_step < 2:
+                wizard_step = 2
+            has_taxonomy = bool(st.session_state.get("sym_delighters") or st.session_state.get("sym_detractors"))
+            if has_taxonomy and wizard_step < 3 and not ai_result:
+                wizard_step = 3
+
+            # Step indicator
+            steps = [("1", "Generate", wizard_step >= 1), ("2", "Review", wizard_step >= 2), ("3", "Run", wizard_step >= 3)]
+            step_html = "<div style='display:flex;align-items:center;gap:6px;margin:0 0 16px;'>"
+            for num, label, active in steps:
+                bg = "var(--color-text-info)" if active else "var(--color-border-tertiary)"
+                fg = "#fff" if active else "var(--color-text-tertiary)"
+                step_html += f"<span style='display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;background:{bg};color:{fg};font-size:12px;font-weight:600;'>{num}</span>"
+                step_html += f"<span style='font-size:13px;color:{'var(--color-text-primary)' if active else 'var(--color-text-tertiary)'};font-weight:{'600' if active else '400'};'>{label}</span>"
+                if num != "3":
+                    step_html += "<span style='color:var(--color-border-secondary);font-size:11px;'>→</span>"
+            step_html += "</div>"
+            st.markdown(step_html, unsafe_allow_html=True)
+
+            # ── STEP 1: Product description + Generate ────────────────────
+            if wizard_step == 1:
+                pdesc = st.text_area(
+                    "Product description",
+                    value=st.session_state.get("sym_product_profile", ""),
+                    placeholder="e.g. SharkNinja FlexStyle HD440 — air styling tool with 4 attachments for curl, smooth, volumize, and dry",
+                    height=80,
+                    key="sym_pdesc",
+                )
+                if not overall_df.empty and "review_text" in overall_df.columns:
+                    max_samples = min(250, max(5, len(overall_df)))
+                    sample_n = st.slider("Sample reviews for taxonomy generation", min_value=5, max_value=max_samples, value=min(50, max_samples), step=5, key="sym_sample_n")
+                    st.caption(f"The AI will read {sample_n} of {len(overall_df):,} reviews to understand the product and build the taxonomy.")
+                else:
+                    sample_n = 50
+
+                product_knowledge = _normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {})
+                sample_reviews = _sample_reviews_for_symptomizer(overall_df, sample_n)
+
+                # Optional: draft description from reviews first
+                if not pdesc.strip():
+                    st.info("No product description yet. Click below to have AI draft one from the reviews, or type one manually.")
+                    if st.button("✨ Draft product description from reviews", use_container_width=True, key="sym_ai_desc"):
+                        overlay = _show_thinking("Reading reviews to draft product description…")
+                        try:
+                            result = _ai_generate_product_description(client=client, sample_reviews=sample_reviews, existing_description="")
+                            if result.get("description"):
+                                st.session_state["sym_product_profile"] = result["description"]
+                                st.session_state["sym_product_knowledge"] = _normalize_product_knowledge(result.get("product_knowledge") or {})
+                                st.session_state["sym_product_profile_ai_note"] = result.get("confidence_note", "Generated from the current review sample.")
+                        except Exception as exc:
+                            st.error(f"AI product description failed: {exc}")
+                        finally:
+                            overlay.empty()
+                        st.rerun()
+                else:
+                    # Main action: Generate Taxonomy (runs both steps internally)
+                    if st.button("🚀 Generate taxonomy", type="primary", use_container_width=True, key="sym_generate_taxonomy"):
+                        overlay = _show_thinking("Step 1/2 — Analyzing product and reviews…")
+                        try:
+                            # Step 1: Generate/update product knowledge
+                            desc_result = _ai_generate_product_description(client=client, sample_reviews=sample_reviews, existing_description=pdesc)
+                            if desc_result.get("description"):
+                                st.session_state["sym_product_profile"] = desc_result["description"]
+                                pk = _normalize_product_knowledge(desc_result.get("product_knowledge") or product_knowledge)
+                                st.session_state["sym_product_knowledge"] = pk
+                                st.session_state["sym_product_profile_ai_note"] = desc_result.get("confidence_note", "")
+                            else:
+                                pk = product_knowledge
+                            overlay.empty()
+                            overlay = _show_thinking("Step 2/2 — Building symptom taxonomy…")
+                            # Step 2: Generate taxonomy from knowledge + reviews
+                            tax_result = _ai_build_symptom_list(
+                                client=client,
+                                product_description=st.session_state.get("sym_product_profile", pdesc),
+                                sample_reviews=sample_reviews,
+                                product_knowledge=pk,
+                            )
+                            st.session_state["sym_ai_build_result"] = tax_result
+                            st.session_state["sym_product_knowledge"] = _normalize_product_knowledge(tax_result.get("product_knowledge") or pk)
+                            st.session_state["sym_wizard_step"] = 2
+                        except Exception as exc:
+                            st.error(f"Taxonomy generation failed: {exc}")
+                        finally:
+                            overlay.empty()
+                        st.rerun()
+
+                    # Show existing product knowledge if available
+                    ai_note = st.session_state.get("sym_product_profile_ai_note", "")
+                    if ai_note:
+                        st.caption(ai_note)
+                    _render_product_knowledge_panel(product_knowledge)
+
+            # ── STEP 2: Review taxonomy + Approve ─────────────────────────
+            elif wizard_step == 2 and ai_result:
+                product_knowledge = _normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {})
                 preview_dels = list(ai_result.get("preview_delighters") or [])
                 preview_dets = list(ai_result.get("preview_detractors") or [])
                 del_bucket_counts = Counter(str(item.get("bucket") or "Product Specific") for item in preview_dels)
                 det_bucket_counts = Counter(str(item.get("bucket") or "Product Specific") for item in preview_dets)
-                st.markdown("**Review and accept:**")
+
+                st.markdown("**Generated taxonomy — review before running:**")
                 st.markdown(_chip_html([
                     (f"Category: {str(ai_result.get('category') or 'general').replace('_', ' ').title()}", "blue"),
                     (f"Delighters: {len(ai_result.get('delighters', []))}", "green"),
@@ -8606,12 +8770,20 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                 ]), unsafe_allow_html=True)
                 if ai_result.get("taxonomy_note"):
                     st.caption(str(ai_result.get("taxonomy_note")))
-                preview_tabs = st.tabs(["🟢 Delighters preview", "🔴 Detractors preview"])
+
+                # Product knowledge summary
+                with st.expander("📚 Product knowledge (auto-generated)", expanded=False):
+                    _render_product_knowledge_panel(product_knowledge)
+
+                # Taxonomy preview
+                preview_tabs = st.tabs(["🟢 Delighters", "🔴 Detractors"])
                 with preview_tabs[0]:
                     _render_ai_taxonomy_preview_table(preview_dels, key_prefix="sym_ai_preview_del", side_label="Delighters")
                 with preview_tabs[1]:
                     _render_ai_taxonomy_preview_table(preview_dets, key_prefix="sym_ai_preview_det", side_label="Detractors")
-                with st.expander("Optional manual edit before accepting", expanded=False):
+
+                # Optional edit
+                with st.expander("✏️ Edit before running", expanded=False):
                     r1, r2 = st.columns(2)
                     with r1:
                         st.markdown("🟢 Delighters")
@@ -8619,28 +8791,67 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                     with r2:
                         st.markdown("🔴 Detractors")
                         st.text_area("Edit", value="\n".join(ai_result.get("detractors", [])), height=220, key="sym_ai_det_edit")
-                if st.button("✅ Accept generated taxonomy", type="primary", use_container_width=True, key="sym_accept_ai"):
+
+                # Review count + Approve & Run
+                st.divider()
+                rc1, rc2, rc3 = st.columns([1.5, 1, 1.5])
+                colmap = _detect_sym_cols(overall_df)
+                work = _detect_missing(overall_df, colmap)
+                available = len(work[work["Needs_Symptomization"] | work["Needs_Delighters"] | work["Needs_Detractors"]])
+                max_reviews = max(1, min(available, len(overall_df)))
+                n_reviews = rc1.number_input("Reviews to symptomize", min_value=1, max_value=max_reviews, value=min(max_reviews, 100), step=10, key="sym_wizard_n_reviews")
+                batch_size = int(rc2.number_input("Batch size", min_value=1, max_value=20, value=int(st.session_state.get("sym_batch_size", 5)), step=1, key="sym_wizard_batch_size"))
+                rc3.metric("Available reviews", f"{available:,}")
+
+                btn_cols = st.columns([1.5, 1, 1])
+                if btn_cols[0].button("✅ Approve & run symptomizer", type="primary", use_container_width=True, key="sym_approve_and_run"):
+                    # Accept taxonomy
                     accepted_dels, accepted_dets = _canonical_symptom_catalog(
-                        _parse_manual_tag_entries(st.session_state.get("sym_ai_del_edit", "")),
-                        _parse_manual_tag_entries(st.session_state.get("sym_ai_det_edit", "")),
+                        _parse_manual_tag_entries(st.session_state.get("sym_ai_del_edit", "\n".join(ai_result.get("delighters", [])))),
+                        _parse_manual_tag_entries(st.session_state.get("sym_ai_det_edit", "\n".join(ai_result.get("detractors", [])))),
                     )
+                    include_neutral = bool(st.session_state.get("sym_include_universal_neutral", True))
+                    final_dets, final_dels = _ensure_universal_taxonomy(accepted_dets, accepted_dels, include_universal_neutral=include_neutral)
                     st.session_state.update(
-                        sym_delighters=accepted_dels,
-                        sym_detractors=accepted_dets,
-                        sym_aliases=_alias_map_for_catalog(
-                            accepted_dels,
-                            accepted_dets,
-                            extra_aliases=ai_result.get("aliases") or {},
-                            existing_aliases=st.session_state.get("sym_aliases", {}),
-                        ),
+                        sym_delighters=final_dels,
+                        sym_detractors=final_dets,
+                        sym_aliases=_alias_map_for_catalog(final_dels, final_dets, extra_aliases=ai_result.get("aliases") or {}, existing_aliases=st.session_state.get("sym_aliases", {})),
                         sym_symptoms_source="ai",
                         sym_taxonomy_preview_items=_taxonomy_preview_items_with_side(ai_result),
                         sym_taxonomy_category=str(ai_result.get("category") or "general"),
                         sym_product_profile_ai_note=(ai_result.get("taxonomy_note") or st.session_state.get("sym_product_profile_ai_note", "")),
+                        sym_wizard_step=3,
+                        sym_wizard_auto_run=True,
+                        sym_wizard_n_reviews=int(n_reviews),
+                        sym_wizard_batch_size=int(batch_size),
                     )
                     st.session_state.pop("sym_ai_build_result", None)
-                    st.success("Accepted.")
                     st.rerun()
+                if btn_cols[1].button("🔄 Regenerate", use_container_width=True, key="sym_regenerate"):
+                    st.session_state.pop("sym_ai_build_result", None)
+                    st.session_state["sym_wizard_step"] = 1
+                    st.rerun()
+                if btn_cols[2].button("← Back", use_container_width=True, key="sym_wizard_back"):
+                    st.session_state["sym_wizard_step"] = 1
+                    st.rerun()
+
+            # ── STEP 3: Ready to run / already has taxonomy ───────────────
+            elif wizard_step >= 3 or has_taxonomy:
+                st.session_state["sym_wizard_step"] = 3
+                st.markdown(_chip_html([
+                    (f"✅ Taxonomy active — {len(st.session_state.get('sym_detractors', []))} det · {len(st.session_state.get('sym_delighters', []))} del", "green"),
+                    (f"Source: {st.session_state.get('sym_symptoms_source', 'unknown')}", "gray"),
+                ]), unsafe_allow_html=True)
+                if st.button("🔄 Rebuild taxonomy from scratch", use_container_width=True, key="sym_rebuild_taxonomy"):
+                    st.session_state["sym_wizard_step"] = 1
+                    st.session_state.pop("sym_ai_build_result", None)
+                    st.rerun()
+                _render_product_knowledge_panel(_normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {}))
+
+            else:
+                # Fallback: no ai_result but wizard_step=2 — reset
+                st.session_state["sym_wizard_step"] = 1
+                st.rerun()
     with sym_tabs[1]:
         if include_universal:
             st.caption("Universal Neutral Symptoms are managed by the toggle above, so this editor is just for product-specific symptoms.")
@@ -8759,6 +8970,12 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
     notice = st.session_state.pop("sym_run_notice", None)
     if notice:
         st.success(notice)
+    # ── Auto-run from wizard step 2 "Approve & Run" ──────────────────
+    wizard_auto_run = st.session_state.pop("sym_wizard_auto_run", False)
+    if wizard_auto_run:
+        n_to_process = st.session_state.pop("sym_wizard_n_reviews", int(n_to_process))
+        batch_size = st.session_state.pop("sym_wizard_batch_size", batch_size)
+        run_btn = True  # Force run
     if run_btn:
         prioritized = _prioritize_for_symptomization(target_df).head(int(n_to_process))
         rows_to_process = prioritized.copy()
@@ -8846,7 +9063,7 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                     _record_new_symptom_candidate(lab, idx=idx, side="delighter")
                 for lab in (out.get("unl_dets", []) or []):
                     _record_new_symptom_candidate(lab, idx=idx, side="detractor")
-                processed_local.append(dict(idx=idx, wrote_dets=final_dets, wrote_dels=final_dels, safety=out.get("safety", ""), reliability=out.get("reliability", ""), sessions=out.get("sessions", ""), ev_det=out.get("ev_det", {}), ev_del=out.get("ev_del", {}), unl_dels=out.get("unl_dels", []), unl_dets=out.get("unl_dets", [])))
+                processed_local.append(dict(idx=idx, review_id=str(actual_row.get("review_id", "")), wrote_dets=final_dets, wrote_dels=final_dels, safety=out.get("safety", ""), reliability=out.get("reliability", ""), sessions=out.get("sessions", ""), ev_det=out.get("ev_det", {}), ev_del=out.get("ev_del", {}), unl_dels=out.get("unl_dels", []), unl_dets=out.get("unl_dets", [])))
                 done += 1
             dataset_ck = dict(st.session_state["analysis_dataset"])
             dataset_ck["reviews_df"] = updated_df.copy()
@@ -8925,6 +9142,15 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
             "staged": bool(st.session_state.get("sym_staged_pipeline")),
             "cache_stats": _v3_result_cache.stats if _HAS_SYMPTOMIZER_V3 else {},
         }
+        # ── Post-run knowledge enrichment: close the feedback loop ────────
+        try:
+            enrichments = _enrich_product_knowledge_from_run(processed_local, min_mentions=max(3, done // 20))
+            enrichment_count = sum(len(v) for v in enrichments.values())
+            if enrichment_count > 0:
+                st.session_state["sym_last_run_stats"]["knowledge_enriched"] = enrichment_count
+                _log.info("Knowledge enrichment: %d new themes discovered", enrichment_count)
+        except Exception as enrich_exc:
+            _log.warning("Knowledge enrichment failed: %s", enrich_exc)
         st.rerun()
     st.divider()
     processed = st.session_state.get("sym_processed_rows") or []
@@ -8940,6 +9166,16 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
         sc3.metric("Avg/review", f"{last_stats.get('avg_per_review', 0):.1f}")
         sc4.metric("Speed", f"{last_stats.get('reviews', 0) / max(last_stats.get('elapsed_sec', 1), 0.1) * 60:.0f}/min")
         sc5.metric("Pipeline", "Staged" if last_stats.get("staged") else "Single-pass")
+        # Sub-stats row: cache + knowledge enrichment
+        sub_chips = []
+        cache_s = last_stats.get("cache_stats", {})
+        if cache_s.get("hits", 0) > 0:
+            sub_chips.append((f"Cache: {cache_s['hits']} hits saved", "indigo"))
+        ke = last_stats.get("knowledge_enriched", 0)
+        if ke > 0:
+            sub_chips.append((f"Knowledge enriched: {ke} new themes", "green"))
+        if sub_chips:
+            st.markdown(_chip_html(sub_chips), unsafe_allow_html=True)
     st.markdown("### 3 · Results")
     total_tags = sum(len(r.get("wrote_dets", [])) + len(r.get("wrote_dels", [])) for r in processed)
     st.markdown(_chip_html([(f"{len(processed)} reviews tagged", "green"), (f"{total_tags} labels written", "indigo")]), unsafe_allow_html=True)
