@@ -718,6 +718,7 @@ def tag_review_batch(
     max_ev_chars: int = 120,
     aliases: Optional[Mapping[str, Sequence[str]]] = None,
     include_universal_neutral: bool = True,
+    pre_category: str = "",  # Pre-computed category — skips inference API call
     # Injected callables from app.py (avoids circular import)
     chat_complete_fn: Optional[Callable] = None,
     safe_json_load_fn: Optional[Callable] = None,
@@ -761,9 +762,11 @@ def tag_review_batch(
     # Use uncached items for the AI call
     items_to_process = uncached_items
 
-    # Build prompt context — cache category inference (deterministic per product)
+    # Build prompt context — use pre-computed category if available (saves an API call)
     category = "general"
-    if infer_category_fn:
+    if pre_category and pre_category != "general":
+        category = pre_category
+    elif infer_category_fn:
         _cat_cache_key = f"cat_{hashlib.sha256(product_profile.encode('utf-8', errors='replace')).hexdigest()[:12]}"
         _cached_cat = getattr(tag_review_batch, '_category_cache', {}).get(_cat_cache_key)
         if _cached_cat:
@@ -811,7 +814,7 @@ def tag_review_batch(
     catalog_size = len(allowed_detractors) + len(allowed_delighters)
     catalog_multiplier = 1.0 + min(0.5, max(0, catalog_size - 20) / 80)  # up to 1.5x for 60+ labels
     base_tokens = int((200 * len(items_to_process) + 400) * catalog_multiplier)
-    max_out = min(6500, max(1200, base_tokens))
+    max_out = min(8000, max(1600, base_tokens))  # Higher ceiling prevents truncation on large batches
 
     # Call the AI
     if chat_complete_fn:

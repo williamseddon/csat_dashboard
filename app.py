@@ -6276,7 +6276,7 @@ def _call_symptomizer_batch(*, client, items, allowed_delighters, allowed_detrac
     # from taxonomy-free claim extraction justifies the extra API call.
     _user_staged = bool(st.session_state.get("sym_staged_pipeline"))
     _avg_review_words = sum(len(str(it.get("review", "")).split()) for it in items) / max(len(items), 1)
-    _auto_staged = _avg_review_words > 100 and len(items) <= 5  # Only for small batches of long reviews
+    _auto_staged = _avg_review_words > 200 and len(items) <= 5  # Only for small batches of very long reviews
     if _HAS_SYMPTOMIZER_V3 and (_user_staged or _auto_staged):
         from review_analyst.symptomizer import extract_claims, map_claims_to_taxonomy
         _SAFETY_KW = re.compile(r"\b(burn|fire|shock|electr|hazard|danger|injur|hospital|smoke|smoking|melted|caught fire|sparks?)\b", re.I)
@@ -6345,6 +6345,7 @@ def _call_symptomizer_batch(*, client, items, allowed_delighters, allowed_detrac
             allowed_detractors=allowed_detractors, product_profile=product_profile,
             product_knowledge=product_knowledge, max_ev_chars=max_ev_chars,
             aliases=aliases, include_universal_neutral=include_universal_neutral,
+            pre_category=st.session_state.get("sym_taxonomy_category", ""),
             chat_complete_fn=_chat_complete_with_fallback_models,
             safe_json_load_fn=_safe_json_load, refine_fn=_refine_tag_assignment,
             model_fn=_shared_model, reasoning_fn=_shared_reasoning,
@@ -7143,7 +7144,7 @@ def _init_state():
         sym_include_universal_neutral=True,
         sym_scope_choice="Missing both",
         sym_n_to_process=10,
-        sym_batch_size=5,
+        sym_batch_size=8,
         sym_max_ev_chars=120,
         sym_review_log_limit=50,
         sym_run_notice=None,
@@ -7802,7 +7803,7 @@ def _render_review_card(row, evidence_items=None):
             st.markdown(f"<div class='chip-wrap' style='justify-content:flex-end;gap:4px;flex-wrap:wrap;padding-top:2px;'>{status_chips}</div>", unsafe_allow_html=True)
         if evidence_items:
             st.markdown(_highlight_evidence(review_text, evidence_items), unsafe_allow_html=True)
-            st.caption("Highlights = Symptomizer evidence · hover to see the AI tag")
+            st.caption("Yellow highlights = Symptomizer evidence · hover to see the AI tag")
         else:
             active_kw = str(st.session_state.get("rf_kw", "")).strip()
             if active_kw:
@@ -8174,6 +8175,43 @@ def _render_dashboard(filtered_df, overall_df=None):
                 st.markdown("<div class='hero-card' style='padding:12px 16px;'>" + " · ".join(insights) + "</div>", unsafe_allow_html=True)
     except Exception:
         pass
+    # ── Symptomizer insights (if available) ───────────────────────────
+    _sym_processed = st.session_state.get("sym_processed_rows") or []
+    if _sym_processed and len(_sym_processed) >= 3:
+        try:
+            _det_freq = {}
+            _del_freq = {}
+            for _rec in _sym_processed:
+                for _t in (_rec.get("wrote_dets") or []):
+                    _det_freq[_t] = _det_freq.get(_t, 0) + 1
+                for _t in (_rec.get("wrote_dels") or []):
+                    _del_freq[_t] = _del_freq.get(_t, 0) + 1
+            _n = max(len(_sym_processed), 1)
+            _top_dets = sorted(_det_freq.items(), key=lambda x: -x[1])[:5]
+            _top_dels = sorted(_del_freq.items(), key=lambda x: -x[1])[:5]
+            if _top_dets or _top_dels:
+                _max_count = max([c for _, c in (_top_dets + _top_dels)] or [1])
+                dc1, dc2 = st.columns(2)
+                with dc1:
+                    bars_html = f"<div class='sym-insights-card'><div class='sym-insights-title' style='color:var(--danger);'>Top issues ({len(_sym_processed)} reviews tagged)</div>"
+                    for label, count in _top_dets:
+                        pct = count * 100 / _max_count
+                        bars_html += f"<div class='sym-bar'><span class='sym-bar-label'>{_esc(label)}</span><div class='sym-bar-track'><div class='sym-bar-fill det' style='width:{pct:.0f}%'></div></div><span class='sym-bar-count'>{count}</span></div>"
+                    if not _top_dets:
+                        bars_html += "<div style='font-size:12px;color:var(--slate-400);'>No detractors tagged</div>"
+                    bars_html += "</div>"
+                    st.markdown(bars_html, unsafe_allow_html=True)
+                with dc2:
+                    bars_html = f"<div class='sym-insights-card'><div class='sym-insights-title' style='color:var(--success);'>Top strengths ({len(_sym_processed)} reviews tagged)</div>"
+                    for label, count in _top_dels:
+                        pct = count * 100 / _max_count
+                        bars_html += f"<div class='sym-bar'><span class='sym-bar-label'>{_esc(label)}</span><div class='sym-bar-track'><div class='sym-bar-fill del' style='width:{pct:.0f}%'></div></div><span class='sym-bar-count'>{count}</span></div>"
+                    if not _top_dels:
+                        bars_html += "<div style='font-size:12px;color:var(--slate-400);'>No delighters tagged</div>"
+                    bars_html += "</div>"
+                    st.markdown(bars_html, unsafe_allow_html=True)
+        except Exception:
+            pass
     st.markdown("<div class='section-sub'>Start with the overall time trend and symptom tables. Additional charts are tucked into a cleaner secondary section below.</div>", unsafe_allow_html=True)
     sym_state = _detect_symptom_state(od)
     if sym_state == "none":
@@ -8297,6 +8335,31 @@ def _render_dashboard(filtered_df, overall_df=None):
                     fig_len.update_layout(title=None, margin=dict(l=24, r=18, t=18, b=34))
                     _show_plotly(fig_len)
 
+    # ── Symptomizer insights (visible when tags exist) ────────────────
+    _sym_processed = st.session_state.get("sym_processed_rows") or []
+    if _sym_processed and len(_sym_processed) >= 3:
+        _det_freq = {}
+        _del_freq = {}
+        for rec in _sym_processed:
+            for t in (rec.get("wrote_dets") or []):
+                _det_freq[t] = _det_freq.get(t, 0) + 1
+            for t in (rec.get("wrote_dels") or []):
+                _del_freq[t] = _del_freq.get(t, 0) + 1
+        _top_dets = sorted(_det_freq.items(), key=lambda x: -x[1])[:5]
+        _top_dels = sorted(_del_freq.items(), key=lambda x: -x[1])[:5]
+        if _top_dets or _top_dels:
+            st.markdown("<div class='sym-insights-card'><div class='sym-insights-title'>Symptomizer insights · " + f"{len(_sym_processed):,} reviews tagged</div>", unsafe_allow_html=True)
+            ic1, ic2 = st.columns(2)
+            with ic1:
+                for label, count in _top_dets:
+                    pct = count / max(len(_sym_processed), 1) * 100
+                    st.markdown(f"<div class='sym-bar'><div class='sym-bar-label'>{_esc(label)}</div><div class='sym-bar-track'><div class='sym-bar-fill det' style='width:{min(pct * 2, 100)}%;'></div></div><div class='sym-bar-count'>{pct:.0f}%</div></div>", unsafe_allow_html=True)
+            with ic2:
+                for label, count in _top_dels:
+                    pct = count / max(len(_sym_processed), 1) * 100
+                    st.markdown(f"<div class='sym-bar'><div class='sym-bar-label'>{_esc(label)}</div><div class='sym-bar-track'><div class='sym-bar-fill del' style='width:{min(pct * 2, 100)}%;'></div></div><div class='sym-bar-count'>{pct:.0f}%</div></div>", unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: REVIEW EXPLORER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8365,118 +8428,6 @@ def _render_review_explorer(*, summary, overall_df, filtered_df, prompt_artifact
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: AI ANALYST
 # ═══════════════════════════════════════════════════════════════════════════════
-def _render_ai_tab(*, settings, overall_df, filtered_df, summary, filter_description):
-    st.markdown("<div class='section-title'>AI Analyst</div>", unsafe_allow_html=True)
-    st.markdown("<div class='section-sub'>Use this for executive summaries, root-cause synthesis, and evidence-backed action plans grounded in the current filtered review set.</div>", unsafe_allow_html=True)
-    if filtered_df.empty:
-        st.info("Adjust filters — no reviews in scope.")
-        return
-    scope_sig = json.dumps(dict(pid=summary.product_id, fd=filter_description, n=len(filtered_df), st=(st.session_state.get("analysis_dataset") or {}).get("source_type", "bv")), sort_keys=True)
-    if st.session_state.get("chat_scope_signature") != scope_sig:
-        if st.session_state.get("chat_messages"):
-            st.session_state["chat_messages"] = []
-            st.session_state["chat_scope_notice"] = "Chat cleared — scope changed."
-        st.session_state["chat_scope_signature"] = scope_sig
-    notice = st.session_state.pop("chat_scope_notice", None)
-    if notice:
-        st.info(notice)
-    st.session_state["workspace_active_tab"] = TAB_AI_ANALYST
-    with st.container(border=True):
-        sc = st.columns([1, 1, 1, 2])
-        sc[0].metric("In scope", f"{len(filtered_df):,}")
-        sc[1].metric("Organic", f"{int((~filtered_df['incentivized_review'].fillna(False)).sum()):,}")
-        sc[2].metric("Model", _shared_model())
-        sc[3].caption(f"Scope: {filter_description}")
-        st.markdown("<div class='section-note'>Best first click for ELT: <strong>Executive summary</strong>. Then raise <strong>Reasoning effort</strong> if you want a higher-confidence long-form answer.</div>", unsafe_allow_html=True)
-    api_key = settings.get("api_key")
-    if not api_key:
-        st.warning("Add OPENAI_API_KEY to Streamlit secrets.")
-        st.code('OPENAI_API_KEY = "sk-..."', language="toml")
-        return
-    include_references = bool(st.session_state.get("ai_include_references", False))
-    archive_msgs, live_msgs = _split_chat_messages(st.session_state.get("chat_messages") or [], keep_last=AI_VISIBLE_CHAT_MESSAGES)
-    with st.container(border=True):
-        st.markdown("**Current exchange**")
-        if not live_msgs:
-            st.info("Start with a quick report below, or type a question.")
-        else:
-            for msg in live_msgs:
-                with st.chat_message(msg["role"]):
-                    if msg["role"] == "assistant":
-                        _render_ai_response(msg["content"], overall_df, include_references=include_references)
-                    else:
-                        st.markdown(msg["content"])
-    if archive_msgs:
-        msg_label = "message" if len(archive_msgs) == 1 else "messages"
-        with st.expander(f"🗂️ Chat archive ({len(archive_msgs)} earlier {msg_label})", expanded=False):
-            for msg in archive_msgs:
-                with st.chat_message(msg["role"]):
-                    if msg["role"] == "assistant":
-                        _render_ai_response(msg["content"], overall_df, include_references=include_references)
-                    else:
-                        st.markdown(msg["content"])
-    quick_actions = {
-        "Executive summary": dict(prompt="Create an executive summary. Lead with biggest strengths, biggest risks, key consumer insight, and top 3 actions.", help="Leadership readout.", persona=None),
-        "Product Development": dict(prompt=PERSONAS["Product Development"]["prompt"], help=PERSONAS["Product Development"]["blurb"], persona="Product Development"),
-        "Quality Engineer": dict(prompt=PERSONAS["Quality Engineer"]["prompt"], help=PERSONAS["Quality Engineer"]["blurb"], persona="Quality Engineer"),
-        "Consumer Insights": dict(prompt=PERSONAS["Consumer Insights"]["prompt"], help=PERSONAS["Consumer Insights"]["blurb"], persona="Consumer Insights"),
-    }
-    quick_trigger = None
-    with st.container(border=True):
-        st.markdown("**Quick reports & answer settings**")
-        st.caption("Use the presets below to get a polished first draft quickly, then refine with your own follow-up question.")
-        action_rows = [list(quick_actions.items())[:2], list(quick_actions.items())[2:]]
-        for ridx, row in enumerate(action_rows):
-            acols = st.columns(len(row))
-            for cidx, (col, (label, config)) in enumerate(zip(acols, row)):
-                if col.button(label, use_container_width=True, help=config["help"], key=f"ai_q_{ridx}_{cidx}_{_slugify(label)}"):
-                    quick_trigger = (config["persona"], label, config["prompt"])
-        size_cols = st.columns([1.18, 1.0, 1.05, 1.45])
-        preset_options = ["Large (1200 words)", "Deep dive (1600 words)", "Custom"]
-        cur_preset = st.session_state.get("ai_response_preset", "Large (1200 words)")
-        if cur_preset not in preset_options:
-            cur_preset = "Large (1200 words)"
-            st.session_state["ai_response_preset"] = cur_preset
-        size_cols[0].selectbox("Response size", preset_options, index=preset_options.index(cur_preset), key="ai_response_preset", help="Large is the default because shorter outputs were not detailed enough.")
-        if st.session_state.get("ai_response_preset") == "Deep dive (1600 words)":
-            st.session_state["ai_response_words"] = 1600
-        elif st.session_state.get("ai_response_preset") == "Large (1200 words)":
-            st.session_state["ai_response_words"] = 1200
-        size_cols[1].number_input("Target words", min_value=250, max_value=2400, step=100, value=_current_ai_target_words(), key="ai_response_words", help="You can type your own target word count. Around 1200 words is the default large report.", disabled=st.session_state.get("ai_response_preset") != "Custom")
-        size_cols[2].toggle("Include references · Beta", value=bool(st.session_state.get("ai_include_references", False)), key="ai_include_references", help="AI Analyst only. Beta feature. When on, the assistant includes hoverable Reference previews in the answer. Off by default for a cleaner reading view.")
-        size_cols[3].caption(f"Target: {_current_ai_target_words():,} words · approx. {int(round(_current_ai_target_words() * 6.2)):,} characters. References are {'on' if st.session_state.get('ai_include_references') else 'off'}.")
-        if st.session_state.get("ai_include_references"):
-            st.caption("**Beta:** hoverable review references are enabled for AI Analyst answers.")
-        reasoning_now = _shared_reasoning()
-        tone = "warning" if reasoning_now in {"none", "minimal", "low"} else "info"
-        getattr(st, tone)("Accuracy tip: raise **Reasoning effort** in the sidebar AI settings for higher-confidence synthesis, especially on long reports, root-cause questions, and mixed sentiment datasets.")
-    helper_cols = st.columns([2, 1, 1])
-    helper_cols[0].caption(f"Scope: {filter_description}")
-    if helper_cols[1].button("Clear chat", use_container_width=True, key="ai_clear_chat"):
-        st.session_state["chat_messages"] = []
-        st.session_state["workspace_active_tab"] = TAB_AI_ANALYST
-        st.rerun()
-    user_message = st.chat_input("Ask about drivers, risks, opportunities, or voice-of-customer themes…", key="ai_chat_input")
-    prompt_to_send = visible_user_message = persona_name = None
-    if quick_trigger:
-        persona_name, visible_user_message, prompt_to_send = quick_trigger
-    elif user_message:
-        prompt_to_send = visible_user_message = user_message
-    if prompt_to_send and visible_user_message:
-        prior = list(st.session_state["chat_messages"])
-        st.session_state["chat_messages"].append({"role": "user", "content": visible_user_message})
-        overlay = _show_thinking("Reviewing the filtered review text…")
-        try:
-            answer = _call_analyst(question=prompt_to_send, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, chat_history=prior, persona_name=persona_name, target_words=_current_ai_target_words(), include_references=bool(st.session_state.get('ai_include_references', False)))
-            if persona_name:
-                answer = f"**{persona_name} report**\n\n{answer}"
-        except Exception as exc:
-            answer = f"OpenAI request failed: {exc}"
-        finally:
-            overlay.empty()
-        st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
-        st.session_state["workspace_active_tab"] = TAB_AI_ANALYST
-        st.rerun()
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: REVIEW PROMPT
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8536,7 +8487,7 @@ def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, fil
         sc = st.columns([1.25, 1, 1, 2.45])
         tagging_scope = sc[0].selectbox("Scope", ["Current filtered reviews", "All loaded reviews"], index=0, key="prompt_tagging_scope")
         scope_df = filtered_df if tagging_scope == "Current filtered reviews" else overall_df
-        batch_size = int(st.session_state.get("sym_batch_size", 5))
+        batch_size = int(st.session_state.get("sym_batch_size", 8))
         est = math.ceil(len(scope_df) / max(1, batch_size)) if len(scope_df) else 0
         sc[1].metric("Reviews", f"{len(scope_df):,}")
         sc[2].metric("Requests", f"{est:,}")
@@ -8828,23 +8779,8 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                             raise ValueError("AI returned empty taxonomy — try adding a product description or increasing sample size")
                         st.session_state["sym_ai_build_result"] = tax_result
                         st.session_state["sym_product_knowledge"] = _normalize_product_knowledge(tax_result.get("product_knowledge") or pk)
-                        # Step 2b: Auto-calibrate the new taxonomy
-                        if _HAS_SYMPTOMIZER_V3:
-                            overlay.empty()
-                            overlay = _show_thinking("Calibrating taxonomy fit…")
-                            try:
-                                _tax_dels = _normalize_tag_list([item.get("label", item) if isinstance(item, dict) else item for item in tax_result.get("delighters", [])])
-                                _tax_dets = _normalize_tag_list([item.get("label", item) if isinstance(item, dict) else item for item in tax_result.get("detractors", [])])
-                                calib = _v3_calibration_preflight(
-                                    client=client, sample_reviews=_sample_reviews_for_symptomizer(overall_df, 8),
-                                    allowed_detractors=_tax_dets, allowed_delighters=_tax_dels,
-                                    product_profile=st.session_state.get("sym_product_profile", ""),
-                                    chat_complete_fn=_chat_complete_with_fallback_models,
-                                    safe_json_load_fn=_safe_json_load, model_fn=_shared_model, reasoning_fn=_shared_reasoning,
-                                )
-                                st.session_state["sym_calibration_result"] = calib
-                            except Exception:
-                                pass
+                        # NOTE: Auto-calibration removed from generate flow for speed.
+                        # Users can validate with 🧪 button in step 2 or section 2.
                         st.session_state["sym_wizard_step"] = 2
                         _gen_success = True
                     except Exception as exc:
@@ -8944,7 +8880,7 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                 available = len(work[work["Needs_Symptomization"] | work["Needs_Delighters"] | work["Needs_Detractors"]])
                 max_reviews = max(1, min(available, len(overall_df)))
                 n_reviews = rc1.number_input("Reviews to symptomize", min_value=1, max_value=max_reviews, value=min(max_reviews, 100), step=10, key="sym_wizard_n_reviews")
-                batch_size = int(rc2.number_input("Batch size", min_value=1, max_value=20, value=int(st.session_state.get("sym_batch_size", 5)), step=1, key="sym_wizard_batch_size"))
+                batch_size = int(rc2.number_input("Batch size", min_value=1, max_value=20, value=int(st.session_state.get("sym_batch_size", 8)), step=1, key="sym_wizard_batch_size"))
                 rc3.metric("Available reviews", f"{available:,}")
 
                 btn_cols = st.columns([1.5, 1, 1])
@@ -8966,8 +8902,8 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                         sym_product_profile_ai_note=(ai_result.get("taxonomy_note") or st.session_state.get("sym_product_profile_ai_note", "")),
                         sym_wizard_step=3,
                         sym_wizard_auto_run=True,
-                        sym_wizard_n_reviews=int(n_reviews),
-                        sym_wizard_batch_size=int(batch_size),
+                        _sym_run_n_reviews=int(n_reviews),
+                        _sym_run_batch_size=int(batch_size),
                     )
                     st.session_state.pop("sym_ai_build_result", None)
                     st.rerun()
@@ -9068,7 +9004,7 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
         target_df = work
     rc = st.columns([1.5, 1, 1, 1, 1])
     n_to_process = rc[0].number_input("Reviews to process", min_value=1, max_value=max(1, len(target_df)), step=1, key="sym_n_to_process")
-    batch_size = int(rc[1].number_input("Batch size", min_value=1, max_value=20, value=int(st.session_state.get("sym_batch_size", 5)), step=1, key="sym_batch_size_run"))
+    batch_size = int(rc[1].number_input("Batch size", min_value=1, max_value=20, value=int(st.session_state.get("sym_batch_size", 8)), step=1, key="sym_batch_size_run"))
     est_batches = max(1, math.ceil(int(n_to_process) / batch_size)) if n_to_process else 0
     rc[2].metric("In scope", f"{len(target_df):,}")
     rc[3].metric("Est. batches", f"{est_batches:,}")
@@ -9102,6 +9038,11 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
     product_knowledge = _normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {})
     client = _get_client()
     run_btn = st.button(f"▶️ Symptomize {min(int(n_to_process), len(target_df)):,} review(s)", type="primary", use_container_width=True, disabled=run_disabled, key="sym_run_btn")
+    if not run_disabled and int(n_to_process) > 0:
+        _est_batches = max(1, math.ceil(int(n_to_process) / max(batch_size, 1)))
+        _est_secs = _est_batches * 2.5 / min(3, _est_batches)  # ~2.5s/batch with parallelism
+        _est_label = f"~{_est_secs:.0f}s" if _est_secs < 60 else f"~{_est_secs/60:.1f}min"
+        st.markdown(f"<div class='time-estimate'>⏱ Estimated: {_est_label} for {int(n_to_process)} reviews ({_est_batches} batches × {batch_size}/batch)</div>", unsafe_allow_html=True)
     if _HAS_SYMPTOMIZER_V3 and api_key and active_taxonomy_count > 0 and len(target_df) > 0:
         cc1, cc2 = st.columns([1, 3])
         if cc1.button("🧪 Validate taxonomy", use_container_width=True, key="sym_calibrate_btn", help="8-review calibration to check taxonomy fit."):
@@ -9121,8 +9062,8 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
     # ── Auto-run from wizard step 2 "Approve & Run" ──────────────────
     wizard_auto_run = st.session_state.pop("sym_wizard_auto_run", False)
     if wizard_auto_run:
-        n_to_process = st.session_state.pop("sym_wizard_n_reviews", int(n_to_process))
-        batch_size = st.session_state.pop("sym_wizard_batch_size", batch_size)
+        n_to_process = st.session_state.pop("_sym_run_n_reviews", int(n_to_process))
+        batch_size = st.session_state.pop("_sym_run_batch_size", batch_size)
         run_btn = True  # Force run
     if run_btn:
         prioritized = _prioritize_for_symptomization(target_df).head(int(n_to_process))
@@ -9150,14 +9091,29 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
         _ev_chars = int(st.session_state.get("sym_max_ev_chars", 120))
         # Initialize adaptive label tracker for mid-run alerts
         _label_tracker = _v3_LabelTracker(_active_dets, _active_dels) if _HAS_SYMPTOMIZER_V3 else None
-        # Speed optimization: use larger batches for short reviews
+        # Speed optimization: adaptive batch sizing based on review length
         if _HAS_SYMPTOMIZER_V3:
             avg_words = rows_to_process.get("review_length_words", pd.Series(50)).fillna(50).mean()
-            if avg_words < 80 and batch_size < 8:
-                batch_size = min(10, batch_size + 3)  # Short reviews can pack tighter
-                bidxs = list(range(0, len(rows_list), batch_size))
-                status.info(f"Short reviews detected (avg {avg_words:.0f} words) — auto-increased batch to {batch_size}")
-        for bi, start in enumerate(bidxs, 1):
+            if avg_words < 60 and batch_size < 12:
+                batch_size = min(12, batch_size + 4)  # Very short reviews pack tight
+            elif avg_words < 100 and batch_size < 10:
+                batch_size = min(10, batch_size + 2)
+            bidxs = list(range(0, len(rows_list), batch_size))
+            if avg_words < 100:
+                status.info(f"Avg {avg_words:.0f} words/review — batch size {batch_size}")
+
+        # Speed optimization: pre-compute category from taxonomy generation (skip API call)
+        _pre_category = st.session_state.get("sym_taxonomy_category", "")
+        if _pre_category and _pre_category != "general":
+            # Inject pre-computed category so tag_review_batch skips _infer_taxonomy_category
+            st.session_state["_sym_cached_category"] = _pre_category
+
+        # Parallel batch execution: run 2-3 batches concurrently
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        _MAX_WORKERS = min(3, max(1, len(bidxs)))  # Up to 3 concurrent API calls
+
+        def _process_one_batch(bi_start_pair):
+            bi, start = bi_start_pair
             batch = rows_list[start:start + batch_size]
             items = [
                 dict(
@@ -9169,28 +9125,51 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                 )
                 for idx, row in batch
             ]
-            _log.info("Batch %d/%d — reviews %d–%d", bi, len(bidxs), start + 1, min(start + batch_size, len(rows_list)))
-            status.info(f"Batch {bi}/{len(bidxs)} — reviews {start + 1}–{min(start + batch_size, len(rows_list))}")
-            # Adaptive prompt hints from LabelTracker (appended to profile for later batches)
             _adaptive_profile = profile
             if _label_tracker and bi > 3:
                 hints = _label_tracker.get_prompt_hints()
                 if hints:
                     _adaptive_profile = profile + "\n" + hints
             outs = {}
+            _failed = 0
             if client:
                 try:
                     outs = _call_symptomizer_batch(client=client, items=items, allowed_delighters=_active_dels, allowed_detractors=_active_dets, product_profile=_adaptive_profile, product_knowledge=product_knowledge, max_ev_chars=_ev_chars, aliases=aliases, include_universal_neutral=_include_universal)
                 except Exception as exc:
-                    status.warning(f"Batch {bi} failed ({exc}) — retrying individually…")
-                    failed_count += len(items)
+                    _log.warning("Batch %d failed (%s) — retrying individually", bi, exc)
+                    _failed = len(items)
                     for it in items:
                         try:
                             single = _call_symptomizer_batch(client=client, items=[it], allowed_delighters=_active_dels, allowed_detractors=_active_dets, product_profile=_adaptive_profile, product_knowledge=product_knowledge, max_ev_chars=_ev_chars, aliases=aliases, include_universal_neutral=_include_universal)
                             outs.update(single)
-                            failed_count -= 1
+                            _failed -= 1
                         except Exception:
                             pass
+            return bi, items, outs, _failed
+
+        # Submit all batches to the thread pool
+        batch_inputs = list(enumerate(bidxs, 1))
+        all_batch_results = []  # Collect (bi, items, outs, failed) from all batches
+
+        if _MAX_WORKERS > 1 and len(bidxs) > 1:
+            status.info(f"Processing {len(bidxs)} batches ({_MAX_WORKERS} concurrent)…")
+            with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+                futures = {executor.submit(_process_one_batch, bp): bp for bp in batch_inputs}
+                for future in as_completed(futures):
+                    result = future.result()
+                    all_batch_results.append(result)
+                    done_batches = len(all_batch_results)
+                    prog.progress(done_batches / len(bidxs), text=f"Batch {done_batches}/{len(bidxs)}")
+        else:
+            # Sequential fallback (single batch or worker=1)
+            for bp in batch_inputs:
+                result = _process_one_batch(bp)
+                all_batch_results.append(result)
+                prog.progress(len(all_batch_results) / len(bidxs), text=f"Batch {len(all_batch_results)}/{len(bidxs)}")
+
+        # Process all results
+        for bi, items, outs, batch_failed in sorted(all_batch_results, key=lambda x: x[0]):
+            failed_count += batch_failed
             for it in items:
                 idx = int(it["idx"])
                 out = outs.get(idx, empty_out)
@@ -9337,6 +9316,113 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
     st.markdown("### 3 · Results")
     total_tags = sum(len(r.get("wrote_dets", [])) + len(r.get("wrote_dels", [])) for r in processed)
     st.markdown(_chip_html([(f"{len(processed)} reviews tagged", "green"), (f"{total_tags} labels written", "indigo")]), unsafe_allow_html=True)
+
+    # ── Tag distribution — visible without clicking ──────────────────
+    if processed and total_tags > 0:
+        det_freq = {}
+        del_freq = {}
+        zero_tag_count = 0
+        for rec in processed:
+            dets = rec.get("wrote_dets", [])
+            dels = rec.get("wrote_dels", [])
+            if not dets and not dels:
+                zero_tag_count += 1
+            for t in dets:
+                det_freq[t] = det_freq.get(t, 0) + 1
+            for t in dels:
+                del_freq[t] = del_freq.get(t, 0) + 1
+        top_dets = sorted(det_freq.items(), key=lambda x: -x[1])[:8]
+        top_dels = sorted(del_freq.items(), key=lambda x: -x[1])[:8]
+
+        det_col, del_col = st.columns(2)
+        with det_col:
+            if top_dets:
+                st.markdown("<div style='font-size:12px;font-weight:700;color:var(--danger,#ef4444);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;'>Top detractors</div>", unsafe_allow_html=True)
+                for label, count in top_dets:
+                    pct = count / max(len(processed), 1) * 100
+                    bar_w = min(pct * 2, 100)
+                    st.markdown(
+                        f"<div style='display:flex;align-items:center;gap:8px;margin-bottom:3px;'>"
+                        f"<div style='flex:1;font-size:12px;color:var(--color-text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>{_esc(label)}</div>"
+                        f"<div style='width:120px;height:14px;background:var(--color-border-tertiary,#eee);border-radius:7px;overflow:hidden;flex-shrink:0;'>"
+                        f"<div style='width:{bar_w}%;height:100%;background:rgba(239,68,68,.7);border-radius:7px;'></div></div>"
+                        f"<span style='font-size:11px;color:var(--color-text-secondary);min-width:36px;text-align:right;'>{count} ({pct:.0f}%)</span>"
+                        f"</div>", unsafe_allow_html=True)
+        with del_col:
+            if top_dels:
+                st.markdown("<div style='font-size:12px;font-weight:700;color:var(--success,#10b981);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;'>Top delighters</div>", unsafe_allow_html=True)
+                for label, count in top_dels:
+                    pct = count / max(len(processed), 1) * 100
+                    bar_w = min(pct * 2, 100)
+                    st.markdown(
+                        f"<div style='display:flex;align-items:center;gap:8px;margin-bottom:3px;'>"
+                        f"<div style='flex:1;font-size:12px;color:var(--color-text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>{_esc(label)}</div>"
+                        f"<div style='width:120px;height:14px;background:var(--color-border-tertiary,#eee);border-radius:7px;overflow:hidden;flex-shrink:0;'>"
+                        f"<div style='width:{bar_w}%;height:100%;background:rgba(16,185,129,.7);border-radius:7px;'></div></div>"
+                        f"<span style='font-size:11px;color:var(--color-text-secondary);min-width:36px;text-align:right;'>{count} ({pct:.0f}%)</span>"
+                        f"</div>", unsafe_allow_html=True)
+
+        # Quick stats row
+        _qs_chips = []
+        if zero_tag_count > 0:
+            _qs_chips.append((f"{zero_tag_count} reviews with 0 tags", "yellow"))
+        _unl_dets = set()
+        _unl_dels = set()
+        for rec in processed:
+            for u in (rec.get("unl_dets") or []):
+                _unl_dets.add(str(u))
+            for u in (rec.get("unl_dels") or []):
+                _unl_dels.add(str(u))
+        if _unl_dets or _unl_dels:
+            _qs_chips.append((f"{len(_unl_dets) + len(_unl_dels)} unlisted themes discovered", "blue"))
+        if _qs_chips:
+            st.markdown(_chip_html(_qs_chips), unsafe_allow_html=True)
+
+        # ── Quick AI insights from tagging results ────────────────────
+        if top_dets or top_dels:
+            if st.button("✨ Generate insights from tags", use_container_width=True, key="sym_quick_insights"):
+                _qi_client = _get_client()
+                if _qi_client:
+                    with st.spinner("Generating insights…"):
+                        _qi_det_str = ", ".join(f"{l} ({c}/{len(processed)}, {c/max(len(processed),1)*100:.0f}%)" for l, c in top_dets)
+                        _qi_del_str = ", ".join(f"{l} ({c}/{len(processed)}, {c/max(len(processed),1)*100:.0f}%)" for l, c in top_dels)
+                        _qi_zero_str = f"{zero_tag_count} reviews ({zero_tag_count/max(len(processed),1)*100:.0f}%) had zero tags." if zero_tag_count else ""
+                        _qi_prompt = f"""Analyze these symptomizer results from {len(processed)} consumer product reviews.
+Product: {st.session_state.get('sym_product_profile', 'Unknown product')}
+
+Top detractors: {_qi_det_str}
+Top delighters: {_qi_del_str}
+{_qi_zero_str}
+
+Write 3-5 bullet points of actionable insights. Be specific — reference the data. Focus on:
+1. The #1 issue and how severe it is (what % of reviews mention it)
+2. Any surprising patterns (e.g. a detractor that also appears in positive reviews)
+3. What the data suggests the product team should prioritize
+4. What's working well (top delighters) and how to protect those strengths
+Keep it concise — each bullet should be 1-2 sentences max."""
+                        try:
+                            insights = _chat_complete_with_fallback_models(
+                                _qi_client, model=_shared_model(), structured=False,
+                                messages=[{"role": "user", "content": _qi_prompt}],
+                                temperature=0.3, max_tokens=800, reasoning_effort=_shared_reasoning(),
+                            )
+                            st.session_state["sym_quick_insights"] = insights
+                        except Exception as exc:
+                            st.error(f"Insights generation failed: {exc}")
+                    st.rerun()
+
+            _cached_insights = st.session_state.get("sym_quick_insights")
+            if _cached_insights:
+                with st.container(border=True):
+                    st.markdown(f"**✨ AI Insights**\n\n{_cached_insights}")
+
+        if _unl_dets or _unl_dels:
+            with st.expander(f"🆕 Unlisted themes ({len(_unl_dets)} det · {len(_unl_dels)} del)", expanded=False):
+                uc1, uc2 = st.columns(2)
+                if _unl_dets:
+                    uc1.markdown("**Detractor candidates:** " + ", ".join(f"`{u}`" for u in sorted(_unl_dets)[:15]))
+                if _unl_dels:
+                    uc2.markdown("**Delighter candidates:** " + ", ".join(f"`{u}`" for u in sorted(_unl_dels)[:15]))
     if _HAS_SYMPTOMIZER_V3 and len(processed) >= 3:
         try:
             # Build items list from session data for polarity mismatch detection
@@ -10030,16 +10116,28 @@ def main():
         st.session_state["workspace_active_tab"] = TAB_DASHBOARD
     active_tab = _render_workspace_nav()
     common = dict(settings=settings, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description)
+
+    def _safe_render(fn, *args, **kwargs):
+        """Error boundary: catch crashes in individual tabs without taking down the app."""
+        try:
+            fn(*args, **kwargs)
+        except Exception as exc:
+            st.error(f"This tab encountered an error: {exc}")
+            _log.error("Tab render error in %s: %s", fn.__name__, exc, exc_info=True)
+            with st.expander("Technical details", expanded=False):
+                import traceback
+                st.code(traceback.format_exc(), language="text")
+
     if active_tab == TAB_DASHBOARD:
-        _render_dashboard(filtered_df, overall_df)
+        _safe_render(_render_dashboard, filtered_df, overall_df)
     elif active_tab == TAB_REVIEW_EXPLORER:
-        _render_review_explorer(summary=summary, overall_df=overall_df, filtered_df=filtered_df, prompt_artifacts=st.session_state.get("prompt_run_artifacts"), filter_description=filter_description, active_items=filter_state["active_items"])
+        _safe_render(_render_review_explorer, summary=summary, overall_df=overall_df, filtered_df=filtered_df, prompt_artifacts=st.session_state.get("prompt_run_artifacts"), filter_description=filter_description, active_items=filter_state["active_items"])
     elif active_tab == TAB_REVIEW_PROMPT:
-        _render_review_prompt_tab(**common)
+        _safe_render(_render_review_prompt_tab, **common)
     elif active_tab == TAB_SYMPTOMIZER:
-        _render_symptomizer_tab(**common)
+        _safe_render(_render_symptomizer_tab, **common)
     elif active_tab == TAB_SOCIAL_LISTENING:
-        _render_social_listening_tab()
+        _safe_render(_render_social_listening_tab)
 
     # ── Persistent AI chat bar (bottom of every page) ─────────────────
     _render_bottom_chat_bar(settings=settings, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description)
@@ -10052,23 +10150,24 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
     """Persistent AI chat bar at the bottom of every page."""
     chat_messages = st.session_state.get("chat_messages") or []
 
-    # Styled container
+    # Styled header
     st.markdown("""<div style='margin-top:2rem;padding-top:1rem;border-top:2px solid var(--border);'>
-        <div style='display:flex;align-items:center;gap:8px;margin-bottom:8px;'>
-            <span style='font-size:15px;'>🤖</span>
-            <span style='font-size:13px;font-weight:600;color:var(--color-text-secondary);'>Ask AI about your reviews</span>
+        <div class='chat-bar-header'>
+            <span class='icon'>🤖</span>
+            <span class='label'>Ask AI about your reviews</span>
         </div>
     </div>""", unsafe_allow_html=True)
 
-    # Show last AI response immediately (not behind expander)
-    if chat_messages and chat_messages[-1].get("role") == "assistant":
-        last_answer = chat_messages[-1].get("content", "")
-        with st.chat_message("assistant"):
-            st.markdown(last_answer, unsafe_allow_html=True)
+    # Show last exchange immediately (user question + AI response)
+    if chat_messages:
+        last_two = chat_messages[-2:] if len(chat_messages) >= 2 else chat_messages[-1:]
+        for msg in last_two:
+            with st.chat_message(msg.get("role", "user")):
+                st.markdown(msg.get("content", ""), unsafe_allow_html=True)
 
     # Older messages behind expander
     if len(chat_messages) > 2:
-        older = chat_messages[:-2] if len(chat_messages) > 2 else []
+        older = chat_messages[:-2]
         if older:
             with st.expander(f"Earlier messages ({len(older)})", expanded=False):
                 for msg in older[-8:]:
@@ -10079,8 +10178,53 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
             st.session_state["chat_messages"] = []
             st.rerun()
 
-    # Chat input
+    # Quick-action suggestions when no conversation exists
+    if not chat_messages:
+        has_symptoms = bool(st.session_state.get("sym_processed_rows"))
+        n_reviews = len(filtered_df) if isinstance(filtered_df, pd.DataFrame) else 0
+        suggestions = []
+        if n_reviews > 0:
+            suggestions.append("What are the main complaints?")
+            suggestions.append("Summarize the top themes")
+        if has_symptoms:
+            suggestions.append("Which detractors need urgent attention?")
+            suggestions.append("What do 5-star reviews praise most?")
+        if not suggestions:
+            suggestions = ["What can I do here?", "How does the symptomizer work?"]
+
+        # Render as clickable buttons
+        cols = st.columns(len(suggestions))
+        for i, (col, suggestion) in enumerate(zip(cols, suggestions)):
+            if col.button(suggestion, key=f"chat_quick_{i}", use_container_width=True):
+                st.session_state.setdefault("chat_messages", []).append({"role": "user", "content": suggestion})
+                st.session_state["_chat_auto_send"] = True
+                st.rerun()
+
+    # Chat input with quick suggestions
+    if not chat_messages:
+        # Show quick-ask suggestions for new users
+        _suggestions = ["What are the top complaints?", "Summarize the reviews", "Compare 1-star vs 5-star reviews"]
+        _sym_active = bool(st.session_state.get("sym_processed_rows"))
+        if _sym_active:
+            _suggestions = ["Why is the top detractor so common?", "What patterns do 1-star reviews share?", "Suggest product improvements"]
+        st.markdown("<div style='display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;'>", unsafe_allow_html=True)
+        scols = st.columns(len(_suggestions))
+        for i, (col, suggestion) in enumerate(zip(scols, _suggestions)):
+            if col.button(suggestion, key=f"chat_suggest_{i}", use_container_width=True):
+                st.session_state.setdefault("chat_messages", []).append({"role": "user", "content": suggestion})
+                st.session_state["_chat_pending_prompt"] = suggestion
+                st.rerun()
+
+    # Handle pending prompt from suggestion buttons
+    _pending = st.session_state.pop("_chat_pending_prompt", None)
     prompt = st.chat_input("Ask about your reviews…", key="bottom_chat_input")
+    if _pending:
+        prompt = _pending
+    # Also handle auto-send from quick action buttons
+    _auto_send = st.session_state.pop("_chat_auto_send", False)
+    if _auto_send and chat_messages and chat_messages[-1].get("role") == "user":
+        prompt = chat_messages[-1].get("content", "")
+
     if prompt:
         client = _get_client()
         api_key = settings.get("api_key")
@@ -10088,7 +10232,7 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
             st.error("OpenAI API key required. Add it in Settings → OpenAI API Key.")
             return
 
-        # Build rich context for the AI
+        # Build rich context
         n_reviews = len(filtered_df) if isinstance(filtered_df, pd.DataFrame) else 0
         n_total = len(overall_df) if isinstance(overall_df, pd.DataFrame) else 0
         review_sample = []
@@ -10096,7 +10240,7 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
             sample_df = filtered_df.sample(min(30, len(filtered_df)), random_state=42)
             review_sample = [_trunc(str(r), 300) for r in sample_df["review_text"].dropna().tolist()]
 
-        # Include symptomizer results if available
+        # Include symptomizer results
         sym_context = ""
         processed = st.session_state.get("sym_processed_rows") or []
         if processed:
@@ -10109,29 +10253,38 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
                     del_freq[t] = del_freq.get(t, 0) + 1
             top_dets = sorted(det_freq.items(), key=lambda x: -x[1])[:10]
             top_dels = sorted(del_freq.items(), key=lambda x: -x[1])[:10]
+            n_proc = len(processed)
             sym_context = f"""
-Symptomizer results ({len(processed)} reviews tagged):
-Top detractors: {', '.join(f'{t} ({c})' for t,c in top_dets)}
-Top delighters: {', '.join(f'{t} ({c})' for t,c in top_dels)}"""
+Symptomizer results ({n_proc} reviews tagged):
+Top detractors: {', '.join(f'{t} ({c}, {c*100//n_proc}%)' for t,c in top_dets)}
+Top delighters: {', '.join(f'{t} ({c}, {c*100//n_proc}%)' for t,c in top_dels)}"""
 
-        system_context = f"""You are an AI review analyst embedded in a consumer product review analytics platform.
-Dataset: {n_total:,} total reviews, {n_reviews:,} after filters.
-Filters: {filter_description if filter_description and 'No active' not in filter_description else 'none'}
+        # Include rating distribution
+        rating_context = ""
+        if isinstance(filtered_df, pd.DataFrame) and "rating" in filtered_df.columns:
+            vc = filtered_df["rating"].dropna().value_counts().sort_index()
+            if not vc.empty:
+                avg = filtered_df["rating"].dropna().mean()
+                rating_context = f"\nRating distribution: {', '.join(f'{int(k)}★: {v}' for k,v in vc.items())} (avg {avg:.1f}★)"
+
+        system_context = f"""You are an AI review analyst. Be concise, specific, and quantitative.
+Dataset: {n_total:,} total reviews, {n_reviews:,} after filters.{rating_context}
 Product: {st.session_state.get('sym_product_profile', 'Not set')}
 {sym_context}
 
-Be concise, specific, and quantitative. Cite patterns from the data. Keep answers actionable."""
+When citing patterns, give percentages and counts. Keep answers under 200 words unless asked for more detail."""
 
         history = [{"role": "system", "content": system_context}]
         for msg in chat_messages[-8:]:
             history.append({"role": msg["role"], "content": msg["content"]})
-        history.append({"role": "user", "content": prompt})
+        # Only add user message if not from auto-send (already in history)
+        if not _auto_send:
+            history.append({"role": "user", "content": prompt})
+            st.session_state.setdefault("chat_messages", []).append({"role": "user", "content": prompt})
 
         if review_sample:
             sample_text = "\n---\n".join(review_sample[:20])
-            history[-1]["content"] = f"{prompt}\n\n[REVIEW SAMPLE — {len(review_sample)} reviews]\n{sample_text}"
-
-        st.session_state.setdefault("chat_messages", []).append({"role": "user", "content": prompt})
+            history[-1]["content"] = f"{history[-1]['content']}\n\n[REVIEW SAMPLE — {len(review_sample)} reviews]\n{sample_text}"
 
         with st.spinner("Thinking…"):
             try:

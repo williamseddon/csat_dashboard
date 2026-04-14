@@ -88,14 +88,18 @@ def _highlight_evidence(text, evidence_items):
     _STOP = {"the","a","an","and","to","for","of","in","on","with","is","it","very","really","so"}
     hits = []
     text_lower = text_str.lower()
-    for ev_text, tag_label in evidence_items:
+    for item in evidence_items:
+        # Support both (text, label) and (text, label, side) tuples
+        ev_text = item[0] if len(item) >= 1 else ""
+        tag_label = item[1] if len(item) >= 2 else ""
+        side = item[2] if len(item) >= 3 else ""
         ev_clean = ev_text.strip()
         if not ev_clean:
             continue
         # Tier 1: Exact match
         found = False
         for m in re.compile(re.escape(ev_clean), re.IGNORECASE).finditer(text_str):
-            hits.append((m.start(), m.end(), tag_label, m.group()))
+            hits.append((m.start(), m.end(), tag_label, m.group(), side))
             found = True
         # Tier 2: Fuzzy match — find the tightest window containing all content words
         if not found:
@@ -121,7 +125,7 @@ def _highlight_evidence(text, evidence_items):
                                     best_start, best_end, best_len = s, e, e - s
                         pos = text_lower.find(w, pos + 1)
                 if best_start >= 0 and best_len < 150:
-                    hits.append((best_start, best_end, tag_label, text_str[best_start:best_end]))
+                    hits.append((best_start, best_end, tag_label, text_str[best_start:best_end], side))
     if not hits:
         return f"<div class='review-body'>{html.escape(text_str)}</div>"
     hits.sort(key=lambda h: h[0])
@@ -133,10 +137,11 @@ def _highlight_evidence(text, evidence_items):
             cursor = h[1]
     parts = []
     cursor = 0
-    for start, end, tag_label, matched in deduped:
+    for start, end, tag_label, matched, side in deduped:
         parts.append(html.escape(text_str[cursor:start]))
-        tip = html.escape(f"AI tag: {tag_label}")
-        parts.append(f'<span class="ev-highlight" data-tag="{tip}">{html.escape(matched)}</span>')
+        tip = html.escape(f"{'Issue' if side == 'det' else 'Strength' if side == 'del' else 'Tag'}: {tag_label}")
+        side_class = f" ev-{side}" if side in ("det", "del") else ""
+        parts.append(f'<span class="ev-highlight{side_class}" data-tag="{tip}">{html.escape(matched)}</span>')
         cursor = end
     parts.append(html.escape(text_str[cursor:]))
     return f"<div class='review-body'>{''.join(parts)}</div>"

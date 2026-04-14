@@ -197,5 +197,69 @@ header{
 .beta-banner .pill-row{position:relative;z-index:1;}
 @keyframes lava-float{0%{transform:translate3d(0,0,0) scale(1);}50%{transform:translate3d(70px,42px,0) scale(1.16);}100%{transform:translate3d(-55px,96px,0) scale(.92);}}
 
+/* Bottom chat bar */
+.chat-bar-header{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
+.chat-bar-header .icon{font-size:15px;}
+.chat-bar-header .label{font-size:13px;font-weight:600;color:var(--slate-500);}
+.chat-quick-actions{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 12px;}
+.chat-quick-btn{display:inline-flex;align-items:center;gap:4px;padding:6px 12px;border-radius:999px;background:var(--slate-50);border:1px solid var(--border);font-size:11.5px;font-weight:500;color:var(--slate-600);cursor:pointer;transition:all .12s ease;}
+.chat-quick-btn:hover{border-color:var(--accent);color:var(--accent);background:rgba(99,102,241,.05);}
+
+/* Symptomizer insights card for dashboard */
+.sym-insights-card{background:linear-gradient(145deg,rgba(99,102,241,.04),var(--surface));border:1px solid rgba(99,102,241,.18);border-radius:var(--radius-lg);padding:14px 16px;box-shadow:var(--shadow-xs);margin:.5rem 0;}
+.sym-insights-title{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--accent);font-weight:700;margin-bottom:8px;}
+.sym-bar{display:flex;align-items:center;gap:8px;margin:3px 0;}
+.sym-bar-label{font-size:11.5px;font-weight:600;color:var(--navy);min-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.sym-bar-track{flex:1;height:6px;background:var(--slate-100);border-radius:3px;overflow:hidden;}
+.sym-bar-fill{height:100%;border-radius:3px;transition:width .3s ease;}
+.sym-bar-fill.det{background:var(--danger);}
+.sym-bar-fill.del{background:var(--success);}
+.sym-bar-count{font-size:11px;font-weight:700;color:var(--slate-500);min-width:28px;text-align:right;}
+
+/* Time estimate badge */
+.time-estimate{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:999px;background:#f0fdf4;border:1px solid #86efac;font-size:11px;font-weight:600;color:#15803d;margin-top:4px;}
+
+/* Chip hover effects */
+.chip{transition:all .12s ease;cursor:default;}
+.chip:hover{filter:brightness(.95);transform:translateY(-1px);box-shadow:0 2px 6px rgba(0,0,0,.08);}
+
+/* Dark mode support */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --navy:#e2e8f0; --navy-mid:#cbd5e1; --navy-soft:#94a3b8;
+    --slate-600:#94a3b8; --slate-500:#94a3b8; --slate-400:#64748b;
+    --slate-200:#334155; --slate-100:#1e293b; --slate-50:#0f172a; --white:#0f172a;
+    --page-bg:#0c1222; --surface:#1a2332; --border:#2d3a4f; --border-strong:#3d4f6a;
+    --shadow-xs:0 1px 2px rgba(0,0,0,.2);
+    --shadow-sm:0 1px 4px rgba(0,0,0,.25);
+    --shadow-md:0 4px 12px rgba(0,0,0,.3);
+    --shadow-lg:0 8px 28px rgba(0,0,0,.4);
+  }
+  .chip.blue{background:rgba(37,99,235,.15);border-color:rgba(37,99,235,.3);color:#60a5fa;}
+  .chip.green{background:rgba(5,150,105,.15);border-color:rgba(5,150,105,.3);color:#34d399;}
+  .chip.red{background:rgba(220,38,38,.15);border-color:rgba(220,38,38,.3);color:#f87171;}
+  .chip.yellow{background:rgba(217,119,6,.15);border-color:rgba(217,119,6,.3);color:#fbbf24;}
+  .chip.indigo{background:rgba(99,102,241,.15);border-color:rgba(99,102,241,.3);color:#a5b4fc;}
+  .chip.gray{background:rgba(100,116,139,.15);border-color:rgba(100,116,139,.3);color:#94a3b8;}
+  .ev-highlight{background:rgba(254,240,138,.2);}
+  .ev-highlight.ev-det{background:rgba(239,68,68,.18);}
+  .ev-highlight.ev-del{background:rgba(16,185,129,.18);}
+  .review-body{color:var(--navy);}
+  .sw-table tbody tr:hover{background:rgba(99,102,241,.06);}
+  .thinking-card{background:var(--surface);border-color:var(--border);}
+  .ref-tip,.ref-tip::before,.ref-item{background:var(--surface)!important;}
+  [data-testid="stSidebar"]{background:#111827!important;border-right-color:var(--border)!important;}
+  .metric-card,.hero-card,.hero-stat,[data-testid="stMetric"]{background:var(--surface);border-color:var(--border);}
+  .metric-card.accent{background:linear-gradient(145deg,rgba(99,102,241,.08),var(--surface));}
+  .beta-banner{background:linear-gradient(135deg,rgba(15,23,42,.95),rgba(30,41,59,.9));}
+}
+
+/* Streamlit dark mode detection (Streamlit uses data-theme attribute) */
+[data-theme="dark"] {
+  --navy:#e2e8f0; --navy-mid:#cbd5e1; --navy-soft:#94a3b8;
+  --page-bg:#0c1222; --surface:#1a2332; --border:#2d3a4f; --border-strong:#3d4f6a;
+  --slate-50:#0f172a; --slate-100:#1e293b;
+}
+
 </style>
 """
