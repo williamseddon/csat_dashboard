@@ -7363,7 +7363,7 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
             if _HAS_SYMPTOMIZER_V3:
                 st.toggle("Enable staged pipeline", value=bool(st.session_state.get("sym_staged_pipeline", False)), key="sym_staged_pipeline", help="Three-stage pipeline: Extract claims → Map to taxonomy → Verify. Higher accuracy but ~2x API calls.")
         st.divider()
-        st.markdown("""<div class='sidebar-scope-card' style='background:linear-gradient(145deg,rgba(255,247,237,.96),rgba(238,242,255,.98));border-color:rgba(249,115,22,.24);box-shadow:0 10px 26px rgba(15,23,42,.08);'>
+        st.markdown("""<div class='sidebar-scope-card'>
           <div class='sidebar-scope-title'>Beta feature</div>
           <div class='sidebar-scope-value'>Open the Social Listening demo route when you want to preview the mocked Meltwater-style workflow.</div>
         </div>""", unsafe_allow_html=True)
@@ -9837,25 +9837,22 @@ else:
 
 
 def _render_lava_lamp_background():
-    st.markdown("""<div class='lava-lamp' aria-hidden='true'>
-      <span class='lava-blob a'></span>
-      <span class='lava-blob b'></span>
-      <span class='lava-blob c'></span>
-      <span class='lava-blob d'></span>
-    </div>""", unsafe_allow_html=True)
+    return
 
 
 def main():
     _render_lava_lamp_background()
-    st.markdown("""<div style="display:flex;align-items:center;gap:12px;justify-content:space-between;flex-wrap:wrap;margin-bottom:.2rem;">
-      <div style="display:flex;align-items:center;gap:12px;">
-        <div style="width:36px;height:36px;background:#0f172a;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 8px 24px rgba(15,23,42,.18);">✨</div>
-        <div>
-          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-            <div style="font-size:20px;font-weight:800;letter-spacing:-.03em;color:#0f172a;">StarWalk Review Analyst</div>
-            <span class='beta-chip'>Beta</span>
+    st.markdown("""<div class='hero-card' style='margin-bottom:1rem;'>
+      <div style="display:flex;align-items:center;gap:12px;justify-content:space-between;flex-wrap:wrap;">
+        <div style="display:flex;align-items:center;gap:12px;">
+          <div style="width:36px;height:36px;background:#eff6ff;border:1px solid #bfdbfe;color:#2563eb;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;">✦</div>
+          <div>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <div style="font-size:20px;font-weight:800;letter-spacing:-.03em;color:var(--navy);">StarWalk Review Analyst</div>
+              <span class='beta-chip'>Light theme</span>
+            </div>
+            <div style="font-size:12px;color:var(--slate-500);margin-top:2px;">Single-file Streamlit workspace for executive review, deep-dive exploration, Review Prompt, Symptomizer, and Social Listening.</div>
           </div>
-          <div style="font-size:12px;color:#64748b;margin-top:1px;">Single-file Streamlit workspace for executive review, deep-dive exploration, Review Prompt, Symptomizer, and a mocked Social Listening Beta route that works even before reviews exist.</div>
         </div>
       </div>
     </div>""", unsafe_allow_html=True)
