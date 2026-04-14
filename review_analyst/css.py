@@ -17,8 +17,17 @@ APP_CSS = """
   --shadow-lg:0 8px 24px rgba(0,0,0,.09),0 4px 8px rgba(0,0,0,.04);
   --radius-sm:10px; --radius-md:14px; --radius-lg:18px; --radius-xl:22px;
 }
-html,body,.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif;color:var(--navy);background:var(--page-bg)!important;}
-.main,.block-container,.stMainBlockContainer{background:var(--page-bg)!important;}
+/* ── Force light mode on every Streamlit surface ── */
+html,body,[data-testid="stAppViewContainer"],.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif;color:#1e293b!important;background:#f8fafc!important;}
+.main,.block-container,.stMainBlockContainer,[data-testid="stAppViewBlockContainer"]{background:#f8fafc!important;color:#1e293b!important;}
+[data-testid="stHeader"]{background:#ffffff!important;}
+[data-testid="stSidebar"],[data-testid="stSidebar"]>div{background:#ffffff!important;color:#1e293b!important;}
+[data-testid="stSidebar"] p,[data-testid="stSidebar"] span,[data-testid="stSidebar"] label{color:#1e293b!important;}
+[data-testid="stMarkdownContainer"] p,[data-testid="stMarkdownContainer"] li,[data-testid="stMarkdownContainer"] span{color:#1e293b;}
+[data-testid="stExpander"]{background:#ffffff!important;color:#1e293b!important;}
+[data-testid="stMetric"]{background:#ffffff!important;color:#1e293b!important;}
+[data-testid="stMetric"] [data-testid="stMetricValue"]{color:#1e293b!important;}
+[data-testid="stMetric"] [data-testid="stMetricLabel"]{color:#64748b!important;}
 .block-container{
   padding-top:2rem!important;
   padding-bottom:3rem!important;
