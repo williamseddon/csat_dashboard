@@ -4416,7 +4416,7 @@ def _select_relevant(df, question, max_reviews=22):
         return df.copy()
     w = df.copy()
     w["blob"] = w["title_and_text"].fillna("").astype(str).map(_norm_text)
-    qt = _tokenize(question)
+    qt = set(_tokenize(question))
 
     # TF-IDF-inspired scoring: penalize common terms, boost rare matches
     term_doc_freq = {}
@@ -4558,6 +4558,11 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
         }
 
     payload = dict(
+        workspace=dict(
+            workspace_name=_safe_text(st.session_state.get("workspace_name") or ""),
+            source_type=_safe_text((st.session_state.get("analysis_dataset") or {}).get("source_type") if isinstance(st.session_state.get("analysis_dataset"), dict) else ""),
+            source_label=_safe_text((st.session_state.get("analysis_dataset") or {}).get("source_label") if isinstance(st.session_state.get("analysis_dataset"), dict) else ""),
+        ),
         product=dict(
             product_id=_safe_summary_product_label(summary),
             product_url=_safe_summary_product_url(summary),
@@ -4569,6 +4574,11 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
             filtered_review_count=len(filtered_df),
             current_tab=str(active_tab),
             question=question,
+        ),
+        active_taxonomy=dict(
+            detractors=_normalize_tag_list(st.session_state.get("sym_detractors") or [])[:25],
+            delighters=_normalize_tag_list(st.session_state.get("sym_delighters") or [])[:25],
+            category=_safe_text(st.session_state.get("sym_taxonomy_category") or "general"),
         ),
         metric_snapshot=dict(
             overall=om,
@@ -4611,7 +4621,12 @@ def _call_analyst(*, question, overall_df, filtered_df, summary, filter_descript
         if include_references else
         "REFERENCE MODE: do NOT include inline citations, do NOT emit (review_ids: ...), and do NOT add reference callouts in the final answer."
     )
-    instructions = base_instructions + "\n\n" + length_note + "\n\n" + reference_note
+    quality_note = (
+        "QUALITY BAR: avoid generic consulting language. Tie every major point to a named symptom, repeated consumer phrase, rating pattern, or review cohort from the supplied context. "
+        "When you recommend an action, name the likely owner (product, CX, support, content, ops, merchandising, or retention), explain the expected benefit, and state what evidence supports it. "
+        "If the data is thin or mixed, say that clearly instead of overcommitting."
+    )
+    instructions = base_instructions + "\n\n" + length_note + "\n\n" + reference_note + "\n\n" + quality_note
     ai_ctx = _build_ai_context(overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, question=question)
     msgs = [{"role": m["role"], "content": m["content"]} for m in list(chat_history)[-8:]]
     msgs.append({"role": "user", "content": f"User request:\n{question}\n\nReview dataset context (JSON):\n{ai_ctx}"})
@@ -6427,10 +6442,84 @@ def _prioritize_for_symptomization(df):
     w["_prio"] += text.str.len().clip(upper=1200) / 1500.0
     return w.sort_values(["_prio"], ascending=False).drop(columns=["_prio"])
 
+
+def _historical_symptom_counts_from_workspace(
+    *,
+    allowed_detractors: Optional[Sequence[str]] = None,
+    allowed_delighters: Optional[Sequence[str]] = None,
+) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """Build lightweight historical label counts from the current workspace."""
+
+    det_allow = set(_normalize_tag_list(list(allowed_detractors or [])))
+    del_allow = set(_normalize_tag_list(list(allowed_delighters or [])))
+    det_counts: Counter[str] = Counter()
+    del_counts: Counter[str] = Counter()
+
+    processed = list(st.session_state.get("sym_processed_rows") or [])
+    for rec in processed:
+        for label in _normalize_tag_list(rec.get("wrote_dets") or []):
+            if not det_allow or label in det_allow:
+                det_counts[label] += 1
+        for label in _normalize_tag_list(rec.get("wrote_dels") or []):
+            if not del_allow or label in del_allow:
+                del_counts[label] += 1
+
+    dataset = st.session_state.get("analysis_dataset") or {}
+    reviews_df = dataset.get("reviews_df") if isinstance(dataset, dict) else None
+    if isinstance(reviews_df, pd.DataFrame) and not reviews_df.empty:
+        det_cols = [col for col in reviews_df.columns if col.startswith("AI Symptom Det")]
+        del_cols = [col for col in reviews_df.columns if col.startswith("AI Symptom Del")]
+        for col in det_cols:
+            for label in _normalize_tag_list(reviews_df[col].fillna("").astype(str).tolist()):
+                if not det_allow or label in det_allow:
+                    det_counts[label] += 1
+        for col in del_cols:
+            for label in _normalize_tag_list(reviews_df[col].fillna("").astype(str).tolist()):
+                if not del_allow or label in del_allow:
+                    del_counts[label] += 1
+
+    return dict(det_counts), dict(del_counts)
+
 def _call_symptomizer_batch(*, client, items, allowed_delighters, allowed_detractors,
                              product_profile="", product_knowledge=None, max_ev_chars=120, aliases=None, include_universal_neutral=True):
     if not items:
         return {}
+    _det_specs = st.session_state.get("sym_detractor_specs", [])
+    _del_specs = st.session_state.get("sym_delighter_specs", [])
+    _hist_det_counts, _hist_del_counts = _historical_symptom_counts_from_workspace(
+        allowed_detractors=allowed_detractors,
+        allowed_delighters=allowed_delighters,
+    )
+
+    _use_v4 = bool(st.session_state.get("sym_v4_pipeline", True))
+    if _HAS_SYMPTOMIZER_V3 and _use_v4:
+        from review_analyst.symptomizer import tag_review_batch_v4
+        return tag_review_batch_v4(
+            client=client,
+            items=items,
+            allowed_delighters=allowed_delighters,
+            allowed_detractors=allowed_detractors,
+            detractor_specs=_det_specs or None,
+            delighter_specs=_del_specs or None,
+            historical_detractor_counts=_hist_det_counts,
+            historical_delighter_counts=_hist_del_counts,
+            product_profile=product_profile,
+            product_knowledge=product_knowledge,
+            max_ev_chars=max_ev_chars,
+            aliases=aliases,
+            include_universal_neutral=include_universal_neutral,
+            pre_category=st.session_state.get("sym_taxonomy_category", ""),
+            chat_complete_fn=_chat_complete_with_fallback_models,
+            safe_json_load_fn=_safe_json_load,
+            refine_fn=_refine_tag_assignment,
+            model_fn=_shared_model,
+            reasoning_fn=_shared_reasoning,
+            infer_category_fn=_infer_taxonomy_category,
+            taxonomy_context_fn=_taxonomy_prompt_context,
+            product_knowledge_text_fn=_product_knowledge_context_text,
+            custom_universal_fn=_custom_universal_catalog,
+            standardize_fn=lambda d, t: _standardize_symptom_lists(d, t),
+        )
     # ── v3 staged pipeline (extract → classify → verify) ────────────────
     # Auto-activates for long reviews (>100 avg words) where the quality gain
     # from taxonomy-free claim extraction justifies the extra API call.
@@ -6503,6 +6592,8 @@ def _call_symptomizer_batch(*, client, items, allowed_delighters, allowed_detrac
         return _v3_tag_review_batch(
             client=client, items=items, allowed_delighters=allowed_delighters,
             allowed_detractors=allowed_detractors, product_profile=product_profile,
+            detractor_specs=_det_specs or None,
+            delighter_specs=_del_specs or None,
             product_knowledge=product_knowledge, max_ev_chars=max_ev_chars,
             aliases=aliases, include_universal_neutral=include_universal_neutral,
             pre_category=st.session_state.get("sym_taxonomy_category", ""),
@@ -7317,6 +7408,7 @@ def _init_state():
         sym_product_profile_ai_note="",
         sym_calibration_result=None,
         sym_staged_pipeline=False,
+        sym_v4_pipeline=True,
         sym_last_run_stats=None,
         sidebar_manual_api_key="",
         workspace_name="",
@@ -7523,7 +7615,12 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
             st.slider("Symptomizer batch size", 1, 12, key="sym_batch_size")
             st.slider("Symptomizer max evidence chars", 60, 200, step=10, key="sym_max_ev_chars")
             if _HAS_SYMPTOMIZER_V3:
-                st.toggle("Enable staged pipeline", value=bool(st.session_state.get("sym_staged_pipeline", False)), key="sym_staged_pipeline", help="Three-stage pipeline: Extract claims → Map to taxonomy → Verify. Higher accuracy but ~2x API calls.")
+                st.toggle(
+                    "Use Symptomizer v4 pipeline",
+                    value=bool(st.session_state.get("sym_v4_pipeline", True)),
+                    key="sym_v4_pipeline",
+                    help="Default on. Uses rich taxonomy guidance, long-review claim extraction, polarity audits, taxonomy hygiene, and targeted verification for riskier results.",
+                )
         st.divider()
         st.markdown("""<div class='sidebar-scope-card sidebar-scope-card--feature'>
           <div class='sidebar-scope-title'>Beta feature</div>
@@ -8930,15 +9027,16 @@ The Symptomizer reads each review as a set of evidence-backed product claims, ma
 
 **Advanced AI behavior inside this run**
 
-- Rating-aware routing limits obvious cross-polarity mistakes and only opens both sides when the text looks mixed.
-- Evidence-first extraction asks the model to quote the review before it maps a claim to a taxonomy label.
+- Rich taxonomy guidance can tell the model exactly when each label should be tagged as a detractor, a delighter, or skipped.
+- Long reviews can route through a two-stage pipeline: extract claims first, then map them to the taxonomy, then cross-check with the single-pass result.
+- Polarity audits look for negation, contrast clauses, and concern-then-relief language before a tag survives.
 - Adaptive batching keeps short reviews fast while shrinking batch size for longer, denser reviews.
-- Sparse-result follow-up re-checks reviews that look under-tagged so the final pass can recover missed signals.
+- Sparse-result follow-up and targeted verification re-check the results most likely to be wrong instead of blindly reprocessing everything.
 - Alias learning and product knowledge enrichment use what the run learned to make future taxonomy passes sharper.
 
 **Why a highlight can still miss sometimes**
 
-The tagger reads more than the main review body — it may use pros, cons, comments, title/body variants, or other visible fields when available. Highlights work best when the stored evidence is verbatim. They can still miss when the captured snippet was paraphrased, heavily normalized, or spread across multiple fields. This build now checks a broader set of visible review fields to make highlighting much more consistent.
+The tagger reads more than the main review body — it may use pros, cons, comments, title/body variants, or other visible fields when available. Highlights work best when the stored evidence is verbatim. They can still miss when the captured snippet was paraphrased, heavily normalized, split across multiple fields, or pulled from a fuzzy evidence match instead of one exact span. This build now recovers more verbatim spans during evidence validation and checks a broader set of visible review fields to make highlighting much more consistent.
             """
         )
     client = _get_client()
@@ -9631,10 +9729,10 @@ The tagger reads more than the main review body — it may use pros, cons, comme
             + "…"
         )
         eta_box.markdown(
-            "<div class='status-note'>The last step saves results, runs a targeted follow-up only on reviews that still look sparse, then refreshes the tables and export file.</div>",
+            "<div class='status-note'>The last step saves results, runs a targeted sparse-result audit only on reviews that still look under-tagged, then refreshes the tables and export file. This stage can feel slower because it focuses on the hardest edge cases instead of the easy bulk tagging work.</div>",
             unsafe_allow_html=True,
         )
-        prog.progress(0.95, text=f"{done}/{total_n} tagged · finalizing")
+        prog.progress(0.95, text=f"{done}/{total_n} tagged · syncing and auditing edge cases")
 
         retry_changed = 0
         if _HAS_SYMPTOMIZER_V3 and client and processed_local:
@@ -9649,13 +9747,13 @@ The tagger reads more than the main review body — it may use pros, cons, comme
                     rate_retry = checked / elapsed_retry if elapsed_retry > 0 else 0.0
                     rem_retry = (max(total_retry - checked, 0) / rate_retry) if rate_retry > 0 and total_retry > 0 else 0.0
                     progress = 0.97 + (0.015 * (checked / max(total_retry, 1))) if total_retry else 0.982
-                    msg = f"{done}/{total_n} tagged · validating sparse results"
+                    msg = f"{done}/{total_n} tagged · auditing sparse results"
                     if total_retry:
                         msg += f" ({checked}/{total_retry})"
                     prog.progress(min(progress, 0.985), text=msg)
                     if total_retry:
                         eta_box.markdown(
-                            f"**Focused follow-up:** {checked}/{total_retry} review(s) checked · **Speed:** {rate_retry * 60:.1f} rev/min · **ETA:** ~{_fmt_secs(rem_retry)}"
+                            f"**Sparse-result audit:** {checked}/{total_retry} review(s) checked · **Speed:** {rate_retry * 60:.1f} rev/min · **ETA:** ~{_fmt_secs(rem_retry)}"
                         )
                     elif phase == "queued":
                         eta_box.markdown(
@@ -9748,7 +9846,11 @@ The tagger reads more than the main review body — it may use pros, cons, comme
             "elapsed_sec": round(elapsed_total, 1),
             "model": _shared_model(),
             "reasoning": _shared_reasoning(),
-            "staged": bool(st.session_state.get("sym_staged_pipeline")),
+            "pipeline": (
+                "v4 hybrid"
+                if bool(st.session_state.get("sym_v4_pipeline", True))
+                else ("staged" if bool(st.session_state.get("sym_staged_pipeline")) else "single-pass")
+            ),
             "cache_stats": _v3_result_cache.stats if _HAS_SYMPTOMIZER_V3 else {},
             "retry_recovered": retry_changed,
         }
@@ -9794,7 +9896,8 @@ The tagger reads more than the main review body — it may use pros, cons, comme
         sc1, sc2, sc3 = st.columns(3)
         sc1.metric("Reviews tagged", f"{last_stats.get('reviews', 0):,}")
         sc2.metric("Labels written", f"{last_stats.get('labels', 0):,} ({last_stats.get('avg_per_review', 0):.1f}/review)")
-        sc3.metric("Speed", f"{last_stats.get('reviews', 0) / max(last_stats.get('elapsed_sec', 1), 0.1) * 60:.0f}/min · {'Staged' if last_stats.get('staged') else 'Single-pass'}")
+        pipeline_label = str(last_stats.get("pipeline") or ("staged" if last_stats.get("staged") else "single-pass")).title()
+        sc3.metric("Speed", f"{last_stats.get('reviews', 0) / max(last_stats.get('elapsed_sec', 1), 0.1) * 60:.0f}/min · {pipeline_label}")
         # Sub-stats row: cache + knowledge enrichment
         sub_chips = []
         cache_s = last_stats.get("cache_stats", {})
@@ -10369,7 +10472,7 @@ def main():
 
     dataset = st.session_state.get("analysis_dataset")
     if dataset:
-        bc = st.columns([2.8, 1.4, 0.6, 0.6])
+        bc = st.columns([2.5, 1.05, 1.1, 0.55, 0.55])
         # Workspace name (editable)
         ws_name = st.session_state.get("workspace_name", dataset.get("source_label", "Untitled"))
         bc[0].caption(f"Active workspace · {dataset.get('source_type', '').title()} · {ws_name}")
@@ -10397,9 +10500,33 @@ def main():
                     st.toast(f"Workspace saved: {ws_name}", icon="💾")
                 except Exception as exc:
                     st.error(f"Save failed: {exc}")
-        if bc[2].button("✏️", use_container_width=True, key="ws_rename_btn", help="Rename workspace"):
+            if bc[2].button("Save as new", use_container_width=True, key="ws_save_as_btn"):
+                try:
+                    summary = dataset.get("summary")
+                    reviews_df = dataset.get("reviews_df", pd.DataFrame())
+                    sym_state = {k: v for k, v in st.session_state.items() if k.startswith("sym_") and not k.startswith("_")}
+                    new_name = ws_name if str(ws_name).strip().lower().endswith("copy") else f"{ws_name} copy"
+                    ws_id = _ws_save(
+                        workspace_name=new_name,
+                        source_type=dataset.get("source_type", "unknown"),
+                        source_label=dataset.get("source_label", ""),
+                        reviews_df=reviews_df,
+                        dataset_payload={k: v for k, v in dataset.items() if k not in ("reviews_df",)},
+                        state_payload=sym_state,
+                        product_id=getattr(summary, "product_id", "") if summary else "",
+                        product_url=getattr(summary, "product_url", "") if summary else "",
+                        symptomized=bool(st.session_state.get("sym_processed_rows")),
+                        workspace_id=None,
+                        allow_source_upsert=False,
+                    )
+                    st.session_state["workspace_id"] = ws_id
+                    st.session_state["workspace_name"] = new_name
+                    st.toast(f"Saved new workspace: {new_name}", icon="🧬")
+                except Exception as exc:
+                    st.error(f"Save as failed: {exc}")
+        if bc[3].button("✏️", use_container_width=True, key="ws_rename_btn", help="Rename workspace"):
             st.session_state["_ws_show_rename"] = True
-        if bc[3].button("Clear", use_container_width=True, key="ws_clear"):
+        if bc[4].button("Clear", use_container_width=True, key="ws_clear"):
             _reset_workspace_state(reset_source=True)
             st.rerun()
         # Rename dialog
@@ -10479,23 +10606,29 @@ def main():
                 "<div class='builder-kicker'>Source setup</div><div class='builder-title' style='font-size:16px;'>Choose how to load reviews</div><div class='builder-sub' style='margin-bottom:.7rem;'>Pick a link-based workspace or an uploaded file flow. The controls below stay grouped so the source choice, mode, and primary action feel like one connected setup.</div>",
                 unsafe_allow_html=True,
             )
-            st.markdown("**Workspace source**")
-            source_mode = st.radio(
-                "Workspace source",
-                [SOURCE_MODE_URL, SOURCE_MODE_FILE],
-                horizontal=True,
-                key="workspace_source_mode",
-                label_visibility="collapsed",
-            )
-            if source_mode == SOURCE_MODE_URL:
-                st.markdown("**Link mode**")
-                url_mode = st.radio(
-                    "Link mode",
-                    ["Single link", "Multiple links"],
+            src_label_col, src_control_col = st.columns([1.0, 2.4])
+            with src_label_col:
+                st.markdown("<div class='metric-label' style='margin-top:.35rem;'>Workspace source</div>", unsafe_allow_html=True)
+            with src_control_col:
+                source_mode = st.radio(
+                    "Workspace source",
+                    [SOURCE_MODE_URL, SOURCE_MODE_FILE],
                     horizontal=True,
-                    key="workspace_url_entry_mode",
+                    key="workspace_source_mode",
                     label_visibility="collapsed",
                 )
+            if source_mode == SOURCE_MODE_URL:
+                mode_label_col, mode_control_col = st.columns([1.0, 2.4])
+                with mode_label_col:
+                    st.markdown("<div class='metric-label' style='margin-top:.2rem;'>Link mode</div>", unsafe_allow_html=True)
+                with mode_control_col:
+                    url_mode = st.radio(
+                        "Link mode",
+                        ["Single link", "Multiple links"],
+                        horizontal=True,
+                        key="workspace_url_entry_mode",
+                        label_visibility="collapsed",
+                    )
                 if url_mode == "Single link":
                     st.text_input(
                         "Product or review URL",
@@ -10549,7 +10682,7 @@ def main():
                         except Exception as exc:
                             st.error(str(exc))
             else:
-                st.markdown("**Uploaded review file**")
+                st.markdown("<div class='metric-label' style='margin:.25rem 0 .3rem;'>Uploaded review file</div>", unsafe_allow_html=True)
                 uploader_key = f"workspace_files_{int(st.session_state.get('workspace_file_uploader_nonce', 0))}"
                 uploaded_files = st.file_uploader(
                     "Upload review export files",
@@ -10711,10 +10844,10 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
     with st.container(border=True):
         top_left, top_right = st.columns([4.2, 1.0])
         with top_left:
-            st.markdown("### Ask AI about this view")
+            st.markdown("### Ask AI about this product or workspace")
             st.caption(
-                "Grounded in the active filters, current symptom tags, and product knowledge when available. "
-                "Use it for sharper summaries, prioritization, root-cause hypotheses, and what-to-do-next guidance."
+                "Grounded in the active filters, current symptom tags, product knowledge, and recent review evidence. "
+                "Use it for sharper summaries, root-cause hypotheses, action plans, consumer-language synthesis, and what-to-do-next guidance."
             )
         with top_right:
             if st.button("Clear chat", key="bottom_chat_clear", use_container_width=True, disabled=not chat_messages):
@@ -10797,7 +10930,7 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
                         st.rerun()
 
     pending_prompt = st.session_state.pop("_chat_pending_prompt", None)
-    prompt = st.chat_input("Ask AI about this filtered view...", key="bottom_chat_input")
+    prompt = st.chat_input("Ask AI about this product or workspace...", key="bottom_chat_input")
     if pending_prompt:
         prompt = pending_prompt
 
@@ -10839,7 +10972,8 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
             f"Special instruction: {focus_instructions.get(focus, '')}\n"
             f"Response format: {response_scaffolds.get(focus, '')}\n"
             f"Style instruction: {style_instructions.get(answer_style, '')}\n"
-            "Ground the answer in the current filtered view. Quantify where possible, separate evidence from inference, avoid generic advice, and end with concrete next steps."
+            "Ground the answer in the current filtered view and current workspace. Quantify where possible, separate evidence from inference, avoid generic advice, and end with concrete next steps. "
+            "Prefer named symptom themes, concrete consumer language, and likely owner-level actions over broad summaries."
         )
 
         st.session_state.setdefault("chat_messages", []).append({"role": "user", "content": prompt})

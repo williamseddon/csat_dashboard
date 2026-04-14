@@ -681,7 +681,9 @@ class NegationDetector:
             re.compile(p, re.IGNORECASE) for p in [
                 rf"\b(?:not|never|hardly|barely|isn't|wasn't|weren't|ain't|without)\s+(?:really\s+|very\s+|that\s+|quite\s+|at\s+all\s+)?{phrase_pattern}\b",
                 rf"\bnot\s+as\s+{phrase_pattern}\s+as\b",
+                rf"\bnot\s+as\s+{phrase_pattern}\s+as\s+(?:I\s+)?(?:expected|hoped|thought|wanted|advertised|described|promised)\b",
                 rf"\b(?:less|fewer)\s+{phrase_pattern}\b",
+                rf"\b(?:less|lacking|missing|needs?\s+more|could\s+use\s+more)\s+{phrase_pattern}\b",
                 rf"\bno\s+(?:issue|issues|problem|problems|complaint|complaints|trouble|concern|concerns)\s+(?:with|from|regarding|about)\s+(?:the\s+|any\s+|this\s+)?(?:[^.!?;,]{{0,30}}\s+)?{phrase_pattern}\b",
                 rf"\bfree\s+of\s+{phrase_pattern}\b",
                 rf"{phrase_pattern}-free\b",
@@ -689,6 +691,9 @@ class NegationDetector:
                 rf"\bno\s+{phrase_pattern}(?:\s+\S+){{0,4}}\s+(?:at\s+all|whatsoever|to\s+speak\s+of)\b",
                 rf"\bnever\s+(?:had|experienced|noticed|encountered|seen|had\s+any)\s+(?:[^.!?;,]{{0,20}}\s+)?{phrase_pattern}\b",
                 rf"\bwithout\s+(?:any\s+|a\s+)?{phrase_pattern}\b",
+                rf"\b(?:would|could|should)\s+(?:be|have\s+been)\s+(?:more|better|nicer)\s+.*{phrase_pattern}\b",
+                rf"\b(?:supposed|expected|meant|claimed|advertised)\s+to\s+(?:be\s+)?{phrase_pattern}\b.*\b(?:but|however|yet|instead|unfortunately)\b",
+                rf"\b(?:only|just)\s+{phrase_pattern}\s+(?:on|at|when|during|in)\b",
             ]
         ]
 

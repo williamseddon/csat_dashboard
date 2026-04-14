@@ -106,6 +106,94 @@ class ResultCache:
 # Module-level singleton — lives for the Streamlit session
 _result_cache = ResultCache()
 
+
+def prune_taxonomy(
+    allowed: Sequence[str],
+    historical_counts: Dict[str, int],
+    *,
+    min_reviews_for_prune: int = 30,
+    max_labels: int = 25,
+) -> Tuple[List[str], List[str]]:
+    """Prune taxonomy labels before a tagging run.
+
+    Returns ``(primary_labels, extended_labels)``. Primary labels go in the
+    main prompt. Extended labels are available to follow-up or sparse-result
+    recovery passes.
+    """
+
+    ordered = [str(label).strip() for label in (allowed or []) if str(label).strip()]
+    if not ordered:
+        return [], []
+
+    total_signal = sum(int(historical_counts.get(label, 0) or 0) for label in ordered)
+    approx_reviews = int(round(total_signal / max(len(ordered), 1)))
+    if approx_reviews < int(min_reviews_for_prune):
+        return ordered[:max_labels], ordered[max_labels:]
+
+    active = [label for label in ordered if int(historical_counts.get(label, 0) or 0) > 0]
+    pruned = [label for label in ordered if int(historical_counts.get(label, 0) or 0) <= 0]
+    if not active:
+        active = list(ordered)
+        pruned = []
+
+    active.sort(key=lambda label: (-int(historical_counts.get(label, 0) or 0), ordered.index(label)))
+    primary = active[:max_labels]
+    extended = active[max_labels:] + pruned
+
+    if pruned:
+        logger.info("Pruned %d zero-hit labels: %s", len(pruned), ", ".join(pruned[:5]))
+    return primary, extended
+
+
+def deduplicate_taxonomy_labels(
+    labels: Sequence[str],
+    aliases: Optional[Dict[str, List[str]]] = None,
+    *,
+    threshold: float = 0.55,
+) -> Tuple[List[str], Dict[str, List[str]]]:
+    """Merge near-duplicate labels before they enter the active catalog.
+
+    Example: ``Loud Noise`` + ``Noisy Motor`` + ``Loud Motor`` can collapse
+    into a single primary label while the extras become aliases.
+    """
+
+    alias_map: Dict[str, List[str]] = {
+        str(key).strip(): [str(v).strip() for v in (vals or []) if str(v).strip()]
+        for key, vals in dict(aliases or {}).items()
+        if str(key).strip()
+    }
+    seen_stems: Dict[str, str] = {}
+    out: List[str] = []
+
+    for raw_label in (labels or []):
+        label = str(raw_label).strip()
+        if not label:
+            continue
+        stems = _tokenize_stemmed(label)
+        if not stems:
+            out.append(label)
+            continue
+
+        merged = False
+        for existing_key, existing_label in list(seen_stems.items()):
+            existing_stems = set(existing_key.split("|")) if existing_key else set()
+            if not existing_stems:
+                continue
+            overlap = len(stems & existing_stems) / max(len(stems), len(existing_stems))
+            if overlap >= threshold:
+                alias_map.setdefault(existing_label, [])
+                if label not in alias_map[existing_label]:
+                    alias_map[existing_label].append(label)
+                logger.info("Dedup: merged '%s' into '%s' (%.0f%% overlap)", label, existing_label, overlap * 100)
+                merged = True
+                break
+
+        if not merged:
+            out.append(label)
+            seen_stems["|".join(sorted(stems))] = label
+
+    return out, alias_map
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -162,6 +250,126 @@ class SymptomResult:
             reliability=self.reliability,
             sessions=self.sessions,
         )
+
+
+@dataclass
+class SymptomSpec:
+    """Rich symptom definition with tagging guidance.
+
+    When populated, these fields are injected into the system prompt so the AI
+    knows exactly when to tag each symptom. This helps reduce polarity and
+    ambiguity errors for labels like "Hair Damage" or "Noise" where negation
+    and comparative phrasing matter.
+    """
+
+    name: str
+    desc: str = ""
+    detractor_signal: str = ""
+    delighter_signal: str = ""
+    ambiguity_rule: str = ""
+    priority: str = "normal"
+    aliases: List[str] = field(default_factory=list)
+    side_lock: str = ""
+
+
+def _coerce_symptom_spec(spec: Any) -> Optional[SymptomSpec]:
+    """Coerce raw session payloads into :class:`SymptomSpec` objects.
+
+    Streamlit session state may hold dataclasses, dicts, or plain strings. This
+    helper keeps the prompt layer backward compatible while letting the app pass
+    richer catalog objects without a separate conversion step.
+    """
+
+    if isinstance(spec, SymptomSpec):
+        return spec
+    if isinstance(spec, Mapping):
+        name = str(spec.get("name", "")).strip()
+        if not name:
+            return None
+        return SymptomSpec(
+            name=name,
+            desc=str(spec.get("desc", "")).strip(),
+            detractor_signal=str(spec.get("detractor_signal", "")).strip(),
+            delighter_signal=str(spec.get("delighter_signal", "")).strip(),
+            ambiguity_rule=str(spec.get("ambiguity_rule", "")).strip(),
+            priority=str(spec.get("priority", "normal")).strip() or "normal",
+            aliases=[str(v).strip() for v in (spec.get("aliases") or []) if str(v).strip()],
+            side_lock=str(spec.get("side_lock", "")).strip(),
+        )
+    if isinstance(spec, str) and spec.strip():
+        return SymptomSpec(name=spec.strip())
+    return None
+
+
+def generate_symptom_guidance(
+    *,
+    client: Any,
+    label: str,
+    side: str,
+    sample_evidence: List[str],
+    product_context: str = "",
+    chat_complete_fn: Optional[Callable] = None,
+    safe_json_load_fn: Optional[Callable] = None,
+    model_fn: Optional[Callable] = None,
+) -> SymptomSpec:
+    """Auto-generate rich :class:`SymptomSpec` guidance for a bare label.
+
+    Uses sample evidence snippets from historical tagging to infer when this
+    label should be tagged as a detractor, delighter, or skipped. This is a
+    one-time catalog-enrichment helper, not something meant to run per review.
+    """
+
+    clean_label = str(label or "").strip()
+    if not clean_label:
+        return SymptomSpec(name="")
+    if not chat_complete_fn:
+        return SymptomSpec(name=clean_label)
+
+    _jload = safe_json_load_fn or _default_json_load
+    evidence_text = "\n".join(f'  - "{str(e).strip()}"' for e in (sample_evidence or [])[:10] if str(e).strip())
+
+    prompt = f"""Generate tagging guidance for the symptom label \"{clean_label}\" ({side} side).
+
+Product context: {product_context or 'consumer product'}
+
+Example evidence snippets where this label was tagged:
+{evidence_text or '  - (no evidence provided)'}
+
+Generate:
+1. desc: one sentence describing what this symptom covers
+2. detractor_signal: describe when a reviewer is complaining about this (negative experience). Use \"always\" if this is always negative (e.g., a defect). Use \"never\" if this can never be negative.
+3. delighter_signal: describe when a reviewer is praising this (positive experience). Use \"always\" if this is always positive. Use \"never\" if this can never be positive.
+4. ambiguity_rule: describe edge cases where you would skip tagging (neutral mentions, unclear attribution, overlap with another symptom)
+
+CRITICAL: The detractor and delighter signals must handle NEGATION correctly.
+Example for \"Hair Damage\":
+- detractor_signal: \"reviewer reports hair damage, dryness, breakage, or split ends after using the product\"
+- delighter_signal: \"reviewer praises that the product did NOT damage their hair, or says hair feels healthy/protected after use\"
+- ambiguity_rule: \"reviewer mentions general hair texture without attributing change to this product -> skip\"
+
+JSON only: {{"desc":"...","detractor_signal":"...","delighter_signal":"...","ambiguity_rule":"..."}}"""
+
+    try:
+        result = chat_complete_fn(
+            client,
+            model=(model_fn or (lambda: "gpt-4o"))(),
+            structured=True,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=400,
+        )
+        data = _jload(result)
+        return SymptomSpec(
+            name=clean_label,
+            desc=str(data.get("desc", "")).strip(),
+            detractor_signal=str(data.get("detractor_signal", "")).strip(),
+            delighter_signal=str(data.get("delighter_signal", "")).strip(),
+            ambiguity_rule=str(data.get("ambiguity_rule", "")).strip(),
+        )
+    except Exception as exc:
+        logger.warning("Failed to generate guidance for '%s': %s", clean_label, exc)
+        return SymptomSpec(name=clean_label)
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +642,8 @@ def validate_evidence(
     """
     if not evidence_list or not review_text:
         return []
-    rv_norm = re.sub(r"\s+", " ", review_text.lower())
+    rv_text = re.sub(r"\s+", " ", str(review_text or "").strip())
+    rv_norm = rv_text.lower()
     rv_words = len(rv_norm.split())
     # Relax minimum for short reviews
     min_chars = 4 if rv_words < 30 else 6
@@ -445,9 +654,14 @@ def validate_evidence(
         if len(e) < min_chars or len(e.split()) < min_words:
             continue
         e_norm = re.sub(r"\s+", " ", e.lower())
+        matched_span = ""
         
         # Tier 1: Exact verbatim match
         found_verbatim = e_norm in rv_norm
+        if found_verbatim:
+            exact_idx = rv_norm.find(e_norm)
+            if exact_idx >= 0:
+                matched_span = rv_text[exact_idx:exact_idx + len(e_norm)]
         
         # Tier 2: Fuzzy substring — find if all significant words appear nearby
         found_fuzzy = False
@@ -458,11 +672,25 @@ def validate_evidence(
                 for start_pos in range(0, len(rv_norm) - 10, 20):
                     window = rv_norm[start_pos:start_pos + 150]
                     if all(w in window for w in e_words):
+                        positions = []
+                        for word in e_words:
+                            pos = window.find(word)
+                            if pos >= 0:
+                                positions.append((start_pos + pos, start_pos + pos + len(word)))
+                        if positions:
+                            span_start = min(pos[0] for pos in positions)
+                            span_end = max(pos[1] for pos in positions)
+                            matched_span = rv_text[span_start:span_end].strip()[:max_chars]
                         found_fuzzy = True
                         break
             elif e_words and len(e_words) == 1 and len(e_words[0]) >= 5:
                 # Single significant word — just check it exists
-                found_fuzzy = e_words[0] in rv_norm
+                if e_words[0] in rv_norm:
+                    found_fuzzy = True
+                    single_idx = rv_norm.find(e_words[0])
+                    if single_idx >= 0:
+                        span_end = min(len(rv_text), single_idx + len(e_words[0]) + 28)
+                        matched_span = rv_text[single_idx:span_end].strip()[:max_chars]
         
         if not found_verbatim and not found_fuzzy:
             continue
@@ -502,7 +730,7 @@ def validate_evidence(
                             is_negated = True
         if is_negated:
             continue
-        out.append(e)
+        out.append(matched_span or e)
     return out[:3]
 
 
@@ -543,8 +771,14 @@ def _score_tag_confidence(
         matched = sum(1 for e in evidence if e.lower() in rv_lower)
         if matched > 0:
             score += 0.25 * min(1.0, matched / max(len(evidence), 1))
-        avg_len = sum(len(e) for e in evidence) / max(len(evidence), 1)
-        score += min(0.1, avg_len / 200)
+        for ev in evidence:
+            word_count = len(str(ev or "").split())
+            if word_count >= 6:
+                score += 0.08
+            elif word_count >= 3:
+                score += 0.04
+            elif word_count > 0:
+                score += 0.01
         # Repetition boost: evidence concept mentioned multiple times = stronger signal
         for e in evidence:
             e_lower = e.lower()
@@ -597,10 +831,61 @@ RELIABILITY_ENUM = "Reliable, Intermittent Issue, Failure, Not Mentioned"
 SESSIONS_ENUM = "1-5, 6-20, 21-50, 50+, Unknown"
 
 
+def _format_rich_catalog(
+    specs: Sequence[SymptomSpec],
+    side: str,
+    fallback_labels: Sequence[str],
+) -> str:
+    """Format the symptom catalog for the system prompt.
+
+    If rich :class:`SymptomSpec` entries are provided, emit guidance blocks.
+    Otherwise fall back to the original flat label list format.
+    """
+
+    rich_specs = [spec for spec in (_coerce_symptom_spec(raw) for raw in (specs or [])) if spec]
+    if rich_specs:
+        lines: List[str] = []
+        for spec in rich_specs:
+            lines.append(f"[{spec.name}]")
+            if spec.desc:
+                lines.append(f"  desc: {spec.desc}")
+            if side == "detractor" and spec.detractor_signal:
+                if spec.detractor_signal == "always":
+                    lines.append("  detractor: ALWAYS tag as detractor when mentioned")
+                elif spec.detractor_signal == "never":
+                    lines.append("  detractor: NEVER tag as detractor")
+                else:
+                    lines.append(f"  tag when: {spec.detractor_signal}")
+            if side == "delighter" and spec.delighter_signal:
+                if spec.delighter_signal == "always":
+                    lines.append("  delighter: ALWAYS tag as delighter when mentioned")
+                elif spec.delighter_signal == "never":
+                    lines.append("  delighter: NEVER tag as delighter")
+                else:
+                    lines.append(f"  tag when: {spec.delighter_signal}")
+            if spec.ambiguity_rule:
+                lines.append(f"  skip when: {spec.ambiguity_rule}")
+            if spec.priority == "high":
+                lines.append("  priority: HIGH — always tag if present even when limit reached")
+            if spec.side_lock:
+                if spec.side_lock == "detractor_only":
+                    lines.append("  side lock: detractor-only")
+                elif spec.side_lock == "delighter_only":
+                    lines.append("  side lock: delighter-only")
+            if spec.aliases:
+                lines.append("  aliases: " + ", ".join(spec.aliases[:8]))
+            lines.append("")
+        return "\n".join(lines).strip() or "  (none defined)"
+
+    return "\n".join(f"  - {label}" for label in fallback_labels) or "  (none defined)"
+
+
 def _build_system_prompt(
     *,
     allowed_detractors: Sequence[str],
     allowed_delighters: Sequence[str],
+    detractor_specs: Optional[Sequence[SymptomSpec]] = None,
+    delighter_specs: Optional[Sequence[SymptomSpec]] = None,
     product_profile: str = "",
     product_knowledge_text: str = "",
     taxonomy_context: str = "",
@@ -608,8 +893,8 @@ def _build_system_prompt(
     max_ev_chars: int = 120,
 ) -> str:
     """Build the system prompt with evidence-first architecture."""
-    det_list = "\n".join(f"  - {l}" for l in allowed_detractors) or "  (none defined)"
-    del_list = "\n".join(f"  - {l}" for l in allowed_delighters) or "  (none defined)"
+    det_list = _format_rich_catalog(detractor_specs or [], "detractor", allowed_detractors)
+    del_list = _format_rich_catalog(delighter_specs or [], "delighter", allowed_delighters)
 
     return f"""You are an expert consumer review analyst. Your job: tag reviews against a symptom taxonomy.
 
@@ -713,6 +998,8 @@ def tag_review_batch(
     items: Sequence[Mapping[str, Any]],
     allowed_delighters: Sequence[str],
     allowed_detractors: Sequence[str],
+    detractor_specs: Optional[Sequence[SymptomSpec]] = None,
+    delighter_specs: Optional[Sequence[SymptomSpec]] = None,
     product_profile: str = "",
     product_knowledge: Any = None,
     max_ev_chars: int = 120,
@@ -742,6 +1029,25 @@ def tag_review_batch(
     _json_load = safe_json_load_fn or _default_json_load
     _model = (model_fn or (lambda: "gpt-4o"))()
     _reasoning = (reasoning_fn or (lambda: "none"))()
+
+    merged_aliases: Dict[str, List[str]] = {
+        str(key).strip(): [str(v).strip() for v in (vals or []) if str(v).strip()]
+        for key, vals in dict(aliases or {}).items()
+        if str(key).strip()
+    }
+    for spec in (_coerce_symptom_spec(raw) for raw in (detractor_specs or [])):
+        if spec and spec.aliases:
+            merged_aliases.setdefault(spec.name, [])
+            for alias in spec.aliases:
+                if alias not in merged_aliases[spec.name]:
+                    merged_aliases[spec.name].append(alias)
+    for spec in (_coerce_symptom_spec(raw) for raw in (delighter_specs or [])):
+        if spec and spec.aliases:
+            merged_aliases.setdefault(spec.name, [])
+            for alias in spec.aliases:
+                if alias not in merged_aliases[spec.name]:
+                    merged_aliases[spec.name].append(alias)
+    aliases = merged_aliases or None
 
     # ── Cache check: skip items we've already processed ──────────────
     _cat_hash = ResultCache.catalog_hash(allowed_detractors, allowed_delighters)
@@ -801,6 +1107,8 @@ def tag_review_batch(
     system_prompt = _build_system_prompt(
         allowed_detractors=allowed_detractors,
         allowed_delighters=allowed_delighters,
+        detractor_specs=detractor_specs,
+        delighter_specs=delighter_specs,
         product_profile=product_profile,
         product_knowledge_text=pk_text,
         taxonomy_context=taxonomy_context,
@@ -928,6 +1236,294 @@ def tag_review_batch(
     return out_by_idx
 
 
+def _merge_pipeline_results(
+    staged_labels: List[str],
+    staged_ev: Dict[str, List[str]],
+    single_labels: List[str],
+    single_ev: Dict[str, List[str]],
+) -> Tuple[List[str], Dict[str, List[str]]]:
+    """Merge results from two-stage and single-pass pipelines.
+
+    - If both agree, keep the label.
+    - If only one side finds it, still keep it.
+    - Merge evidence from both sources and prefer the longer snippets.
+    """
+
+    all_labels = list(dict.fromkeys(list(staged_labels or []) + list(single_labels or [])))
+    merged_ev: Dict[str, List[str]] = {}
+    for label in all_labels:
+        combined = list(dict.fromkeys(list(staged_ev.get(label, []) or []) + list(single_ev.get(label, []) or [])))
+        combined.sort(key=lambda ev: -len(str(ev or "")))
+        merged_ev[label] = [str(ev).strip() for ev in combined[:3] if str(ev).strip()]
+    return all_labels[:10], merged_ev
+
+
+def needs_verification(
+    result: Dict[str, Any],
+    review_text: str,
+    rating: Any,
+) -> bool:
+    """Identify results that deserve a lightweight verification pass."""
+
+    dets = list(result.get("dets") or [])
+    dels = list(result.get("dels") or [])
+    review_words = len(str(review_text or "").split())
+
+    if not dets and not dels and review_words > 50:
+        return True
+
+    try:
+        r = float(rating)
+        if r >= 5 and dets:
+            return True
+        if r <= 1 and dels:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    if review_words < 40 and (len(dets) + len(dels)) > 4:
+        return True
+    return False
+
+
+_VERIFY_SYSTEM = """You are auditing symptom tags assigned to a product review. For each tag, decide KEEP or DROP.
+
+DROP a tag if:
+- The evidence doesn't support it (quote is about a different topic)
+- The polarity is wrong (negative evidence tagged as delighter, or vice versa)
+- The tag is about a DIFFERENT product mentioned in the review
+- The evidence is negated ("no issues with X" should NOT be tagged as X detractor)
+
+KEEP a tag if the evidence genuinely supports the label and polarity.
+
+Output strict JSON: {"tags":[{"label":"...","verdict":"KEEP"|"DROP","reason":"one word"}]}"""
+
+
+def verify_tags(
+    *,
+    client: Any,
+    review_text: str,
+    rating: Any,
+    result: Dict[str, Any],
+    chat_complete_fn: Optional[Callable] = None,
+    safe_json_load_fn: Optional[Callable] = None,
+    model_fn: Optional[Callable] = None,
+) -> Dict[str, Any]:
+    """Run lightweight verification on a flagged result.
+
+    This targets the small slice of results that are most likely to be wrong,
+    which improves precision without paying for a second pass on every review.
+    """
+
+    if not chat_complete_fn:
+        return result
+
+    _jload = safe_json_load_fn or _default_json_load
+    dets = list(result.get("dets") or [])
+    dels = list(result.get("dels") or [])
+    ev_det = dict(result.get("ev_det") or {})
+    ev_del = dict(result.get("ev_del") or {})
+    if not dets and not dels:
+        return result
+
+    tag_lines: List[str] = []
+    for label in dets:
+        ev = ev_det.get(label, [])
+        tag_lines.append(f"  DETRACTOR: {label} — evidence: {'; '.join(ev[:2]) if ev else '(none)'}")
+    for label in dels:
+        ev = ev_del.get(label, [])
+        tag_lines.append(f"  DELIGHTER: {label} — evidence: {'; '.join(ev[:2]) if ev else '(none)'}")
+
+    user_msg = f"Review ({rating}★): \"{str(review_text or '')[:500]}\"\n\nTags assigned:\n" + "\n".join(tag_lines)
+
+    try:
+        raw = chat_complete_fn(
+            client,
+            model=(model_fn or (lambda: "gpt-4o"))(),
+            structured=True,
+            messages=[
+                {"role": "system", "content": _VERIFY_SYSTEM},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=300,
+        )
+        data = _jload(raw)
+        verdicts = {
+            str(tag.get("label", "")).strip(): str(tag.get("verdict", "KEEP")).upper()
+            for tag in (data.get("tags") or [])
+            if isinstance(tag, dict)
+        }
+        new_dets = [label for label in dets if verdicts.get(label, "KEEP") != "DROP"]
+        new_dels = [label for label in dels if verdicts.get(label, "KEEP") != "DROP"]
+        dropped = [label for label in dets + dels if verdicts.get(label) == "DROP"]
+        if dropped:
+            logger.info("Verification dropped %d tags: %s", len(dropped), ", ".join(dropped))
+        return dict(
+            dets=new_dets,
+            dels=new_dels,
+            ev_det={key: value for key, value in ev_det.items() if key in new_dets},
+            ev_del={key: value for key, value in ev_del.items() if key in new_dels},
+            unl_dets=list(result.get("unl_dets") or []),
+            unl_dels=list(result.get("unl_dels") or []),
+            safety=result.get("safety", "Not Mentioned"),
+            reliability=result.get("reliability", "Not Mentioned"),
+            sessions=result.get("sessions", "Unknown"),
+        )
+    except Exception as exc:
+        logger.warning("Verification failed: %s", exc)
+        return result
+
+
+def tag_review_batch_v4(
+    *,
+    client: Any,
+    items: Sequence[Mapping[str, Any]],
+    allowed_delighters: Sequence[str],
+    allowed_detractors: Sequence[str],
+    long_review_threshold: int = 600,
+    **kwargs: Any,
+) -> Dict[int, Dict[str, Any]]:
+    """v4 entry point: hybrid routing with verification.
+
+    Short reviews go through the proven single-pass engine. Long reviews route
+    through the staged claim-extraction pipeline and are then cross-validated
+    against the single-pass output. Flagged outputs get a lightweight audit.
+    """
+
+    if not items:
+        return {}
+
+    aliases = {
+        str(key).strip(): [str(v).strip() for v in (vals or []) if str(v).strip()]
+        for key, vals in dict(kwargs.get("aliases") or {}).items()
+        if str(key).strip()
+    }
+
+    deduped_detractors, aliases = deduplicate_taxonomy_labels(list(allowed_detractors or []), aliases)
+    deduped_delighters, aliases = deduplicate_taxonomy_labels(list(allowed_delighters or []), aliases)
+
+    det_counts = dict(kwargs.get("historical_detractor_counts") or {})
+    del_counts = dict(kwargs.get("historical_delighter_counts") or {})
+    primary_detractors, extended_detractors = prune_taxonomy(deduped_detractors, det_counts, max_labels=25)
+    primary_delighters, extended_delighters = prune_taxonomy(deduped_delighters, del_counts, max_labels=25)
+
+    active_detractors = primary_detractors or deduped_detractors
+    active_delighters = primary_delighters or deduped_delighters
+
+    logger.info(
+        "v4 routing active — %d detractor labels (%d extended), %d delighter labels (%d extended)",
+        len(active_detractors),
+        len(extended_detractors),
+        len(active_delighters),
+        len(extended_delighters),
+    )
+
+    short_items = [item for item in items if len(str(item.get("review", ""))) < long_review_threshold]
+    long_items = [item for item in items if len(str(item.get("review", ""))) >= long_review_threshold]
+    results: Dict[int, Dict[str, Any]] = {}
+
+    batch_kwargs = dict(kwargs)
+    batch_kwargs["aliases"] = aliases
+    batch_kwargs.pop("historical_detractor_counts", None)
+    batch_kwargs.pop("historical_delighter_counts", None)
+
+    if short_items:
+        short_results = tag_review_batch(
+            client=client,
+            items=short_items,
+            allowed_delighters=active_delighters,
+            allowed_detractors=active_detractors,
+            **batch_kwargs,
+        )
+        for item in short_items:
+            idx = int(item["idx"])
+            result = short_results.get(idx, {})
+            if needs_verification(result, str(item.get("review", "")), item.get("rating")):
+                result = verify_tags(
+                    client=client,
+                    review_text=str(item.get("review", "")),
+                    rating=item.get("rating"),
+                    result=result,
+                    chat_complete_fn=batch_kwargs.get("chat_complete_fn"),
+                    safe_json_load_fn=batch_kwargs.get("safe_json_load_fn"),
+                    model_fn=batch_kwargs.get("model_fn"),
+                )
+            results[idx] = result
+
+    for item in long_items:
+        idx = int(item["idx"])
+        review_text = str(item.get("review", ""))
+        rating = item.get("rating")
+
+        claims = extract_claims(
+            client=client,
+            review_text=review_text,
+            rating=rating,
+            chat_fn=batch_kwargs.get("chat_complete_fn"),
+            json_fn=batch_kwargs.get("safe_json_load_fn"),
+            model_fn=batch_kwargs.get("model_fn"),
+            reasoning_fn=batch_kwargs.get("reasoning_fn"),
+        )
+
+        single_result = tag_review_batch(
+            client=client,
+            items=[item],
+            allowed_delighters=active_delighters,
+            allowed_detractors=active_detractors,
+            **batch_kwargs,
+        ).get(idx, {})
+
+        if claims:
+            staged_dets, staged_dels, staged_ev_det, staged_ev_del = map_claims_to_taxonomy(
+                claims,
+                active_detractors + list(extended_detractors),
+                active_delighters + list(extended_delighters),
+                aliases=aliases,
+            )
+            merged_dets, merged_ev_det = _merge_pipeline_results(
+                staged_dets,
+                staged_ev_det,
+                list(single_result.get("dets") or []),
+                dict(single_result.get("ev_det") or {}),
+            )
+            merged_dels, merged_ev_del = _merge_pipeline_results(
+                staged_dels,
+                staged_ev_del,
+                list(single_result.get("dels") or []),
+                dict(single_result.get("ev_del") or {}),
+            )
+            merged = dict(
+                dets=merged_dets,
+                dels=merged_dels,
+                ev_det=merged_ev_det,
+                ev_del=merged_ev_del,
+                unl_dets=list(single_result.get("unl_dets") or []),
+                unl_dels=list(single_result.get("unl_dels") or []),
+                safety=single_result.get("safety", "Not Mentioned"),
+                reliability=single_result.get("reliability", "Not Mentioned"),
+                sessions=single_result.get("sessions", "Unknown"),
+            )
+        else:
+            merged = single_result
+
+        if needs_verification(merged, review_text, rating):
+            merged = verify_tags(
+                client=client,
+                review_text=review_text,
+                rating=rating,
+                result=merged,
+                chat_complete_fn=batch_kwargs.get("chat_complete_fn"),
+                safe_json_load_fn=batch_kwargs.get("safe_json_load_fn"),
+                model_fn=batch_kwargs.get("model_fn"),
+            )
+
+        results[idx] = merged
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -999,6 +1595,82 @@ def _cross_side_coherence(
                 break
 
     return dets, dels, ev_det, ev_del
+
+
+def _audit_tag_polarity(
+    label: str,
+    evidence: List[str],
+    side: str,
+    review_text: str,
+) -> str:
+    """Audit a single tag's polarity against its evidence in context.
+
+    Returns ``correct``, ``inverted``, or ``ambiguous``.
+    """
+
+    if not evidence or not review_text:
+        return "correct"
+
+    rv_lower = str(review_text or "").lower()
+    if side == "detractor" and _WORRY_THEN_POSITIVE.search(rv_lower):
+        return "inverted"
+
+    for ev in evidence:
+        ev_lower = str(ev or "").lower().strip()
+        if not ev_lower:
+            continue
+        idx = rv_lower.find(ev_lower)
+        if idx < 0:
+            continue
+
+        ctx_start = max(0, idx - 100)
+        ctx_end = min(len(rv_lower), idx + len(ev_lower) + 100)
+        context = rv_lower[ctx_start:ctx_end]
+
+        if _HAS_NEG_DETECTOR:
+            try:
+                if _NegDetector.is_negated(ev_lower, context):
+                    return "inverted"
+                label_terms = [term for term in re.findall(r"[a-z]+", str(label or "").lower()) if len(term) > 3 and term not in _STOP_TOKENS]
+                for term in label_terms[:3]:
+                    if _NegDetector.is_negated(term, context):
+                        return "inverted"
+            except Exception:
+                pass
+        else:
+            preceding = rv_lower[max(0, idx - 50):idx]
+            if _NEG_CONTEXT.search(preceding):
+                return "inverted"
+            label_terms = [term for term in re.findall(r"[a-z]+", str(label or "").lower()) if len(term) > 3 and term not in _STOP_TOKENS]
+            for term in label_terms[:3]:
+                term_idx = context.find(term)
+                if term_idx > 0 and _NEG_CONTEXT.search(context[max(0, term_idx - 20):term_idx]):
+                    return "inverted"
+
+        but_pattern = re.compile(r"\b(but|however|although|except|yet|though)\b", re.I)
+        but_match = but_pattern.search(context)
+        if but_match:
+            ev_pos = context.find(ev_lower)
+            but_pos = but_match.start()
+            if ev_pos > but_pos and side == "delighter":
+                return "ambiguous"
+            if ev_pos < but_pos and side == "detractor":
+                following = context[but_pos:]
+                if re.search(r"\b(fine|okay|ok|manageable|not\s+(?:a\s+)?big\s+deal|still\s+(?:love|like|recommend))\b", following, re.I):
+                    return "ambiguous"
+
+        if side == "detractor" and re.search(r"\b(old|older|previous|last|other)\b", context) and re.search(r"\b(this one|this product|new one|current one)\b", context):
+            label_terms = [term for term in re.findall(r"[a-z]+", str(label or "").lower()) if len(term) > 3 and term not in _STOP_TOKENS]
+            if any(term in context for term in label_terms[:3]):
+                return "inverted"
+    return "correct"
+
+
+_WORRY_THEN_POSITIVE = re.compile(
+    r"\b(worried|afraid|scared|concerned|nervous|thought|feared|expected)\b"
+    r".*?\b(but|however|actually|turns?\s+out|surprisingly|thankfully|fortunately|glad)\b",
+    re.I | re.DOTALL,
+)
 
 
 def _enforce_universal_discipline(labels, ev_map):
@@ -1104,6 +1776,16 @@ def _extract_side_with_confidence(
             continue
         labels.append(lbl)
         ev_map[lbl] = validated[:3]
+        polarity_verdict = _audit_tag_polarity(lbl, validated, side, review_text)
+        if polarity_verdict == "inverted":
+            logger.info("Polarity audit: '%s' evidence is inverted for %s side — skipping", lbl, side)
+            if labels:
+                labels.pop()
+            ev_map.pop(lbl, None)
+            coherence_flags.pop(lbl, None)
+            continue
+        if polarity_verdict == "ambiguous":
+            coherence_flags[lbl] = False
         if len(labels) >= 10: break
 
     # Aspect-level dedup: "Loud Noise" + "Noisy Motor" = same concept — keep best evidence
@@ -1114,16 +1796,21 @@ def _extract_side_with_confidence(
     labels = _check_contradictions_with_evidence(labels, ev_map)
     # Filter by confidence threshold — scales with catalog size
     if len(labels) >= 2:
-        # Dynamic threshold: large catalogs dilute scores, small catalogs inflate them
         cat_size = len(allowed)
+        review_words = len(str(review_text or "").split())
         if cat_size >= 50:
-            conf_threshold = 0.18  # Large catalog — be permissive
+            conf_threshold = 0.18
         elif cat_size >= 30:
             conf_threshold = 0.22
         elif cat_size >= 15:
             conf_threshold = 0.25
         else:
-            conf_threshold = 0.30  # Small catalog — be stricter
+            conf_threshold = 0.30
+
+        if review_words < 30:
+            conf_threshold *= 0.75
+        elif review_words > 200:
+            conf_threshold *= 1.10
 
         scored = []
         for lbl in labels:
