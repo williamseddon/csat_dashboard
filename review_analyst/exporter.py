@@ -7,6 +7,21 @@ import pandas as pd
 from .analytics import compute_metrics, monthly_trend, rating_distribution
 
 
+def _summary_attr(summary, attr, default=""):
+    if summary is None:
+        return default
+    if hasattr(summary, attr):
+        value = getattr(summary, attr, default)
+        return default if value is None else value
+    if isinstance(summary, dict):
+        value = summary.get(attr, default)
+        return default if value is None else value
+    if attr == "product_id":
+        value = str(summary).strip()
+        return value or default
+    return default
+
+
 def build_master_excel(summary, reviews_df: pd.DataFrame) -> bytes:
     metrics = compute_metrics(reviews_df)
     rating_df = rating_distribution(reviews_df)
@@ -14,9 +29,9 @@ def build_master_excel(summary, reviews_df: pd.DataFrame) -> bytes:
     summary_df = pd.DataFrame(
         [
             {
-                'product_id': summary.product_id,
-                'product_url': summary.product_url,
-                'reviews_downloaded': summary.reviews_downloaded,
+                'product_id': _summary_attr(summary, 'product_id', 'reviews'),
+                'product_url': _summary_attr(summary, 'product_url'),
+                'reviews_downloaded': _summary_attr(summary, 'reviews_downloaded'),
                 'avg_rating': metrics.get('avg_rating'),
                 'avg_rating_non_incentivized': metrics.get('avg_rating_non_incentivized'),
                 'pct_low_star': metrics.get('pct_low_star'),

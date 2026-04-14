@@ -23,6 +23,21 @@ GENERAL_INSTRUCTIONS = (
 )
 
 
+def _summary_attr(summary, attr, default=""):
+    if summary is None:
+        return default
+    if hasattr(summary, attr):
+        value = getattr(summary, attr, default)
+        return default if value is None else value
+    if isinstance(summary, dict):
+        value = summary.get(attr, default)
+        return default if value is None else value
+    if attr == "product_id":
+        value = str(summary).strip()
+        return value or default
+    return default
+
+
 def get_api_key() -> Optional[str]:
     return os.getenv('OPENAI_API_KEY')
 
@@ -136,7 +151,7 @@ def build_ai_context(filtered_df, summary, filter_description: str, question: st
             }
         )
     payload = {
-        'product': {'product_id': summary.product_id, 'product_url': summary.product_url},
+        'product': {'product_id': _summary_attr(summary, 'product_id', 'reviews'), 'product_url': _summary_attr(summary, 'product_url')},
         'scope': {'filter_description': filter_description, 'review_count': len(filtered_df)},
         'metrics': metrics,
         'rating_distribution': rating_dist,

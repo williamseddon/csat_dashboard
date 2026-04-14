@@ -33,6 +33,20 @@ def _safe_text(value, default=""):
     s = str(value).strip()
     return s if s else default
 
+def _summary_attr(summary, attr, default=""):
+    if summary is None:
+        return default
+    if hasattr(summary, attr):
+        value = getattr(summary, attr, default)
+        return default if value is None else value
+    if isinstance(summary, dict):
+        value = summary.get(attr, default)
+        return default if value is None else value
+    if attr == "product_id":
+        value = str(summary).strip()
+        return value or default
+    return default
+
 def _normalize_tag_list(tags):
     if not tags: return []
     seen = set()
@@ -109,9 +123,9 @@ def _build_master_excel(summary, reviews_df, *, prompt_defs=None, prompt_summary
         md = pd.DataFrame()
     summary_df = pd.DataFrame([dict(
         product_name=_product_name(summary, reviews_df),
-        product_id=summary.product_id,
-        product_url=summary.product_url,
-        reviews_downloaded=summary.reviews_downloaded,
+        product_id=_summary_attr(summary, "product_id", "reviews"),
+        product_url=_summary_attr(summary, "product_url"),
+        reviews_downloaded=_summary_attr(summary, "reviews_downloaded"),
         export_review_count=len(reviews_df),
         total_loaded_reviews=total_loaded_reviews if total_loaded_reviews is not None else len(reviews_df),
         export_scope=export_scope_label,
@@ -150,7 +164,7 @@ def _get_master_bundle(summary, reviews_df, prompt_artifacts, *, active_items=No
     psd = (prompt_artifacts or {}).get("summary_df")
     ps = (prompt_artifacts or {}).get("scope_label", "")
     key = json.dumps(dict(
-        pid=summary.product_id,
+        pid=_summary_attr(summary, "product_id", "reviews"),
         n=len(reviews_df),
         cols=sorted(str(c) for c in reviews_df.columns),
         psig=(prompt_artifacts or {}).get("definition_signature"),
@@ -175,7 +189,7 @@ def _get_master_bundle(summary, reviews_df, prompt_artifacts, *, active_items=No
     )
     ts = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
     scope_slug = "filtered_view" if active_items else "review_workspace"
-    b = dict(key=key, excel_bytes=xlsx, excel_name=f"{summary.product_id}_{scope_slug}_{ts}.xlsx")
+    b = dict(key=key, excel_bytes=xlsx, excel_name=f"{_summary_attr(summary, "product_id", "reviews")}_{scope_slug}_{ts}.xlsx")
     st.session_state["master_export_bundle"] = b
     return b
 

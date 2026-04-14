@@ -28,6 +28,20 @@ def _safe_int(value, default=0):
     try: return int(float(value))
     except: return default
 
+def _summary_attr(summary, attr, default=""):
+    if summary is None:
+        return default
+    if hasattr(summary, attr):
+        value = getattr(summary, attr, default)
+        return default if value is None else value
+    if isinstance(summary, dict):
+        value = summary.get(attr, default)
+        return default if value is None else value
+    if attr == "product_id":
+        value = str(summary).strip()
+        return value or default
+    return default
+
 def _trunc(text, max_len=120):
     s = _safe_text(text)
     return s[:max_len] + "…" if len(s) > max_len else s
@@ -106,7 +120,7 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
     hi = filtered_df[filtered_df["rating"].isin([4, 5])].head(8)
     ev = pd.concat([rel, rec, low, hi], ignore_index=True).drop_duplicates(subset=["review_id"]).head(32)
     payload = dict(
-        product=dict(product_id=summary.product_id, product_url=summary.product_url, product_name=_product_name(summary, overall_df)),
+        product=dict(product_id=_summary_attr(summary, "product_id"), product_url=_summary_attr(summary, "product_url"), product_name=_product_name(summary, overall_df)),
         analysis_scope=dict(filter_description=filter_description, overall_review_count=len(overall_df), filtered_review_count=len(filtered_df)),
         metric_snapshot=dict(overall=om, filtered=fm, rating_distribution_filtered=rd, monthly_trend_filtered=md),
         review_text_evidence=_snippet_rows(ev, max_reviews=32),
@@ -178,7 +192,7 @@ def _product_name(summary, df):
         prods = [x for x in dict.fromkeys(df["product_or_sku"].fillna("").astype(str).str.strip().tolist()) if x]
         if len(prods) > 1 and str(getattr(summary, "product_id", "")).startswith("MULTI_URL_WORKSPACE"):
             return f"Combined review workspace ({len(prods)} products)"
-    return summary.product_id
+    return _summary_attr(summary, "product_id", "REVIEWS")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  AI ANALYST
