@@ -4270,26 +4270,17 @@ def _render_active_filter_summary(filter_state: Dict[str, Any], overall_df: pd.D
 
 def _render_workspace_nav() -> str:
     current = st.session_state.get("workspace_active_tab", TAB_DASHBOARD)
-    # Render pill-style navigation
     nav_items = WORKSPACE_TABS
-    pill_html = "<div style='display:flex;gap:6px;flex-wrap:wrap;padding:6px 0 10px;'>"
-    for label in nav_items:
-        is_active = (current == label)
-        bg = "#6366f1" if is_active else "transparent"
-        fg = "#fff" if is_active else "var(--color-text-secondary)"
-        border = "1.5px solid #6366f1" if is_active else "1px solid var(--color-border-secondary)"
-        pill_html += f"<span style='padding:6px 14px;border-radius:20px;background:{bg};color:{fg};border:{border};font-size:13px;font-weight:{"600" if is_active else "400"};cursor:pointer;white-space:nowrap;'>{_esc(label)}</span>"
-    pill_html += "</div>"
-    st.markdown(pill_html, unsafe_allow_html=True)
-    # Streamlit can't handle onclick in raw HTML, so use button columns as the actual interaction layer
     cols = st.columns(len(nav_items))
     for i, (col, label) in enumerate(zip(cols, nav_items)):
         kwargs = {"use_container_width": True, "key": f"wnav_{i}_{_slugify(label, fallback='tab')}"}
         if current == label:
             kwargs["type"] = "primary"
-        if col.button(label.split("  ")[-1] if "  " in label else label, **kwargs):
+        display_label = label.split("  ", 1)[1].strip() if "  " in label else re.sub(r"^[^\w]+", "", str(label)).strip()
+        if col.button(display_label or str(label).strip(), **kwargs):
             current = label
             st.session_state["workspace_active_tab"] = label
+    st.markdown("<div style='height:.25rem'></div>", unsafe_allow_html=True)
     return current
 
 
@@ -8156,23 +8147,40 @@ def _render_dashboard(filtered_df, overall_df=None):
             recent_30 = filtered_df[pd.to_datetime(filtered_df.get("submission_time"), errors="coerce", utc=True) >= (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=30))]
             recent_avg = pd.to_numeric(recent_30.get("rating"), errors="coerce").mean() if len(recent_30) >= 3 else None
             low_pct = (pd.to_numeric(filtered_df.get("rating"), errors="coerce") <= 2).mean()
-            insights = []
+            summary_pills = []
             if pd.notna(avg_rating):
-                insights.append(f"**{avg_rating:.2f}★** avg across {n_reviews:,} reviews")
-            if pd.notna(organic_avg) and organic_mask.sum() >= 3:
-                delta = organic_avg - (avg_rating or 0)
+                summary_pills.append(
+                    f"<span class='dashboard-pill'><span class='meta'>Average rating</span><strong>{avg_rating:.2f}★</strong></span>"
+                )
+                summary_pills.append(
+                    f"<span class='dashboard-pill'><span class='meta'>Reviews</span><strong>{n_reviews:,}</strong></span>"
+                )
+            if pd.notna(organic_avg) and organic_mask.sum() >= 3 and pd.notna(avg_rating):
+                delta = organic_avg - avg_rating
                 if abs(delta) >= 0.1:
-                    direction = "higher" if delta > 0 else "lower"
-                    insights.append(f"Organic reviews avg **{organic_avg:.2f}★** ({direction} than overall)")
+                    direction = "Higher" if delta > 0 else "Lower"
+                    summary_pills.append(
+                        f"<span class='dashboard-pill'><span class='meta'>Organic</span><strong>{organic_avg:.2f}★</strong><span class='meta'>{direction} than overall</span></span>"
+                    )
             if recent_avg is not None and pd.notna(recent_avg) and pd.notna(avg_rating):
                 delta = recent_avg - avg_rating
                 if abs(delta) >= 0.15:
-                    trend = "📈 trending up" if delta > 0 else "📉 trending down"
-                    insights.append(f"Last 30 days: **{recent_avg:.2f}★** ({trend})")
+                    trend_cls = "trend-up" if delta > 0 else "trend-down"
+                    trend_label = "Trending up" if delta > 0 else "Trending down"
+                    summary_pills.append(
+                        f"<span class='dashboard-pill {trend_cls}'><span class='meta'>Last 30 days</span><strong>{recent_avg:.2f}★</strong><span class='meta'>{trend_label}</span></span>"
+                    )
             if low_pct >= 0.15:
-                insights.append(f"⚠️ **{low_pct:.0%}** of reviews are 1-2★")
-            if insights:
-                st.markdown("<div class='hero-card' style='padding:12px 16px;'>" + " · ".join(insights) + "</div>", unsafe_allow_html=True)
+                summary_pills.append(
+                    f"<span class='dashboard-pill warn'><span class='meta'>Low-star share</span><strong>{low_pct:.0%}</strong></span>"
+                )
+            if summary_pills:
+                st.markdown(
+                    "<div class='dashboard-brief'><div class='dashboard-brief-title'>At a glance</div><div class='dashboard-brief-row'>"
+                    + "".join(summary_pills)
+                    + "</div></div>",
+                    unsafe_allow_html=True,
+                )
     except Exception:
         pass
     # ── Symptomizer insights (if available) ───────────────────────────
@@ -8227,10 +8235,7 @@ def _render_dashboard(filtered_df, overall_df=None):
             st.rerun()
         st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
 
-    scope = st.radio("Scope", ["All matching reviews", "Organic only"], horizontal=True, key="dashboard_scope")
     chart_df = filtered_df.copy()
-    if scope == "Organic only":
-        chart_df = chart_df[~chart_df["incentivized_review"].fillna(False)].reset_index(drop=True)
     if chart_df.empty:
         st.info("No reviews match the current scope.")
         return
@@ -8983,34 +8988,54 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
     detractors = list(st.session_state.get("sym_detractors") or [])
     colmap = _detect_sym_cols(overall_df)
     work = _detect_missing(overall_df, colmap)
-    need_both = int(work["Needs_Symptomization"].sum())
-    need_del = int(work["Needs_Delighters"].sum())
-    need_det = int(work["Needs_Detractors"].sum())
-    st.markdown(f"""<div class="hero-grid" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:0;margin-bottom:.8rem;">
-      <div class="hero-stat"><div class="label">Total reviews</div><div class="value">{len(overall_df):,}</div></div>
-      <div class="hero-stat"><div class="label">Need delighters</div><div class="value">{need_del:,}</div></div>
-      <div class="hero-stat"><div class="label">Need detractors</div><div class="value">{need_det:,}</div></div>
-      <div class="hero-stat accent"><div class="label">Missing both</div><div class="value">{need_both:,}</div></div>
-    </div>""", unsafe_allow_html=True)
-    scope_choice = st.selectbox("Scope", ["Missing both", "Any missing", "Current filtered reviews", "All loaded reviews"], key="sym_scope_choice")
-    if scope_choice == "Missing both":
-        target_df = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])]
-    elif scope_choice == "Any missing":
-        target_df = work[(work["Needs_Delighters"]) | (work["Needs_Detractors"])]
-    elif scope_choice == "Current filtered reviews":
-        fids = set(filtered_df["review_id"].astype(str))
-        target_df = work[work["review_id"].astype(str).isin(fids)]
-    else:
-        target_df = work
-    rc = st.columns([1.5, 1, 1, 1, 1])
-    n_to_process = rc[0].number_input("Reviews to process", min_value=1, max_value=max(1, len(target_df)), step=1, key="sym_n_to_process")
-    batch_size = int(rc[1].number_input("Batch size", min_value=1, max_value=20, value=int(st.session_state.get("sym_batch_size", 8)), step=1, key="sym_batch_size_run"))
-    est_batches = max(1, math.ceil(int(n_to_process) / batch_size)) if n_to_process else 0
-    rc[2].metric("In scope", f"{len(target_df):,}")
-    rc[3].metric("Est. batches", f"{est_batches:,}")
-    rc[4].caption(f"Scope: {scope_choice}\nModel: {_shared_model()}")
+    st.markdown(
+        f"""<div class="hero-grid" style="grid-template-columns:minmax(220px,280px);margin-top:0;margin-bottom:.7rem;">
+      <div class="hero-stat accent"><div class="label">Total reviews</div><div class="value">{len(overall_df):,}</div></div>
+    </div>""",
+        unsafe_allow_html=True,
+    )
     active_taxonomy_count = len(delighters) + len(detractors)
-    run_disabled = (not api_key) or (len(target_df) == 0) or (active_taxonomy_count == 0)
+    with st.container(border=True):
+        st.markdown(
+            "<div class='builder-kicker'>Run setup</div><div class='builder-title'>Choose what to tag</div><div class='builder-sub'>Pick the review set, how many reviews to process, and batch size. Counts update automatically as you change the controls.</div>",
+            unsafe_allow_html=True,
+        )
+        cfg = st.columns([1.45, 1.0, 0.95, 0.85, 0.95])
+        scope_choice = cfg[0].selectbox("Review set", ["Missing both", "Any missing", "Current filtered reviews", "All loaded reviews"], key="sym_scope_choice")
+        if scope_choice == "Missing both":
+            target_df = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])]
+        elif scope_choice == "Any missing":
+            target_df = work[(work["Needs_Delighters"]) | (work["Needs_Detractors"])]
+        elif scope_choice == "Current filtered reviews":
+            fids = set(filtered_df["review_id"].astype(str))
+            target_df = work[work["review_id"].astype(str).isin(fids)]
+        else:
+            target_df = work
+        max_reviews_in_scope = max(1, len(target_df))
+        default_n = int(st.session_state.get("sym_n_to_process", min(100, max_reviews_in_scope)))
+        default_n = min(max(1, default_n), max_reviews_in_scope)
+        st.session_state["sym_n_to_process"] = default_n
+        n_to_process = cfg[1].number_input("Reviews to process", min_value=1, max_value=max_reviews_in_scope, value=default_n, step=1, key="sym_n_to_process")
+        batch_size_default = int(st.session_state.get("sym_batch_size_run", st.session_state.get("sym_batch_size", 8)) or 8)
+        batch_size_default = min(20, max(1, batch_size_default))
+        batch_size = int(cfg[2].number_input("Batch size", min_value=1, max_value=20, value=batch_size_default, step=1, key="sym_batch_size_run"))
+        est_batches = max(1, math.ceil(int(n_to_process) / batch_size)) if n_to_process else 0
+        cfg[3].metric("In scope", f"{len(target_df):,}")
+        cfg[4].metric("Batches", f"{est_batches:,}")
+        st.caption(f"Model: {_shared_model()} · Review set: {scope_choice}")
+        run_disabled = (not api_key) or (len(target_df) == 0) or (active_taxonomy_count == 0)
+        if run_disabled and not api_key:
+            st.warning("Add OPENAI_API_KEY to Streamlit secrets.")
+        elif len(target_df) == 0:
+            st.info("No reviews match the selected review set.")
+        elif active_taxonomy_count == 0:
+            st.info("Add at least one active symptom or re-enable Universal Neutral Symptoms before running the Symptomizer.")
+        run_btn = st.button(f"▶️ Symptomize {min(int(n_to_process), len(target_df)):,} review(s)", type="primary", use_container_width=True, disabled=run_disabled, key="sym_run_btn")
+        if not run_disabled and int(n_to_process) > 0:
+            _est_batches = max(1, math.ceil(int(n_to_process) / max(batch_size, 1)))
+            _est_secs = _est_batches * 2.5 / min(3, _est_batches)
+            _est_label = f"~{_est_secs:.0f}s" if _est_secs < 60 else f"~{_est_secs / 60:.1f}min"
+            st.markdown(f"<div class='time-estimate'>⏱ Estimated tagging time: {_est_label} for {int(n_to_process)} reviews ({_est_batches} batches × {batch_size}/batch)</div>", unsafe_allow_html=True)
     # ── Taxonomy overlap check ────────────────────────────────────────────
     if active_taxonomy_count >= 6 and (detractors and delighters):
         overlap_warnings = []
@@ -9027,22 +9052,10 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                 st.caption("These detractor/delighter pairs share significant keyword overlap and may cause the AI to confuse them:")
                 for w in overlap_warnings[:8]:
                     st.markdown(f"- {w}")
-    if run_disabled and not api_key:
-        st.warning("Add OPENAI_API_KEY to Streamlit secrets.")
-    elif len(target_df) == 0:
-        st.info("No reviews match the current scope.")
-    elif active_taxonomy_count == 0:
-        st.info("Add at least one active symptom or re-enable Universal Neutral Symptoms before running the symptomizer.")
     # Pre-resolve variables needed by both calibration and run
     profile = st.session_state.get("sym_product_profile", "")
     product_knowledge = _normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {})
     client = _get_client()
-    run_btn = st.button(f"▶️ Symptomize {min(int(n_to_process), len(target_df)):,} review(s)", type="primary", use_container_width=True, disabled=run_disabled, key="sym_run_btn")
-    if not run_disabled and int(n_to_process) > 0:
-        _est_batches = max(1, math.ceil(int(n_to_process) / max(batch_size, 1)))
-        _est_secs = _est_batches * 2.5 / min(3, _est_batches)  # ~2.5s/batch with parallelism
-        _est_label = f"~{_est_secs:.0f}s" if _est_secs < 60 else f"~{_est_secs/60:.1f}min"
-        st.markdown(f"<div class='time-estimate'>⏱ Estimated: {_est_label} for {int(n_to_process)} reviews ({_est_batches} batches × {batch_size}/batch)</div>", unsafe_allow_html=True)
     if _HAS_SYMPTOMIZER_V3 and api_key and active_taxonomy_count > 0 and len(target_df) > 0:
         cc1, cc2 = st.columns([1, 3])
         if cc1.button("🧪 Validate taxonomy", use_container_width=True, key="sym_calibrate_btn", help="8-review calibration to check taxonomy fit."):
@@ -9068,7 +9081,7 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
     if run_btn:
         prioritized = _prioritize_for_symptomization(target_df).head(int(n_to_process))
         rows_to_process = prioritized.copy()
-        prog = st.progress(0.0, text="Starting…")
+        prog = st.progress(0.0, text="Preparing reviews…")
         status = st.empty()
         eta_box = st.empty()
         stats_box = st.empty()
@@ -9089,28 +9102,23 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
         _active_dels = list(delighters or [])
         _include_universal = bool(st.session_state.get("sym_include_universal_neutral", True))
         _ev_chars = int(st.session_state.get("sym_max_ev_chars", 120))
-        # Initialize adaptive label tracker for mid-run alerts
         _label_tracker = _v3_LabelTracker(_active_dets, _active_dels) if _HAS_SYMPTOMIZER_V3 else None
-        # Speed optimization: adaptive batch sizing based on review length
         if _HAS_SYMPTOMIZER_V3:
             avg_words = rows_to_process.get("review_length_words", pd.Series(50)).fillna(50).mean()
             if avg_words < 60 and batch_size < 12:
-                batch_size = min(12, batch_size + 4)  # Very short reviews pack tight
+                batch_size = min(12, batch_size + 4)
             elif avg_words < 100 and batch_size < 10:
                 batch_size = min(10, batch_size + 2)
             bidxs = list(range(0, len(rows_list), batch_size))
             if avg_words < 100:
-                status.info(f"Avg {avg_words:.0f} words/review — batch size {batch_size}")
+                status.info(f"Avg {avg_words:.0f} words/review — using batch size {batch_size}.")
 
-        # Speed optimization: pre-compute category from taxonomy generation (skip API call)
         _pre_category = st.session_state.get("sym_taxonomy_category", "")
         if _pre_category and _pre_category != "general":
-            # Inject pre-computed category so tag_review_batch skips _infer_taxonomy_category
             st.session_state["_sym_cached_category"] = _pre_category
 
-        # Parallel batch execution: run 2-3 batches concurrently
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        _MAX_WORKERS = min(3, max(1, len(bidxs)))  # Up to 3 concurrent API calls
+        _MAX_WORKERS = min(3, max(1, len(bidxs)))
 
         def _process_one_batch(bi_start_pair):
             bi, start = bi_start_pair
@@ -9134,40 +9142,63 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
             _failed = 0
             if client:
                 try:
-                    outs = _call_symptomizer_batch(client=client, items=items, allowed_delighters=_active_dels, allowed_detractors=_active_dets, product_profile=_adaptive_profile, product_knowledge=product_knowledge, max_ev_chars=_ev_chars, aliases=aliases, include_universal_neutral=_include_universal)
+                    outs = _call_symptomizer_batch(
+                        client=client,
+                        items=items,
+                        allowed_delighters=_active_dels,
+                        allowed_detractors=_active_dets,
+                        product_profile=_adaptive_profile,
+                        product_knowledge=product_knowledge,
+                        max_ev_chars=_ev_chars,
+                        aliases=aliases,
+                        include_universal_neutral=_include_universal,
+                    )
                 except Exception as exc:
                     _log.warning("Batch %d failed (%s) — retrying individually", bi, exc)
                     _failed = len(items)
                     for it in items:
                         try:
-                            single = _call_symptomizer_batch(client=client, items=[it], allowed_delighters=_active_dels, allowed_detractors=_active_dets, product_profile=_adaptive_profile, product_knowledge=product_knowledge, max_ev_chars=_ev_chars, aliases=aliases, include_universal_neutral=_include_universal)
+                            single = _call_symptomizer_batch(
+                                client=client,
+                                items=[it],
+                                allowed_delighters=_active_dels,
+                                allowed_detractors=_active_dets,
+                                product_profile=_adaptive_profile,
+                                product_knowledge=product_knowledge,
+                                max_ev_chars=_ev_chars,
+                                aliases=aliases,
+                                include_universal_neutral=_include_universal,
+                            )
                             outs.update(single)
                             _failed -= 1
                         except Exception:
                             pass
             return bi, items, outs, _failed
 
-        # Submit all batches to the thread pool
         batch_inputs = list(enumerate(bidxs, 1))
-        all_batch_results = []  # Collect (bi, items, outs, failed) from all batches
+        all_batch_results = []
+        total_batches = max(1, len(batch_inputs))
+        checkpoint_every = 2 if total_batches > 2 else 1
 
         if _MAX_WORKERS > 1 and len(bidxs) > 1:
-            status.info(f"Processing {len(bidxs)} batches ({_MAX_WORKERS} concurrent)…")
+            status.info(f"Tagging {total_n:,} reviews across {len(bidxs)} batches ({_MAX_WORKERS} concurrent)…")
             with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
                 futures = {executor.submit(_process_one_batch, bp): bp for bp in batch_inputs}
                 for future in as_completed(futures):
                     result = future.result()
                     all_batch_results.append(result)
                     done_batches = len(all_batch_results)
-                    prog.progress(done_batches / len(bidxs), text=f"Batch {done_batches}/{len(bidxs)}")
+                    prep_progress = 0.65 * (done_batches / max(len(bidxs), 1))
+                    prog.progress(prep_progress, text=f"Batch {done_batches}/{len(bidxs)} complete")
         else:
-            # Sequential fallback (single batch or worker=1)
+            status.info(f"Tagging {total_n:,} reviews across {len(bidxs)} batch{'es' if len(bidxs) != 1 else ''}…")
             for bp in batch_inputs:
                 result = _process_one_batch(bp)
                 all_batch_results.append(result)
-                prog.progress(len(all_batch_results) / len(bidxs), text=f"Batch {len(all_batch_results)}/{len(bidxs)}")
+                done_batches = len(all_batch_results)
+                prep_progress = 0.65 * (done_batches / max(len(bidxs), 1))
+                prog.progress(prep_progress, text=f"Batch {done_batches}/{len(bidxs)} complete")
 
-        # Process all results
         for bi, items, outs, batch_failed in sorted(all_batch_results, key=lambda x: x[0]):
             failed_count += batch_failed
             for it in items:
@@ -9192,63 +9223,133 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                     _record_new_symptom_candidate(lab, idx=idx, side="delighter")
                 for lab in (out.get("unl_dets", []) or []):
                     _record_new_symptom_candidate(lab, idx=idx, side="detractor")
-                processed_local.append(dict(idx=idx, review_id=str(actual_row.get("review_id", "")), wrote_dets=final_dets, wrote_dels=final_dels, safety=out.get("safety", ""), reliability=out.get("reliability", ""), sessions=out.get("sessions", ""), ev_det=out.get("ev_det", {}), ev_del=out.get("ev_del", {}), unl_dels=out.get("unl_dels", []), unl_dets=out.get("unl_dets", [])))
+                processed_local.append(
+                    dict(
+                        idx=idx,
+                        review_id=str(actual_row.get("review_id", "")),
+                        wrote_dets=final_dets,
+                        wrote_dels=final_dels,
+                        safety=out.get("safety", ""),
+                        reliability=out.get("reliability", ""),
+                        sessions=out.get("sessions", ""),
+                        ev_det=out.get("ev_det", {}),
+                        ev_del=out.get("ev_del", {}),
+                        unl_dels=out.get("unl_dels", []),
+                        unl_dets=out.get("unl_dets", []),
+                    )
+                )
                 done += 1
-            dataset_ck = dict(st.session_state["analysis_dataset"])
-            dataset_ck["reviews_df"] = updated_df.copy()
-            st.session_state["analysis_dataset"] = dataset_ck
-            st.session_state["sym_processed_rows"] = list(processed_local)
+            if bi % checkpoint_every == 0 or bi == total_batches:
+                dataset_ck = dict(st.session_state["analysis_dataset"])
+                dataset_ck["reviews_df"] = updated_df.copy()
+                st.session_state["analysis_dataset"] = dataset_ck
+                st.session_state["sym_processed_rows"] = list(processed_local)
+                st.session_state["_sym_checkpoint_done"] = done
             elapsed = time.perf_counter() - t0
             rate = done / elapsed if elapsed > 0 else 0
             rem = (total_n - done) / rate if rate > 0 else 0
-            prog.progress(done / total_n, text=f"{done}/{total_n} processed")
-            # Checkpoint already saved via dataset_ck above (every batch)
-            st.session_state["_sym_checkpoint_done"] = done
-            eta_box.markdown(f"**Speed:** {rate * 60:.1f} rev/min · **ETA:** ~{_fmt_secs(rem)}")
+            apply_progress = 0.65 + (0.27 * (done / max(total_n, 1)))
+            prog.progress(min(apply_progress, 0.92), text=f"{done}/{total_n} reviews tagged")
+            eta_box.markdown(f"**Tagging speed:** {rate * 60:.1f} rev/min · **Tagging ETA:** ~{_fmt_secs(rem)}")
             avg_labels = total_labels_written / max(done, 1)
-            stats_box.markdown(f"<span style='font-size:12px;color:var(--slate-500);'>Labels written: **{total_labels_written}** · Avg per review: **{avg_labels:.1f}**" + (f" · ⚠️ {failed_count} failed" if failed_count > 0 else "") + "</span>", unsafe_allow_html=True)
-            # Phase 3: Track label performance mid-run
+            stat_lines = [
+                f"Labels written: <b>{total_labels_written}</b> · Avg per review: <b>{avg_labels:.1f}</b>"
+                + (f" · ⚠️ {failed_count} failed" if failed_count > 0 else "")
+            ]
             if _label_tracker:
                 _label_tracker.record_batch(outs)
                 alerts = _label_tracker.check_alerts(min_reviews=batch_size * 3)
-                for alert in alerts[:4]:
+                for alert in alerts[:3]:
                     if alert["issue"] == "too_broad":
-                        stats_box.markdown(f"<span style='font-size:11px;color:var(--warning);'>⚠️ '{alert['label']}' hitting {alert['pct']:.0f}% of reviews — may be too broad</span>", unsafe_allow_html=True)
+                        stat_lines.append(f"⚠️ '{_esc(alert['label'])}' is hitting {alert['pct']:.0f}% of reviews and may be too broad.")
                     elif alert["issue"] == "high_zero_rate":
-                        stats_box.markdown(f"<span style='font-size:11px;color:var(--warning);'>⚠️ {alert['pct']:.0f}% of reviews returned zero tags — taxonomy may need tuning</span>", unsafe_allow_html=True)
+                        stat_lines.append(f"⚠️ {alert['pct']:.0f}% of reviews returned zero tags — the taxonomy may need tuning.")
                     elif alert["issue"] == "zero_hits":
-                        stats_box.markdown(f"<span style='font-size:11px;color:var(--slate-400);'>ℹ️ '{alert['label']}' ({alert['side']}) — zero hits after {_label_tracker.total_reviews} reviews</span>", unsafe_allow_html=True)
-                # Show if adaptive prompting is active
+                        stat_lines.append(f"ℹ️ '{_esc(alert['label'])}' ({_esc(alert['side'])}) still has zero hits after {_label_tracker.total_reviews} reviews.")
                 if bi > 3 and _label_tracker.get_prompt_hints():
-                    stats_box.markdown(f"<span style='font-size:11px;color:var(--indigo);'>🧠 Adaptive prompting active — adjusting for dominant/missing labels</span>", unsafe_allow_html=True)
-            gc.collect()
-        # ── v3 auto-retry for zero-tag reviews ───────────────────────────
+                    stat_lines.append("🧠 Adaptive prompting is active and smoothing dominant or missing labels.")
+            stats_box.markdown("<div class='status-note'>" + "<br>".join(stat_lines) + "</div>", unsafe_allow_html=True)
+            if bi % 4 == 0 or bi == total_batches:
+                gc.collect()
+
+        follow_up_candidates = sum(1 for rec in processed_local if (not rec.get("wrote_dets")) or (not rec.get("wrote_dels")))
+        status.info(
+            "Tagging complete. Finalizing results"
+            + (f" · checking {follow_up_candidates:,} review(s) that may need a second pass" if follow_up_candidates else "")
+            + "…"
+        )
+        eta_box.markdown(
+            "<div class='status-note'>The last step saves results, runs focused follow-up checks where needed, learns aliases, and refreshes the result tables.</div>",
+            unsafe_allow_html=True,
+        )
+        prog.progress(0.95, text=f"{done}/{total_n} tagged · finalizing")
+
+        retry_changed = 0
         if _HAS_SYMPTOMIZER_V3 and client and processed_local:
             try:
+                prog.progress(0.97, text=f"{done}/{total_n} tagged · validating sparse results")
                 all_items = {}
                 for bs in bidxs:
                     for ri, rw in rows_list[bs:bs + batch_size]:
                         all_items[int(ri)] = dict(idx=int(ri), review=_symptomizer_review_text(rw), rating=rw.get("rating"))
-                batch_res = {r["idx"]: r for r in processed_local}
+                batch_res = {int(r["idx"]): r for r in processed_local}
                 retry_res = _v3_retry_zero_tags(
-                    client=client, results=batch_res, items=list(all_items.values()),
-                    allowed_detractors=_active_dets, allowed_delighters=_active_dels,
-                    aliases=aliases, max_ev_chars=_ev_chars,
+                    client=client,
+                    results=batch_res,
+                    items=list(all_items.values()),
+                    allowed_detractors=_active_dets,
+                    allowed_delighters=_active_dels,
+                    aliases=aliases,
+                    max_ev_chars=_ev_chars,
                     chat_complete_fn=_chat_complete_with_fallback_models,
-                    safe_json_load_fn=_safe_json_load, model_fn=_shared_model, reasoning_fn=_shared_reasoning)
-                rc = sum(1 for k, v in retry_res.items() if v.get("dets") != batch_res.get(k, {}).get("wrote_dets") or v.get("dels") != batch_res.get(k, {}).get("wrote_dels"))
+                    safe_json_load_fn=_safe_json_load,
+                    model_fn=_shared_model,
+                    reasoning_fn=_shared_reasoning,
+                )
                 for ri, nr in retry_res.items():
-                    if ri in updated_df.index and nr != batch_res.get(ri):
-                        updated_df = _write_ai_symptom_row(updated_df, ri, dets=nr.get("dets"), dels=nr.get("dels"), safety=nr.get("safety"), reliability=nr.get("reliability"), sessions=nr.get("sessions"))
-                if rc:
-                    _log.info("Auto-retry recovered tags for %d review(s)", rc)
-                    status.info(f"Auto-retry recovered tags for {rc} review(s)")
+                    prev = batch_res.get(int(ri), {})
+                    prev_dets = list(prev.get("wrote_dets") or [])
+                    prev_dels = list(prev.get("wrote_dels") or [])
+                    new_dets = list(nr.get("dets") or [])[:10]
+                    new_dels = list(nr.get("dels") or [])[:10]
+                    if new_dets != prev_dets or new_dels != prev_dels:
+                        retry_changed += 1
+                        if ri in updated_df.index:
+                            updated_df = _write_ai_symptom_row(
+                                updated_df,
+                                ri,
+                                dets=new_dets,
+                                dels=new_dels,
+                                safety=nr.get("safety"),
+                                reliability=nr.get("reliability"),
+                                sessions=nr.get("sessions"),
+                            )
+                        processed_local = _upsert_processed_symptom_record(
+                            processed_local,
+                            ri,
+                            new_dets,
+                            new_dels,
+                            row_meta={
+                                "AI Safety": nr.get("safety", prev.get("safety", "Not Mentioned")),
+                                "AI Reliability": nr.get("reliability", prev.get("reliability", "Not Mentioned")),
+                                "AI # of Sessions": nr.get("sessions", prev.get("sessions", "Unknown")),
+                            },
+                            ev_det=nr.get("ev_det"),
+                            ev_del=nr.get("ev_del"),
+                        )
+                if retry_changed:
+                    _log.info("Auto-retry recovered tags for %d review(s)", retry_changed)
+                    status.info(f"Focused follow-up recovered tags for {retry_changed:,} review(s).")
             except Exception as retry_exc:
                 _log.warning("Auto-retry failed: %s", retry_exc)
+
+        prog.progress(0.985, text=f"{done}/{total_n} tagged · saving results")
         dataset = dict(st.session_state["analysis_dataset"])
         dataset["reviews_df"] = updated_df
         qa_baseline_map = _build_symptom_baseline_map(processed_local)
         qa_metrics = _compute_tag_edit_accuracy(qa_baseline_map, qa_baseline_map)
+        final_label_count = sum(len(r.get("wrote_dets", [])) + len(r.get("wrote_dels", [])) for r in processed_local)
+        elapsed_total = time.perf_counter() - t0
         st.session_state.update(
             analysis_dataset=dataset,
             sym_processed_rows=processed_local,
@@ -9260,18 +9361,19 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
             sym_qa_notice=None,
             sym_export_bytes=None,
         )
-        status.success(f"✅ Symptomized {done:,} reviews — {total_labels_written} labels written ({total_labels_written / max(done, 1):.1f} avg/review).")
-        _log.info("Symptomized %d reviews — %d labels written (%.1f avg)", done, total_labels_written, total_labels_written / max(done, 1))
-        st.session_state["sym_run_notice"] = f"Symptomized {done:,} reviews · {total_labels_written} labels. Tags visible in Review Explorer."
         st.session_state["sym_last_run_stats"] = {
-            "reviews": done, "labels": total_labels_written, "failed": failed_count,
-            "avg_per_review": round(total_labels_written / max(done, 1), 1),
-            "elapsed_sec": round(time.perf_counter() - t0, 1),
-            "model": _shared_model(), "reasoning": _shared_reasoning(),
+            "reviews": done,
+            "labels": final_label_count,
+            "failed": failed_count,
+            "avg_per_review": round(final_label_count / max(done, 1), 1),
+            "elapsed_sec": round(elapsed_total, 1),
+            "model": _shared_model(),
+            "reasoning": _shared_reasoning(),
             "staged": bool(st.session_state.get("sym_staged_pipeline")),
             "cache_stats": _v3_result_cache.stats if _HAS_SYMPTOMIZER_V3 else {},
+            "retry_recovered": retry_changed,
         }
-        # ── Post-run knowledge enrichment: close the feedback loop ────────
+
         try:
             enrichments = _enrich_product_knowledge_from_run(processed_local, min_mentions=max(3, done // 20))
             enrichment_count = sum(len(v) for v in enrichments.values())
@@ -9280,14 +9382,28 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                 _log.info("Knowledge enrichment: %d new themes discovered", enrichment_count)
         except Exception as enrich_exc:
             _log.warning("Knowledge enrichment failed: %s", enrich_exc)
-        # ── Post-run alias learning: teach the system consumer language ───
         try:
             aliases_learned = _auto_learn_aliases_from_run(processed_local)
             if aliases_learned > 0:
                 st.session_state["sym_last_run_stats"]["aliases_learned"] = aliases_learned
         except Exception as alias_exc:
             _log.warning("Alias learning failed: %s", alias_exc)
-        st.rerun()
+
+        prog.progress(1.0, text=f"{done}/{total_n} tagged · complete")
+        eta_box.markdown(
+            "<div class='status-note'>Finished. Results below are already synced to the Dashboard and Review Explorer.</div>",
+            unsafe_allow_html=True,
+        )
+        status.success(
+            f"✅ Symptomized {done:,} reviews — {final_label_count} labels written ({final_label_count / max(done, 1):.1f} avg/review)."
+            + (f" Focused follow-up recovered {retry_changed} review(s)." if retry_changed else "")
+        )
+        _log.info(
+            "Symptomized %d reviews — %d labels written (%.1f avg)",
+            done,
+            final_label_count,
+            final_label_count / max(done, 1),
+        )
     st.divider()
     processed = st.session_state.get("sym_processed_rows") or []
     if not processed:
@@ -9305,6 +9421,9 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
         cache_s = last_stats.get("cache_stats", {})
         if cache_s.get("hits", 0) > 0:
             sub_chips.append((f"Cache: {cache_s['hits']} hits saved", "indigo"))
+        rr = last_stats.get("retry_recovered", 0)
+        if rr > 0:
+            sub_chips.append((f"Follow-up recovered: {rr}", "green"))
         ke = last_stats.get("knowledge_enriched", 0)
         if ke > 0:
             sub_chips.append((f"Knowledge enriched: {ke} new themes", "green"))
