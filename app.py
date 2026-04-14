@@ -7802,7 +7802,7 @@ def _render_review_card(row, evidence_items=None):
             st.markdown(f"<div class='chip-wrap' style='justify-content:flex-end;gap:4px;flex-wrap:wrap;padding-top:2px;'>{status_chips}</div>", unsafe_allow_html=True)
         if evidence_items:
             st.markdown(_highlight_evidence(review_text, evidence_items), unsafe_allow_html=True)
-            st.caption("Yellow highlights = Symptomizer evidence · hover to see the AI tag")
+            st.caption("Highlights = Symptomizer evidence · hover to see the AI tag")
         else:
             active_kw = str(st.session_state.get("rf_kw", "")).strip()
             if active_kw:
