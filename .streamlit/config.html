@@ -1,21 +1,19 @@
 [theme]
+# Base gives us light-mode Streamlit defaults (light text colors, etc.)
 base = "light"
+
+# Primary action color — matches --accent in the app CSS (#6366f1 indigo)
 primaryColor = "#6366f1"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f8fafc"
-textColor = "#1e293b"
+
+# Main content area: clearly-not-white cool gray.
+# White cards and charts will pop visibly against this.
+backgroundColor = "#eef0f4"
+
+# Sidebar, code blocks, st.container borders:
+# Slightly lighter than the main bg so the sidebar reads as a panel, not a duplicate.
+secondaryBackgroundColor = "#f5f7fb"
+
+# All body text: near-black navy for max readability
+textColor = "#0f172a"
+
 font = "sans serif"
-
-[server]
-maxUploadSize = 200
-
-[browser]
-gatherUsageStats = false
-
-[runner]
-fastReruns = true
-
-[client]
-showSidebarNavigation = false
-toolbarMode = "minimal"
-
