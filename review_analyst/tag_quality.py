@@ -97,7 +97,7 @@ CONCEPT_SYNONYMS: Dict[str, Dict[str, Tuple[str, ...]]] = {
         "keywords": ("overall satisfaction","satisfaction","satisfied","happy","overall dissatisfaction","dissatisfaction","dissatisfied","disappointed","recommend","expectations"),
     },
     "noise": {
-        "positive": ("quiet","silent","low noise","not loud","not noisy","runs quietly"),
+        "positive": ("quiet","silent","low noise","not loud","not noisy","runs quietly","quieter","quieter than","much quieter","a lot quieter"),
         "negative": ("loud","noisy","noise","too loud","too noisy","noise issue"),
         "keywords": ("quiet","silent","loud","noisy","noise"),
     },
@@ -967,14 +967,29 @@ class FragmentScorer:
 
 
 def _dedupe_evidence(items: List[TagEvidence]) -> List[TagEvidence]:
-    seen: set = set()
+    seen: set[str] = set()
     out: List[TagEvidence] = []
-    for item in items:
-        key = item.text.lower().strip()
-        if key and key not in seen:
-            seen.add(key)
-            out.append(item)
-    return out[:2]
+
+    def _norm(value: str) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+    def _score(item: TagEvidence) -> tuple[int, int, float]:
+        text = _norm(item.text)
+        return (len(text), len(text.split()), float(getattr(item, "confidence", 0.0) or 0.0))
+
+    ranked = sorted(list(items or []), key=_score, reverse=True)
+    for item in ranked:
+        key = _norm(item.text)
+        if not key or key in seen:
+            continue
+        # Suppress shorter snippets when a longer kept snippet already covers them.
+        if any(key in _norm(kept.text) for kept in out):
+            continue
+        out.append(item)
+        seen.add(key)
+        if len(out) >= 2:
+            break
+    return out
 
 
 def _split_fragments(review_text: str) -> List[str]:

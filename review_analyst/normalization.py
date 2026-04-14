@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 from typing import Any, Dict, List, Tuple
 
@@ -523,6 +524,10 @@ def normalize_uploaded_df(raw_df: pd.DataFrame, *, source_name: str = "", includ
 def read_uploaded_file(uploaded_file, *, include_local_symptomization: bool = False) -> pd.DataFrame:
     filename = getattr(uploaded_file, "name", "uploaded_file")
     raw = uploaded_file.getvalue()
+    max_upload_mb = float(os.getenv("STARWALK_MAX_UPLOAD_MB", "40") or 40)
+    max_upload_bytes = int(max_upload_mb * 1024 * 1024)
+    if max_upload_bytes > 0 and len(raw) > max_upload_bytes:
+        raise ValueError(f"{filename} exceeds the upload limit of {max_upload_mb:g} MB.")
     suffix = filename.lower().rsplit(".", 1)[-1] if "." in filename else "csv"
     if suffix == "csv":
         try:

@@ -13,6 +13,7 @@ import difflib
 import gc
 import html
 import io
+import ipaddress
 import json
 import math
 import os
@@ -1387,8 +1388,24 @@ def _dedupe_keep_order(values):
 
 def _normalize_input_url(product_url: str) -> str:
     product_url = (product_url or "").strip()
+    if not product_url:
+        return ""
     if not re.match(r"^https?://", product_url, flags=re.IGNORECASE):
         product_url = "https://" + product_url
+    parsed = urlparse(product_url)
+    if (parsed.scheme or "").lower() not in {"http", "https"}:
+        raise ReviewDownloaderError("Only http(s) product/review URLs are supported.")
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise ReviewDownloaderError("Enter a valid public product/review URL.")
+    if host in {"localhost", "0.0.0.0"} or host.endswith(".localhost") or host.endswith(".local"):
+        raise ReviewDownloaderError("Local or private URLs are blocked.")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        raise ReviewDownloaderError("Local or private URLs are blocked.")
     return product_url
 
 
@@ -1904,6 +1921,10 @@ def _normalize_uploaded_df(raw, *, source_name="", include_local_symptomization=
 def _read_uploaded_file(f, *, include_local_symptomization=False):
     fname = getattr(f, "name", "uploaded_file")
     raw = f.getvalue()
+    max_upload_mb = float(os.getenv("STARWALK_MAX_UPLOAD_MB", "40") or 40)
+    max_upload_bytes = int(max_upload_mb * 1024 * 1024)
+    if max_upload_bytes > 0 and len(raw) > max_upload_bytes:
+        raise ReviewDownloaderError(f"{fname} exceeds the upload limit of {max_upload_mb:g} MB.")
     suffix = fname.lower().rsplit(".", 1)[-1] if "." in fname else "csv"
     if suffix == "csv":
         try:
@@ -4481,7 +4502,6 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
     low = filtered_df[filtered_df["rating"].isin([1, 2])].head(8)
     hi = filtered_df[filtered_df["rating"].isin([4, 5])].head(8)
     ev = pd.concat([rel, rec, low, hi], ignore_index=True).drop_duplicates(subset=["review_id"]).head(32)
-    # Build symptom distribution if available
     symptom_context = {}
     try:
         det_cols = [c for c in filtered_df.columns if c.startswith("AI Symptom Det")]
@@ -4500,16 +4520,65 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
                     if v and v.upper() not in NON_VALUES:
                         del_counts[v] += 1
             if det_counts:
-                symptom_context["top_detractors"] = [{"label": k, "count": v, "pct": round(v/max(len(filtered_df),1)*100,1)} for k, v in det_counts.most_common(15)]
+                symptom_context["top_detractors"] = [{"label": k, "count": v, "pct": round(v / max(len(filtered_df), 1) * 100, 1)} for k, v in det_counts.most_common(15)]
             if del_counts:
-                symptom_context["top_delighters"] = [{"label": k, "count": v, "pct": round(v/max(len(filtered_df),1)*100,1)} for k, v in del_counts.most_common(15)]
+                symptom_context["top_delighters"] = [{"label": k, "count": v, "pct": round(v / max(len(filtered_df), 1) * 100, 1)} for k, v in del_counts.most_common(15)]
     except Exception:
         pass
+
+    active_tab = st.session_state.get("workspace_active_tab") or TAB_DASHBOARD
+    knowledge = _normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {})
+    processed = list(st.session_state.get("sym_processed_rows") or [])
+    sym_snapshot = {
+        "status": "Not yet symptomized — run the Symptomizer first for richer analysis.",
+        "processed_reviews": 0,
+        "top_detractors": [],
+        "top_delighters": [],
+    }
+    if processed:
+        det_counts = Counter()
+        del_counts = Counter()
+        zero_tag_reviews = 0
+        for rec in processed:
+            dets = list(rec.get("wrote_dets") or [])
+            dels = list(rec.get("wrote_dels") or [])
+            if not dets and not dels:
+                zero_tag_reviews += 1
+            for label in dets:
+                det_counts[label] += 1
+            for label in dels:
+                del_counts[label] += 1
+        n_proc = len(processed)
+        sym_snapshot = {
+            "status": "Symptomizer results available.",
+            "processed_reviews": n_proc,
+            "zero_tag_reviews": zero_tag_reviews,
+            "top_detractors": [{"label": k, "count": v, "pct": round(v / max(n_proc, 1) * 100, 1)} for k, v in det_counts.most_common(10)],
+            "top_delighters": [{"label": k, "count": v, "pct": round(v / max(n_proc, 1) * 100, 1)} for k, v in del_counts.most_common(10)],
+        }
+
     payload = dict(
-        product=dict(product_id=_safe_summary_product_label(summary), product_url=_safe_summary_product_url(summary), product_name=_product_name(summary, overall_df)),
-        analysis_scope=dict(filter_description=filter_description, overall_review_count=len(overall_df), filtered_review_count=len(filtered_df)),
-        metric_snapshot=dict(overall=om, filtered=fm, rating_distribution_filtered=rd, monthly_trend_filtered=md),
-        symptom_tags=symptom_context if symptom_context else "Not yet symptomized — run the Symptomizer first for richer analysis.",
+        product=dict(
+            product_id=_safe_summary_product_label(summary),
+            product_url=_safe_summary_product_url(summary),
+            product_name=_product_name(summary, overall_df),
+        ),
+        analysis_scope=dict(
+            filter_description=filter_description,
+            overall_review_count=len(overall_df),
+            filtered_review_count=len(filtered_df),
+            current_tab=str(active_tab),
+            question=question,
+        ),
+        metric_snapshot=dict(
+            overall=om,
+            filtered=fm,
+            rating_distribution_filtered=rd,
+            monthly_trend_filtered=md,
+        ),
+        symptom_tags=symptom_context if symptom_context else "No current tag columns in the filtered view.",
+        symptomizer_run_summary=sym_snapshot,
+        product_knowledge=knowledge,
         review_text_evidence=_snippet_rows(ev, max_reviews=32),
     )
     full_json = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
@@ -7740,70 +7809,150 @@ def _highlight_keywords_in_text(text, keywords):
     return result
 
 
-def _highlight_evidence(text, evidence_items):
-    """Highlight evidence in review text with fuzzy matching and side-colored tints.
-    
-    Detractor evidence highlights in coral, delighter evidence in green.
-    Falls back to yellow when side info is not available.
-    
-    Tier 1: Exact regex match (case-insensitive)
-    Tier 2: Fuzzy — find the best overlapping window containing all content words
-    """
-    text_str = str(text)
+def _normalize_highlight_text(text):
+    replacements = str.maketrans({
+        "‘": "'", "’": "'", "‛": "'",
+        "“": '"', "”": '"',
+        "–": '-', "—": '-', "−": '-',
+        " ": ' ',
+    })
+    return str(text or "").translate(replacements)
+
+
+
+def _normalized_text_with_map(text):
+    raw = _normalize_highlight_text(text)
+    chars = []
+    idx_map = []
+    prev_space = True
+    for idx, ch in enumerate(raw):
+        if ch.isspace():
+            if prev_space:
+                continue
+            chars.append(" ")
+            idx_map.append(idx)
+            prev_space = True
+            continue
+        chars.append(ch.lower())
+        idx_map.append(idx)
+        prev_space = False
+    return "".join(chars), idx_map
+
+
+
+def _evidence_content_tokens(text):
+    stop = {"the", "a", "an", "and", "to", "for", "of", "in", "on", "with", "is", "it", "very", "really", "so"}
+    return [w for w in re.findall(r"[a-z0-9']+", str(text or "").lower()) if len(w) > 2 and w not in stop]
+
+
+
+def _find_evidence_hits(text, evidence_items):
+    text_str = str(text or "")
     if not evidence_items or not text_str.strip():
-        return f"<div class='review-body'>{html.escape(text_str)}</div>"
+        return []
+
+    norm_text, idx_map = _normalized_text_with_map(text_str)
+    if not norm_text:
+        return []
+
     hits = []
-    text_lower = text_str.lower()
     for item in evidence_items:
-        # Support both (text, label) and (text, label, side) tuples
         ev_text = item[0] if len(item) >= 1 else ""
         tag_label = item[1] if len(item) >= 2 else ""
         side = item[2] if len(item) >= 3 else ""
-        ev_clean = ev_text.strip()
+        ev_clean = re.sub(r"\s+", " ", _normalize_highlight_text(ev_text)).strip()
         if not ev_clean:
             continue
-        # Tier 1: Exact match
-        found = False
-        for m in re.compile(re.escape(ev_clean), re.IGNORECASE).finditer(text_str):
-            hits.append((m.start(), m.end(), tag_label, m.group(), side))
-            found = True
-        # Tier 2: Fuzzy match
-        if not found:
-            ev_words = [w for w in ev_clean.lower().split() if len(w) > 2 and w.lower() not in {"the","a","an","and","to","for","of","in","on","with","is","it","very","really","so"}]
-            if len(ev_words) >= 2:
-                best_start, best_end, best_len = -1, -1, 999
-                for w in ev_words:
-                    pos = text_lower.find(w)
+        ev_norm, _ = _normalized_text_with_map(ev_clean)
+        ev_norm = re.sub(r"\s+", " ", ev_norm).strip()
+        if not ev_norm:
+            continue
+
+        found_any = False
+        # Tier 1: normalized exact substring match (handles curly quotes/dashes/spaces)
+        for match in re.finditer(re.escape(ev_norm), norm_text, flags=re.IGNORECASE):
+            start_n, end_n = match.span()
+            if end_n <= start_n:
+                continue
+            start_o = idx_map[start_n]
+            end_o = idx_map[end_n - 1] + 1
+            hits.append((start_o, end_o, tag_label, text_str[start_o:end_o], side))
+            found_any = True
+
+        # Tier 2: flexible token chain match allowing punctuation gaps
+        if not found_any:
+            tokens = _evidence_content_tokens(ev_norm)
+            if tokens:
+                token_pattern = re.compile(r"\b" + r"\W+".join(re.escape(tok) for tok in tokens) + r"\b", re.IGNORECASE)
+                match = token_pattern.search(norm_text)
+                if match:
+                    start_n, end_n = match.span()
+                    start_o = idx_map[start_n]
+                    end_o = idx_map[end_n - 1] + 1
+                    hits.append((start_o, end_o, tag_label, text_str[start_o:end_o], side))
+                    found_any = True
+
+        # Tier 3: shortest window covering all content tokens
+        if not found_any:
+            tokens = _evidence_content_tokens(ev_norm)
+            if len(tokens) >= 2:
+                best = None
+                for token in tokens:
+                    pos = norm_text.find(token)
                     while pos >= 0:
-                        window_start = max(0, pos - 10)
-                        window_end = min(len(text_lower), pos + 120)
-                        window = text_lower[window_start:window_end]
-                        if all(ew in window for ew in ev_words):
+                        window_start = max(0, pos - 18)
+                        window_end = min(len(norm_text), pos + max(len(ev_norm) + 42, 120))
+                        window = norm_text[window_start:window_end]
+                        if all(tok in window for tok in tokens):
                             positions = []
-                            for ew in ev_words:
-                                wp = window.find(ew)
-                                if wp >= 0:
-                                    positions.append((window_start + wp, window_start + wp + len(ew)))
+                            for tok in tokens:
+                                tok_pos = window.find(tok)
+                                if tok_pos >= 0:
+                                    positions.append((window_start + tok_pos, window_start + tok_pos + len(tok)))
                             if positions:
-                                s = min(p[0] for p in positions)
-                                e = max(p[1] for p in positions)
-                                if (e - s) < best_len:
-                                    best_start, best_end, best_len = s, e, e - s
-                        pos = text_lower.find(w, pos + 1)
-                if best_start >= 0 and best_len < 150:
-                    hits.append((best_start, best_end, tag_label, text_str[best_start:best_end], side))
+                                start_n = min(p[0] for p in positions)
+                                end_n = max(p[1] for p in positions)
+                                span_len = end_n - start_n
+                                if span_len < min(max(len(ev_norm) + 36, 80), 220):
+                                    if best is None or span_len < best[0]:
+                                        best = (span_len, start_n, end_n)
+                        pos = norm_text.find(token, pos + 1)
+                if best is not None:
+                    _, start_n, end_n = best
+                    start_o = idx_map[start_n]
+                    end_o = idx_map[end_n - 1] + 1
+                    hits.append((start_o, end_o, tag_label, text_str[start_o:end_o], side))
+
+    if not hits:
+        return []
+
+    hits.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    deduped = []
+    seen = set()
+    cursor = -1
+    for start_o, end_o, tag_label, matched, side in hits:
+        key = (start_o, end_o, str(tag_label).strip().lower(), str(side).strip().lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        if start_o < cursor:
+            continue
+        deduped.append((start_o, end_o, tag_label, matched, side))
+        cursor = end_o
+    return deduped
+
+
+
+def _highlight_evidence(text, evidence_items, *, hits=None):
+    text_str = str(text or "")
+    if not text_str.strip():
+        return f"<div class='review-body'>{html.escape(text_str)}</div>"
+    hits = list(hits or _find_evidence_hits(text_str, evidence_items))
     if not hits:
         return f"<div class='review-body'>{html.escape(text_str)}</div>"
-    hits.sort(key=lambda h: h[0])
-    deduped = []
-    cursor = 0
-    for h in hits:
-        if h[0] >= cursor:
-            deduped.append(h)
-            cursor = h[1]
     parts = []
     cursor = 0
-    for start, end, tag_label, matched, side in deduped:
+    for start, end, tag_label, matched, side in hits:
         parts.append(html.escape(text_str[cursor:start]))
         tip = html.escape(f"{'Issue' if side == 'det' else 'Strength' if side == 'del' else 'Tag'}: {tag_label}")
         side_class = f" ev-{side}" if side in ("det", "del") else ""
@@ -7811,6 +7960,7 @@ def _highlight_evidence(text, evidence_items):
         cursor = end
     parts.append(html.escape(text_str[cursor:]))
     return f"<div class='review-body'>{''.join(parts)}</div>"
+
 
 
 def _build_evidence_lookup(processed_rows):
@@ -7849,6 +7999,7 @@ def _build_evidence_lookup(processed_rows):
     return lookup
 
 
+
 def _symptom_tags_html(det_tags, del_tags, *, ev_det=None, ev_del=None):
     if not det_tags and not del_tags:
         return ""
@@ -7857,14 +8008,13 @@ def _symptom_tags_html(det_tags, del_tags, *, ev_det=None, ev_del=None):
     def _chip(tag, color, ev_map):
         ev = ev_map.get(tag, [])
         tooltip = _esc(" | ".join(str(e)[:80] for e in ev)) if ev else "No evidence captured"
-        # Confidence visual: opacity + border style based on evidence quality
         ev_total_chars = sum(len(str(e)) for e in ev)
         if len(ev) >= 2 and ev_total_chars >= 30:
-            conf_style = "opacity:1;border:1.5px solid;"  # Strong
+            conf_style = "opacity:1;border:1.5px solid;"
         elif len(ev) >= 1 and ev_total_chars >= 15:
-            conf_style = "opacity:.88;border:1px solid;"  # Moderate
+            conf_style = "opacity:.88;border:1px solid;"
         else:
-            conf_style = "opacity:.65;border:1px dashed;"  # Weak — dashed border signals low confidence
+            conf_style = "opacity:.65;border:1px dashed;"
         ev_indicator = f"<span style='font-size:9px;opacity:.5;margin-left:2px;'>{len(ev)}ev</span>" if ev else "<span style='font-size:9px;opacity:.4;margin-left:2px;'>0ev</span>"
         return f"<span class='chip {color}' style='font-size:11px;padding:3px 8px;cursor:help;{conf_style}' title='{tooltip}'>{_esc(tag)}{ev_indicator}</span>"
     sym_html = "<div style='margin-top:9px;padding-top:9px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px;'>"
@@ -7878,11 +8028,41 @@ def _symptom_tags_html(det_tags, del_tags, *, ev_det=None, ev_del=None):
     return sym_html
 
 
+
+def _review_card_sections(row):
+    sections = []
+    seen = set()
+    section_map = [
+        ("Review", row.get("review_text")),
+        ("Pros", row.get("pros")),
+        ("Cons", row.get("cons")),
+        ("Headline", row.get("headline")),
+        ("Body", row.get("body")),
+        ("Comments", row.get("comments")),
+        ("Reviewer notes", row.get("reviewer_comments")),
+    ]
+    fallback_text = _safe_text(row.get("title_and_text"))
+    for label, raw in section_map:
+        body = _safe_text(raw).strip()
+        if not body:
+            continue
+        key = re.sub(r"\s+", " ", body).strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        sections.append((label, body))
+    if not sections and fallback_text:
+        sections.append(("Review", fallback_text))
+    if not sections:
+        sections.append(("Review", "—"))
+    return sections
+
+
+
 def _render_review_card(row, evidence_items=None):
     rating_val = _safe_int(row.get("rating"), 0) if pd.notna(row.get("rating")) else 0
     stars = "★" * max(0, min(rating_val, 5)) + "☆" * max(0, 5 - rating_val)
     title = _safe_text(row.get("title"), "No title") or "No title"
-    review_text = _safe_text(row.get("review_text"), "—") or "—"
     meta_bits = [b for b in [_safe_text(row.get("submission_date")), _safe_text(row.get("content_locale")), _safe_text(row.get("retailer")), _safe_text(row.get("product_or_sku"))] if b]
     is_organic = not _safe_bool(row.get("incentivized_review"), False)
     status_chips = f"<span class='chip {'gray' if is_organic else 'yellow'}'>{'Organic' if is_organic else 'Incentivized'}</span>"
@@ -7892,6 +8072,7 @@ def _render_review_card(row, evidence_items=None):
     det_cols, del_cols = _symptom_col_lists_from_columns(row.index)
     det_tags = _collect_row_symptom_tags(row, det_cols)
     del_tags = _collect_row_symptom_tags(row, del_cols)
+    sections = _review_card_sections(row)
     with st.container(border=True):
         top_cols = st.columns([5, 1.5])
         with top_cols[0]:
@@ -7901,17 +8082,29 @@ def _render_review_card(row, evidence_items=None):
                 st.markdown(f"<div style='font-size:12px;color:var(--slate-400);margin-bottom:4px;'>{' · '.join(_esc(b) for b in meta_bits)}</div>", unsafe_allow_html=True)
         with top_cols[1]:
             st.markdown(f"<div class='chip-wrap' style='justify-content:flex-end;gap:4px;flex-wrap:wrap;padding-top:2px;'>{status_chips}</div>", unsafe_allow_html=True)
-        if evidence_items:
-            st.markdown(_highlight_evidence(review_text, evidence_items), unsafe_allow_html=True)
-            st.caption("Evidence highlights show matched issue and strength snippets — hover to see the AI tag.")
-        else:
-            active_kw = str(st.session_state.get("rf_kw", "")).strip()
-            if active_kw:
-                highlighted = _highlight_keywords_in_text(html.escape(review_text), active_kw.split())
+
+        active_kw = str(st.session_state.get("rf_kw", "")).strip()
+        matched_hits = 0
+        for idx, (section_label, section_text) in enumerate(sections):
+            if len(sections) > 1:
+                margin_top = ".3rem" if idx == 0 else ".55rem"
+                st.markdown(f"<div class='metric-label' style='margin:{margin_top} 0 .18rem;font-size:10.5px;'>{_esc(section_label)}</div>", unsafe_allow_html=True)
+            if evidence_items:
+                section_hits = _find_evidence_hits(section_text, evidence_items)
+                matched_hits += len(section_hits)
+                st.markdown(_highlight_evidence(section_text, evidence_items, hits=section_hits), unsafe_allow_html=True)
+            elif active_kw:
+                highlighted = _highlight_keywords_in_text(html.escape(section_text), active_kw.split())
                 st.markdown(f"<div class='review-body'>{highlighted}</div>", unsafe_allow_html=True)
             else:
-                st.markdown(f"<div class='review-body'>{html.escape(review_text)}</div>", unsafe_allow_html=True)
-        # Collect evidence maps from processed symptomizer records
+                st.markdown(f"<div class='review-body'>{html.escape(section_text)}</div>", unsafe_allow_html=True)
+
+        if evidence_items:
+            if matched_hits:
+                st.caption("Evidence highlights now check the visible review fields the Symptomizer reads, including review text, pros/cons, and comments when available.")
+            else:
+                st.caption("Some evidence was captured as paraphrased or cross-field text, so not every tag snippet maps perfectly onto the visible review fields.")
+
         _ev_det_map, _ev_del_map = {}, {}
         try:
             _rid = _safe_text(row.get("review_id"))
@@ -8728,6 +8921,26 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
     _apply_pending_symptomizer_ui_state()
     st.markdown("<div class='section-title'>Symptomizer</div>", unsafe_allow_html=True)
     st.markdown("<div class='section-sub'>Row-level AI tagging of delighters and detractors. Use this when you want a more structured theme layer for the Dashboard, Review Explorer, and downstream exports.</div>", unsafe_allow_html=True)
+    with st.expander("How the Symptomizer works", expanded=False):
+        st.markdown(
+            """
+**What it does**
+
+The Symptomizer reads each review as a set of evidence-backed product claims, maps those claims to your active L1/L2 taxonomy, and writes structured detractor and delighter tags back into the workspace and export file.
+
+**Advanced AI behavior inside this run**
+
+- Rating-aware routing limits obvious cross-polarity mistakes and only opens both sides when the text looks mixed.
+- Evidence-first extraction asks the model to quote the review before it maps a claim to a taxonomy label.
+- Adaptive batching keeps short reviews fast while shrinking batch size for longer, denser reviews.
+- Sparse-result follow-up re-checks reviews that look under-tagged so the final pass can recover missed signals.
+- Alias learning and product knowledge enrichment use what the run learned to make future taxonomy passes sharper.
+
+**Why a highlight can still miss sometimes**
+
+The tagger reads more than the main review body — it may use pros, cons, comments, title/body variants, or other visible fields when available. Highlights work best when the stored evidence is verbatim. They can still miss when the captured snippet was paraphrased, heavily normalized, or spread across multiple fields. This build now checks a broader set of visible review fields to make highlighting much more consistent.
+            """
+        )
     client = _get_client()
     api_key = settings.get("api_key")
     sym_source = st.session_state.get("sym_symptoms_source", "none")
@@ -9414,11 +9627,11 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
         follow_up_candidates = sum(1 for rec in processed_local if (not rec.get("wrote_dets")) or (not rec.get("wrote_dels")))
         status.info(
             "Tagging complete. Finalizing results"
-            + (f" · checking {follow_up_candidates:,} review(s) that may need a second pass" if follow_up_candidates else "")
+            + (f" · focused follow-up is checking {follow_up_candidates:,} under-tagged review(s)" if follow_up_candidates else "")
             + "…"
         )
         eta_box.markdown(
-            "<div class='status-note'>The last step saves results, runs focused follow-up checks where needed, learns aliases, and refreshes the result tables.</div>",
+            "<div class='status-note'>The last step saves results, runs a targeted follow-up only on reviews that still look sparse, then refreshes the tables and export file.</div>",
             unsafe_allow_html=True,
         )
         prog.progress(0.95, text=f"{done}/{total_n} tagged · finalizing")
@@ -9426,7 +9639,31 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
         retry_changed = 0
         if _HAS_SYMPTOMIZER_V3 and client and processed_local:
             try:
-                prog.progress(0.97, text=f"{done}/{total_n} tagged · validating sparse results")
+                retry_t0 = time.perf_counter()
+                retry_total = max(int(follow_up_candidates or 0), 0)
+
+                def _retry_progress(done_retry, total_retry, phase):
+                    total_retry = max(int(total_retry or 0), 0)
+                    checked = min(max(int(done_retry or 0), 0), total_retry or max(int(done_retry or 0), 0))
+                    elapsed_retry = time.perf_counter() - retry_t0
+                    rate_retry = checked / elapsed_retry if elapsed_retry > 0 else 0.0
+                    rem_retry = (max(total_retry - checked, 0) / rate_retry) if rate_retry > 0 and total_retry > 0 else 0.0
+                    progress = 0.97 + (0.015 * (checked / max(total_retry, 1))) if total_retry else 0.982
+                    msg = f"{done}/{total_n} tagged · validating sparse results"
+                    if total_retry:
+                        msg += f" ({checked}/{total_retry})"
+                    prog.progress(min(progress, 0.985), text=msg)
+                    if total_retry:
+                        eta_box.markdown(
+                            f"**Focused follow-up:** {checked}/{total_retry} review(s) checked · **Speed:** {rate_retry * 60:.1f} rev/min · **ETA:** ~{_fmt_secs(rem_retry)}"
+                        )
+                    elif phase == "queued":
+                        eta_box.markdown(
+                            "<div class='status-note'>No sparse-result follow-up was needed, so the app is moving straight into result sync and export prep.</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                _retry_progress(0, retry_total, "queued")
                 all_items = {}
                 for bs in bidxs:
                     for ri, rw in rows_list[bs:bs + batch_size]:
@@ -9444,6 +9681,8 @@ def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filte
                     safe_json_load_fn=_safe_json_load,
                     model_fn=_shared_model,
                     reasoning_fn=_shared_reasoning,
+                    max_workers=min(4, max(1, retry_total)),
+                    progress_callback=_retry_progress,
                 )
                 for ri, nr in retry_res.items():
                     prev = batch_res.get(int(ri), {})
@@ -10235,112 +10474,144 @@ def main():
                         st.caption("No saved workspaces yet. Build one below and save it.")
                 st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
         st.markdown("<div class='builder-card'><div class='builder-kicker'>Get started</div><div class='builder-title'>Build a review workspace</div><div class='builder-sub'>Paste a supported product page or review API URL, or upload a review export file. Start with the Dashboard for an executive summary, then move into the other tabs for deeper work.</div><div class='helper-chip-row'><span class='helper-chip'>Shark/Ninja US</span><span class='helper-chip'>Shark/Ninja UK/EU</span><span class='helper-chip'>Costco</span><span class='helper-chip'>Sephora</span><span class='helper-chip'>Ulta</span><span class='helper-chip'>Hoka</span><span class='helper-chip'>CurrentBody</span><span class='helper-chip'>Okendo API</span><span class='helper-chip'>Bazaarvoice API</span><span class='helper-chip'>PowerReviews API</span></div></div>", unsafe_allow_html=True)
-        source_mode = st.radio("Workspace source", [SOURCE_MODE_URL, SOURCE_MODE_FILE], horizontal=True, key="workspace_source_mode")
-        if source_mode == SOURCE_MODE_URL:
-            url_mode = st.radio("Link mode", ["Single link", "Multiple links"], horizontal=True, key="workspace_url_entry_mode")
-            if url_mode == "Single link":
-                st.text_input("Product or review URL", key="workspace_product_url", placeholder="Paste a product page or direct review endpoint")
-                st.caption("Fastest path: paste a retailer product page or a direct Bazaarvoice / PowerReviews / Okendo review endpoint.")
-                if st.button("Build review workspace", type="primary", key="ws_build_url", use_container_width=True):
-                    try:
-                        nd = _load_product_reviews_dispatch(st.session_state.get("workspace_product_url", DEFAULT_PRODUCT_URL))
-                        _reset_review_filters()
-                        st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", sym_delighters=[], sym_detractors=[], sym_custom_universal_delighters=[], sym_custom_universal_detractors=[], sym_aliases={}, sym_taxonomy_preview_items=[], sym_taxonomy_category="general", sym_qa_baseline_map={}, sym_qa_accuracy={}, sym_qa_user_edited=False, sym_qa_row_ids=[], sym_qa_selected_row=None, sym_qa_notice=None, sym_product_profile_ai_note="", sym_product_knowledge={}, workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None, ai_include_references=False, ot_show_volume=False, _uploaded_raw_bytes=None, sym_export_bytes=None)
-                        # Phase 1: Auto-discover product profile + knowledge
-                        with st.spinner("Auto-discovering product profile…"):
-                            _auto_discover_product(nd)
-                        st.rerun()
-                    except requests.HTTPError as exc:
-                        st.error(f"HTTP error: {exc}")
-                    except ReviewDownloaderError as exc:
-                        st.error(str(exc))
-                    except Exception as exc:
-                        st.error(str(exc))
-            else:
-                st.text_area(
-                    "Product or review URLs",
-                    key="workspace_product_urls_bulk",
-                    height=150,
-                    placeholder="Paste one product page or review endpoint per line\nhttps://www.costco.com/...\nhttps://www.sephora.com/...\nhttps://www.hoka.com/...",
-                )
-                bulk_urls = _parse_bulk_product_urls(st.session_state.get("workspace_product_urls_bulk", ""))
-                if bulk_urls:
-                    preview = ", ".join((_strip_www(urlparse(u).netloc) or u) for u in bulk_urls[:4])
-                    if len(bulk_urls) > 4:
-                        preview += f" +{len(bulk_urls) - 4}"
-                    st.caption(f"Ready to load {len(bulk_urls)} link(s) · {preview}")
-                else:
-                    st.caption("Paste one product page or direct review endpoint per line to build a combined workspace.")
-                if st.button("Build combined workspace", type="primary", key="ws_build_url_multi", use_container_width=True):
-                    try:
-                        nd = _load_multiple_product_reviews_dispatch(bulk_urls)
-                        _reset_review_filters()
-                        st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", sym_delighters=[], sym_detractors=[], sym_custom_universal_delighters=[], sym_custom_universal_detractors=[], sym_aliases={}, sym_taxonomy_preview_items=[], sym_taxonomy_category="general", sym_qa_baseline_map={}, sym_qa_accuracy={}, sym_qa_user_edited=False, sym_qa_row_ids=[], sym_qa_selected_row=None, sym_qa_notice=None, sym_product_profile_ai_note="", sym_product_knowledge={}, workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None, ai_include_references=False, ot_show_volume=False, _uploaded_raw_bytes=None, sym_export_bytes=None)
-                        with st.spinner("Auto-discovering product profile…"):
-                            _auto_discover_product(nd)
-                        st.rerun()
-                    except requests.HTTPError as exc:
-                        st.error(f"HTTP error: {exc}")
-                    except ReviewDownloaderError as exc:
-                        st.error(str(exc))
-                    except Exception as exc:
-                        st.error(str(exc))
-        else:
-            uploader_key = f"workspace_files_{int(st.session_state.get('workspace_file_uploader_nonce', 0))}"
-            uploaded_files = st.file_uploader("Upload review export files", type=["csv", "xlsx", "xls"], accept_multiple_files=True, help="Supports Axion-style exports and similar CSV/XLSX review files.", key=uploader_key)
-            include_local_symptomization = st.checkbox(
-                "Include local symptomization if detected",
-                value=bool(st.session_state.get("workspace_include_local_symptomization", True)),
-                key="workspace_include_local_symptomization",
-                help="Preserves populated Symptom 1–20 / AI Symptom columns from uploaded files so the Dashboard, Review Explorer, filters, and Symptomizer can use them immediately.",
+        with st.container(border=True):
+            st.markdown(
+                "<div class='builder-kicker'>Source setup</div><div class='builder-title' style='font-size:16px;'>Choose how to load reviews</div><div class='builder-sub' style='margin-bottom:.7rem;'>Pick a link-based workspace or an uploaded file flow. The controls below stay grouped so the source choice, mode, and primary action feel like one connected setup.</div>",
+                unsafe_allow_html=True,
             )
-            st.caption("Mapped columns include Event Id, Base SKU, Review Text, Rating, Opened date, Seeded Flag, and Retailer when available. Turn on local symptomization to keep existing Symptom 1–20 / AI Symptom tags and infer the symptom catalog automatically.")
-            if st.button("Build review workspace from file", type="primary", key="ws_build_file", use_container_width=True):
-                try:
-                    nd = _load_uploaded_files_dispatch(uploaded_files or [], include_local_symptomization=include_local_symptomization)
-                    _reset_review_filters()
-                    raw_bytes = None
-                    if uploaded_files and len(uploaded_files) == 1:
-                        fname = getattr(uploaded_files[0], "name", "")
-                        if fname.lower().endswith((".xlsx", ".xlsm")):
-                            raw_bytes = uploaded_files[0].getvalue()
-                    local_delighters, local_detractors = ([], [])
-                    if include_local_symptomization:
-                        local_delighters, local_detractors = _local_symptom_catalog(nd["reviews_df"])
-                    has_local_catalog = bool(local_delighters or local_detractors)
-                    st.session_state.update(
-                        analysis_dataset=nd,
-                        chat_messages=[],
-                        master_export_bundle=None,
-                        prompt_run_artifacts=None,
-                        sym_processed_rows=[],
-                        sym_new_candidates={},
-                        sym_symptoms_source=("local upload" if has_local_catalog else "none"),
-                        sym_delighters=(local_delighters if has_local_catalog else []),
-                        sym_detractors=(local_detractors if has_local_catalog else []),
-                        sym_aliases=_alias_map_for_catalog((local_delighters if has_local_catalog else []), (local_detractors if has_local_catalog else [])),
-                        sym_taxonomy_preview_items=[],
-                        sym_taxonomy_category="general",
-                        sym_qa_baseline_map={},
-                        sym_qa_accuracy={},
-                        sym_qa_user_edited=False,
-                        sym_qa_row_ids=[],
-                        sym_qa_selected_row=None,
-                        sym_qa_notice=None,
-                        sym_product_profile_ai_note="",
-                        sym_product_knowledge={},
-                        workspace_active_tab=TAB_DASHBOARD,
-                        workspace_tab_request=None,
-                        ai_include_references=False,
-                        ot_show_volume=False,
-                        _uploaded_raw_bytes=raw_bytes,
-                        sym_export_bytes=None,
+            st.markdown("**Workspace source**")
+            source_mode = st.radio(
+                "Workspace source",
+                [SOURCE_MODE_URL, SOURCE_MODE_FILE],
+                horizontal=True,
+                key="workspace_source_mode",
+                label_visibility="collapsed",
+            )
+            if source_mode == SOURCE_MODE_URL:
+                st.markdown("**Link mode**")
+                url_mode = st.radio(
+                    "Link mode",
+                    ["Single link", "Multiple links"],
+                    horizontal=True,
+                    key="workspace_url_entry_mode",
+                    label_visibility="collapsed",
+                )
+                if url_mode == "Single link":
+                    st.text_input(
+                        "Product or review URL",
+                        key="workspace_product_url",
+                        placeholder="Paste a product page or direct review endpoint",
+                        label_visibility="collapsed",
                     )
-                    st.rerun()
-                except ReviewDownloaderError as exc:
-                    st.error(str(exc))
-                except Exception as exc:
-                    st.exception(exc)
+                    st.caption("Fastest path: paste a retailer product page or a direct Bazaarvoice / PowerReviews / Okendo review endpoint.")
+                    if st.button("Build review workspace", type="primary", key="ws_build_url", use_container_width=True):
+                        try:
+                            nd = _load_product_reviews_dispatch(st.session_state.get("workspace_product_url", DEFAULT_PRODUCT_URL))
+                            _reset_review_filters()
+                            st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", sym_delighters=[], sym_detractors=[], sym_custom_universal_delighters=[], sym_custom_universal_detractors=[], sym_aliases={}, sym_taxonomy_preview_items=[], sym_taxonomy_category="general", sym_qa_baseline_map={}, sym_qa_accuracy={}, sym_qa_user_edited=False, sym_qa_row_ids=[], sym_qa_selected_row=None, sym_qa_notice=None, sym_product_profile_ai_note="", sym_product_knowledge={}, workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None, ai_include_references=False, ot_show_volume=False, _uploaded_raw_bytes=None, sym_export_bytes=None)
+                            with st.spinner("Auto-discovering product profile…"):
+                                _auto_discover_product(nd)
+                            st.rerun()
+                        except requests.HTTPError as exc:
+                            st.error(f"HTTP error: {exc}")
+                        except ReviewDownloaderError as exc:
+                            st.error(str(exc))
+                        except Exception as exc:
+                            st.error(str(exc))
+                else:
+                    st.text_area(
+                        "Product or review URLs",
+                        key="workspace_product_urls_bulk",
+                        height=150,
+                        placeholder="Paste one product page or review endpoint per line\nhttps://www.costco.com/...\nhttps://www.sephora.com/...\nhttps://www.hoka.com/...",
+                        label_visibility="collapsed",
+                    )
+                    bulk_urls = _parse_bulk_product_urls(st.session_state.get("workspace_product_urls_bulk", ""))
+                    if bulk_urls:
+                        preview = ", ".join((_strip_www(urlparse(u).netloc) or u) for u in bulk_urls[:4])
+                        if len(bulk_urls) > 4:
+                            preview += f" +{len(bulk_urls) - 4}"
+                        st.caption(f"Ready to load {len(bulk_urls)} link(s) · {preview}")
+                    else:
+                        st.caption("Paste one product page or direct review endpoint per line to build a combined workspace.")
+                    if st.button("Build combined workspace", type="primary", key="ws_build_url_multi", use_container_width=True):
+                        try:
+                            nd = _load_multiple_product_reviews_dispatch(bulk_urls)
+                            _reset_review_filters()
+                            st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", sym_delighters=[], sym_detractors=[], sym_custom_universal_delighters=[], sym_custom_universal_detractors=[], sym_aliases={}, sym_taxonomy_preview_items=[], sym_taxonomy_category="general", sym_qa_baseline_map={}, sym_qa_accuracy={}, sym_qa_user_edited=False, sym_qa_row_ids=[], sym_qa_selected_row=None, sym_qa_notice=None, sym_product_profile_ai_note="", sym_product_knowledge={}, workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None, ai_include_references=False, ot_show_volume=False, _uploaded_raw_bytes=None, sym_export_bytes=None)
+                            with st.spinner("Auto-discovering product profile…"):
+                                _auto_discover_product(nd)
+                            st.rerun()
+                        except requests.HTTPError as exc:
+                            st.error(f"HTTP error: {exc}")
+                        except ReviewDownloaderError as exc:
+                            st.error(str(exc))
+                        except Exception as exc:
+                            st.error(str(exc))
+            else:
+                st.markdown("**Uploaded review file**")
+                uploader_key = f"workspace_files_{int(st.session_state.get('workspace_file_uploader_nonce', 0))}"
+                uploaded_files = st.file_uploader(
+                    "Upload review export files",
+                    type=["csv", "xlsx", "xls"],
+                    accept_multiple_files=True,
+                    help="Supports Axion-style exports and similar CSV/XLSX review files.",
+                    key=uploader_key,
+                    label_visibility="collapsed",
+                )
+                include_local_symptomization = st.checkbox(
+                    "Include local symptomization if detected",
+                    value=bool(st.session_state.get("workspace_include_local_symptomization", True)),
+                    key="workspace_include_local_symptomization",
+                    help="Preserves populated Symptom 1–20 / AI Symptom columns from uploaded files so the Dashboard, Review Explorer, filters, and Symptomizer can use them immediately.",
+                )
+                st.caption("Mapped columns include Event Id, Base SKU, Review Text, Rating, Opened date, Seeded Flag, and Retailer when available. Turn on local symptomization to keep existing Symptom 1–20 / AI Symptom tags and infer the symptom catalog automatically.")
+                if st.button("Build review workspace from file", type="primary", key="ws_build_file", use_container_width=True):
+                    try:
+                        nd = _load_uploaded_files_dispatch(uploaded_files or [], include_local_symptomization=include_local_symptomization)
+                        _reset_review_filters()
+                        raw_bytes = None
+                        if uploaded_files and len(uploaded_files) == 1:
+                            fname = getattr(uploaded_files[0], "name", "")
+                            if fname.lower().endswith((".xlsx", ".xlsm")):
+                                raw_bytes = uploaded_files[0].getvalue()
+                        local_delighters, local_detractors = ([], [])
+                        if include_local_symptomization:
+                            local_delighters, local_detractors = _local_symptom_catalog(nd["reviews_df"])
+                        has_local_catalog = bool(local_delighters or local_detractors)
+                        st.session_state.update(
+                            analysis_dataset=nd,
+                            chat_messages=[],
+                            master_export_bundle=None,
+                            prompt_run_artifacts=None,
+                            sym_processed_rows=[],
+                            sym_new_candidates={},
+                            sym_symptoms_source=("local upload" if has_local_catalog else "none"),
+                            sym_delighters=(local_delighters if has_local_catalog else []),
+                            sym_detractors=(local_detractors if has_local_catalog else []),
+                            sym_aliases=_alias_map_for_catalog((local_delighters if has_local_catalog else []), (local_detractors if has_local_catalog else [])),
+                            sym_taxonomy_preview_items=[],
+                            sym_taxonomy_category="general",
+                            sym_qa_baseline_map={},
+                            sym_qa_accuracy={},
+                            sym_qa_user_edited=False,
+                            sym_qa_row_ids=[],
+                            sym_qa_selected_row=None,
+                            sym_qa_notice=None,
+                            sym_product_profile_ai_note="",
+                            sym_product_knowledge={},
+                            workspace_active_tab=TAB_DASHBOARD,
+                            workspace_tab_request=None,
+                            ai_include_references=False,
+                            ot_show_volume=False,
+                            _uploaded_raw_bytes=raw_bytes,
+                            sym_export_bytes=None,
+                        )
+                        st.rerun()
+                    except ReviewDownloaderError as exc:
+                        st.error(str(exc))
+                    except Exception as exc:
+                        st.exception(exc)
 
     dataset = st.session_state.get("analysis_dataset")
     settings = _render_sidebar(dataset["reviews_df"] if dataset else None)
@@ -10424,13 +10695,26 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
     has_symptoms = bool(st.session_state.get("sym_processed_rows"))
     product_label = _product_name(summary, overall_df if isinstance(overall_df, pd.DataFrame) else pd.DataFrame())
 
+    focus_options = [
+        "Action plan",
+        "Root cause",
+        "Consumer language",
+        "Product / CX opportunities",
+    ]
+    if st.session_state.get("bottom_chat_focus") not in focus_options:
+        default_focus = "Root cause" if active_tab == TAB_SYMPTOMIZER else "Action plan"
+        st.session_state["bottom_chat_focus"] = default_focus
+    answer_styles = ["Actionable", "Balanced", "Deep dive"]
+    if st.session_state.get("bottom_chat_answer_style") not in answer_styles:
+        st.session_state["bottom_chat_answer_style"] = "Balanced"
+
     with st.container(border=True):
-        top_left, top_right = st.columns([4.4, 1.0])
+        top_left, top_right = st.columns([4.2, 1.0])
         with top_left:
             st.markdown("### Ask AI about this view")
             st.caption(
-                "Uses the active filtered reviews and Symptomizer output when available, "
-                "so answers stay tied to the current workspace instead of the full app history."
+                "Grounded in the active filters, current symptom tags, and product knowledge when available. "
+                "Use it for sharper summaries, prioritization, root-cause hypotheses, and what-to-do-next guidance."
             )
         with top_right:
             if st.button("Clear chat", key="bottom_chat_clear", use_container_width=True, disabled=not chat_messages):
@@ -10452,6 +10736,20 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
         if filter_description:
             st.caption(f"Current filters: {filter_description}")
 
+        ctl1, ctl2 = st.columns([1.25, 1.0])
+        focus = ctl1.selectbox(
+            "AI focus",
+            options=focus_options,
+            key="bottom_chat_focus",
+            help="Steers the answer toward a stronger action plan, root-cause readout, consumer-language summary, or opportunity framing.",
+        )
+        answer_style = ctl2.selectbox(
+            "Answer style",
+            options=answer_styles,
+            key="bottom_chat_answer_style",
+            help="Controls how concise or detailed the answer should be.",
+        )
+
         if chat_messages:
             latest_messages = chat_messages[-2:] if len(chat_messages) >= 2 else chat_messages[-1:]
             for msg in latest_messages:
@@ -10465,26 +10763,30 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
                             st.markdown(msg.get("content", ""), unsafe_allow_html=True)
         else:
             st.markdown(
-                "<div class='soft-panel' style='margin:.35rem 0 .8rem;'><b>Try asking</b> - biggest complaints, top delighters, 1-star vs 5-star differences, or which issues deserve immediate action.</div>",
+                "<div class='soft-panel' style='margin:.35rem 0 .8rem;'><b>Best uses</b> · Ask for the biggest complaints in this slice, what to fix first, where the rating drag is concentrated, what consumers actually praise, or how to translate the current view into product/CX actions.</div>",
                 unsafe_allow_html=True,
             )
             suggestions = []
-            if view_reviews > 0:
-                suggestions.extend([
-                    "What are the biggest complaints in this view?",
-                    "Summarize the top themes in plain English",
-                ])
             if has_symptoms:
                 suggestions.extend([
-                    "Which detractors need action first?",
-                    "What do 5-star reviews praise most?",
+                    "Which detractors deserve action first in this view?",
+                    "What are the likely root causes behind the top detractors?",
+                    "What do the strongest delighters suggest we should protect?",
+                    "Turn this view into a prioritized action plan for product and CX",
                 ])
-            if not suggestions:
+            elif view_reviews > 0:
+                suggestions.extend([
+                    "Summarize the biggest complaints in this filtered view",
+                    "What are the clearest consumer themes here?",
+                    "What separates the low-star reviews from the high-star reviews?",
+                    "What should I investigate next before symptomizing?",
+                ])
+            else:
                 suggestions = [
-                    "What can I do here?",
-                    "How should I use the Symptomizer?",
-                    "What patterns should I look for?",
+                    "How should I use this workspace?",
+                    "What should I look for first?",
                     "What should I export next?",
+                    "How does the Symptomizer help here?",
                 ]
             rows = [suggestions[i:i + 2] for i in range(0, min(len(suggestions), 4), 2)]
             for ridx, row in enumerate(rows):
@@ -10506,87 +10808,53 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
             st.error("OpenAI API key required. Add it in Settings -> OpenAI API Key.")
             return
 
-        review_sample = []
-        if isinstance(filtered_df, pd.DataFrame) and not filtered_df.empty and "review_text" in filtered_df.columns:
-            sample_df = filtered_df.sample(min(30, len(filtered_df)), random_state=42)
-            review_sample = [_trunc(str(r), 300) for r in sample_df["review_text"].dropna().tolist()]
+        persona_map = {
+            "Action plan": "Product Development",
+            "Root cause": "Quality Engineer",
+            "Consumer language": "Consumer Insights",
+            "Product / CX opportunities": "Product Development",
+        }
+        focus_instructions = {
+            "Action plan": "Prioritize what should happen now, next, and later. Be specific about product, CX, ops, or messaging actions.",
+            "Root cause": "Explain the most likely failure modes, workflow friction, or taxonomy-level causes behind the patterns in this view. Separate confirmed evidence from inference.",
+            "Consumer language": "Summarize the actual consumer language, emotional tone, and repeated phrasing. Highlight what customers care about and how they describe it.",
+            "Product / CX opportunities": "Convert the current view into opportunity areas for product, support, onboarding, merchandising, retention, or messaging.",
+        }
+        response_scaffolds = {
+            "Action plan": "Structure the answer as: What matters most; Prioritized actions (Now / Next / Later); Risks or dependencies; What to monitor next.",
+            "Root cause": "Structure the answer as: What is happening; Most likely root causes; Evidence supporting each cause; What is still uncertain; What to verify next.",
+            "Consumer language": "Structure the answer as: What customers keep saying; Emotional tone; Repeated phrases or ideas; Messaging implications; Quotes or examples only when they add value.",
+            "Product / CX opportunities": "Structure the answer as: Biggest opportunity areas; Product opportunities; CX/onboarding/support opportunities; Quick wins; Longer-term bets.",
+        }
+        style_instructions = {
+            "Actionable": "Be concise, decisive, and practical. Favor ranked recommendations over long narrative.",
+            "Balanced": "Balance diagnosis with recommendations. Include enough explanation to make the actions credible.",
+            "Deep dive": "Go deeper on tradeoffs, evidence, uncertainty, and second-order implications."
+        }
+        target_words = {"Actionable": 260, "Balanced": 430, "Deep dive": 650}.get(answer_style, 430)
+        enriched_prompt = (
+            f"{prompt}\n\n"
+            f"Focus mode: {focus}.\n"
+            f"Answer style: {answer_style}.\n"
+            f"Special instruction: {focus_instructions.get(focus, '')}\n"
+            f"Response format: {response_scaffolds.get(focus, '')}\n"
+            f"Style instruction: {style_instructions.get(answer_style, '')}\n"
+            "Ground the answer in the current filtered view. Quantify where possible, separate evidence from inference, avoid generic advice, and end with concrete next steps."
+        )
 
-        sym_context = ""
-        processed = st.session_state.get("sym_processed_rows") or []
-        if processed:
-            det_freq = {}
-            del_freq = {}
-            for rec in processed:
-                for tag in (rec.get("wrote_dets") or []):
-                    det_freq[tag] = det_freq.get(tag, 0) + 1
-                for tag in (rec.get("wrote_dels") or []):
-                    del_freq[tag] = del_freq.get(tag, 0) + 1
-            top_dets = sorted(det_freq.items(), key=lambda item: (-item[1], item[0]))[:10]
-            top_dels = sorted(del_freq.items(), key=lambda item: (-item[1], item[0]))[:10]
-            n_proc = len(processed)
-            top_det_text = ", ".join(
-                f"{tag} ({count}, {round(count / max(n_proc, 1) * 100):.0f}%)" for tag, count in top_dets
-            ) or "None"
-            top_del_text = ", ".join(
-                f"{tag} ({count}, {round(count / max(n_proc, 1) * 100):.0f}%)" for tag, count in top_dels
-            ) or "None"
-            sym_context = (
-                f"\nSymptomizer results ({n_proc} reviews tagged):"
-                f"\nTop detractors: {top_det_text}"
-                f"\nTop delighters: {top_del_text}"
-            )
-
-        rating_context = ""
-        if isinstance(filtered_df, pd.DataFrame) and "rating" in filtered_df.columns:
-            vc = filtered_df["rating"].dropna().value_counts().sort_index()
-            if not vc.empty:
-                avg = filtered_df["rating"].dropna().mean()
-                distribution = ", ".join(
-                    f"{int(k)} star: {v}" if float(k).is_integer() else f"{k} star: {v}"
-                    for k, v in vc.items()
-                )
-                rating_context = f"\nRating distribution: {distribution} (avg {avg:.1f} star)"
-
-        system_context = f"""You are an internal consumer review analyst for SharkNinja.
-Answer directly, stay specific, and use the active view as the source of truth.
-Product: {product_label}
-Current tab: {str(active_tab).replace('_', ' ').title()}
-Dataset: {total_reviews:,} loaded reviews, {view_reviews:,} in the active filtered view.{rating_context}
-Filters: {filter_description or 'No active filters'}
-{sym_context}
-
-Response rules:
-- Lead with the answer in one sentence.
-- Then give 2-4 concise bullets with counts, percentages, or clear evidence-backed patterns.
-- Prefer symptomizer labels when they exist instead of inventing new names.
-- If evidence is thin or the view is small, say so clearly.
-- Avoid generic filler and avoid repeating the question.
-- Keep the answer under 220 words unless the user asks for more detail."""
-
-        history = [{"role": "system", "content": system_context}]
-        for msg in chat_messages[-8:]:
-            history.append({"role": msg["role"], "content": msg["content"]})
-        history.append({"role": "user", "content": prompt})
         st.session_state.setdefault("chat_messages", []).append({"role": "user", "content": prompt})
-
-        if review_sample:
-            sample_text = "\n---\n".join(review_sample[:20])
-            history[-1]["content"] = (
-                f"{history[-1]['content']}\n\n"
-                f"[REVIEW SAMPLE - {len(review_sample)} reviews]\n"
-                f"{sample_text}"
-            )
-
-        with st.spinner("Thinking..."):
+        with st.spinner("Thinking through the current view…"):
             try:
-                answer = _chat_complete_with_fallback_models(
-                    client,
-                    model=_shared_model(),
-                    structured=False,
-                    messages=history,
-                    temperature=0.25,
-                    max_tokens=1500,
-                    reasoning_effort=_shared_reasoning(),
+                answer = _call_analyst(
+                    question=enriched_prompt,
+                    overall_df=overall_df,
+                    filtered_df=filtered_df,
+                    summary=summary,
+                    filter_description=filter_description,
+                    chat_history=chat_messages,
+                    persona_name=persona_map.get(focus),
+                    target_words=target_words,
+                    include_references=bool(st.session_state.get("ai_include_references", False)),
                 )
                 st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
             except Exception as exc:

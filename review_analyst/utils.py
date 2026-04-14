@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import ipaddress
 import json
 import math
 import re
@@ -12,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 import pandas as pd
 
 from .config import STOPWORDS
+from .models import ReviewDownloaderError
 
 
 NON_VALUES = {"<NA>", "NA", "N/A", "NONE", "-", "", "NAN", "NULL"}
@@ -134,8 +136,24 @@ def ordered_unique(values: Sequence[Any]) -> List[str]:
 
 def normalize_input_url(product_url: str) -> str:
     product_url = (product_url or "").strip()
+    if not product_url:
+        return ""
     if not re.match(r"^https?://", product_url, flags=re.IGNORECASE):
         product_url = "https://" + product_url
+    parsed = urlparse(product_url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ReviewDownloaderError("Only http(s) product/review URLs are supported.")
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise ReviewDownloaderError("Enter a valid public product/review URL.")
+    if host in {"localhost", "0.0.0.0"} or host.endswith(".localhost") or host.endswith(".local"):
+        raise ReviewDownloaderError("Local or private URLs are blocked.")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        raise ReviewDownloaderError("Local or private URLs are blocked.")
     return product_url
 
 

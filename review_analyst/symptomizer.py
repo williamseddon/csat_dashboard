@@ -1363,6 +1363,8 @@ def retry_zero_tag_reviews(
     safe_json_load_fn: Optional[Callable] = None,
     model_fn: Optional[Callable] = None,
     reasoning_fn: Optional[Callable] = None,
+    max_workers: int = 1,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Dict[int, Dict[str, Any]]:
     """Re-process reviews that got zero tags on the expected side.
 
@@ -1380,53 +1382,57 @@ def retry_zero_tag_reviews(
     items_by_idx = {int(it["idx"]): it for it in items}
     retried = dict(results)
 
-    for idx, result in results.items():
-        item = items_by_idx.get(idx)
-        if not item:
-            continue
-
+    def _retry_flags(item: Mapping[str, Any], result: Mapping[str, Any]):
         rating = item.get("rating")
         review_text = item.get("review", "")
         dets_found = result.get("dets") or []
         dels_found = result.get("dels") or []
-
-        # Smart retry criteria: retry when rating SUGGESTS tags should exist
-        # but don't retry just because gate_polarity says both sides are eligible
         try:
             r = float(rating)
         except (TypeError, ValueError):
-            r = 3.0  # unknown rating → neutral
+            r = 3.0
 
         missed_det = False
         missed_del = False
-
-        # Definitely retry: zero tags on BOTH sides (always suspicious)
         if not dets_found and not dels_found:
             missed_det = True
             missed_del = True
         else:
-            # Rating-based: 1-3★ with zero detractors is likely a miss
             if r <= 3 and not dets_found:
                 missed_det = True
-            # Rating-based: 3-5★ with zero delighters is likely a miss
             if r >= 3 and not dels_found:
                 missed_del = True
-            # Text signal override: explicit negative words but no detractors
             if not dets_found and _EXPLICIT_NEGATIVE.search(review_text):
                 missed_det = True
-            # Text signal override: explicit positive words but no delighters
             if not dels_found and _EXPLICIT_POSITIVE.search(review_text):
                 missed_del = True
+        return missed_det, missed_del, rating, review_text
 
-        if not (missed_det or missed_del):
+    candidates = []
+    for idx, result in results.items():
+        item = items_by_idx.get(int(idx))
+        if not item:
             continue
+        missed_det, missed_del, rating, review_text = _retry_flags(item, result)
+        if missed_det or missed_del:
+            candidates.append((int(idx), dict(result), item, rating, review_text, missed_det, missed_del))
 
-        # Build focused catalog for retry
+    total_candidates = len(candidates)
+    if progress_callback:
+        try:
+            progress_callback(0, total_candidates, "queued")
+        except Exception:
+            pass
+    if total_candidates == 0:
+        return retried
+
+    def _process_candidate(job):
+        idx, base_result, item, rating, review_text, missed_det, missed_del = job
         catalog_parts = []
         if missed_det:
-            catalog_parts.append("DETRACTORS:\n" + "\n".join(f"  - {l}" for l in allowed_detractors))
+            catalog_parts.append("DETRACTORS:\n" + "\n".join(f"  - {label}" for label in allowed_detractors))
         if missed_del:
-            catalog_parts.append("DELIGHTERS:\n" + "\n".join(f"  - {l}" for l in allowed_delighters))
+            catalog_parts.append("DELIGHTERS:\n" + "\n".join(f"  - {label}" for label in allowed_delighters))
 
         system = _RETRY_SYSTEM_PROMPT.format(catalog_section="\n\n".join(catalog_parts))
         user_msg = json.dumps(dict(
@@ -1435,6 +1441,8 @@ def retry_zero_tag_reviews(
             retry_reason=f"{'missed detractors' if missed_det else ''}{' and ' if missed_det and missed_del else ''}{'missed delighters' if missed_del else ''}",
         ))
 
+        updated = dict(base_result)
+        changed = False
         try:
             result_text = chat_complete_fn(
                 client,
@@ -1444,13 +1452,12 @@ def retry_zero_tag_reviews(
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_msg},
                 ],
-                temperature=0.3,  # Higher than main pass to explore different interpretations
+                temperature=0.3,
                 response_format={"type": "json_object"},
                 max_tokens=1200,
                 reasoning_effort=_reasoning,
             )
             data = _json_load(result_text)
-            review_text = item.get("review", "")
 
             if missed_det and data.get("detractors"):
                 new_dets, new_ev_det = _extract_side_with_confidence(
@@ -1458,10 +1465,9 @@ def retry_zero_tag_reviews(
                     aliases=aliases, side="detractor", max_ev_chars=max_ev_chars,
                 )
                 if new_dets:
-                    updated = dict(retried[idx])
                     updated["dets"] = new_dets
                     updated["ev_det"] = new_ev_det
-                    retried[idx] = updated
+                    changed = True
 
             if missed_del and data.get("delighters"):
                 new_dels, new_ev_del = _extract_side_with_confidence(
@@ -1469,23 +1475,55 @@ def retry_zero_tag_reviews(
                     aliases=aliases, side="delighter", max_ev_chars=max_ev_chars,
                 )
                 if new_dels:
-                    updated = dict(retried[idx])
                     updated["dels"] = new_dels
                     updated["ev_del"] = new_ev_del
-                    retried[idx] = updated
+                    changed = True
 
-            # Merge safety/reliability from retry if original was empty
             for field, enum_str in [("safety", SAFETY_ENUM), ("reliability", RELIABILITY_ENUM)]:
                 retry_val = _validate_enum(data.get(field), enum_str)
-                if retry_val not in ("Not Mentioned", "Unknown") and retried[idx].get(field) in ("Not Mentioned", "Unknown", None):
-                    updated = dict(retried[idx])
+                if retry_val not in ("Not Mentioned", "Unknown") and updated.get(field) in ("Not Mentioned", "Unknown", None):
                     updated[field] = retry_val
-                    retried[idx] = updated
-
+                    changed = True
         except Exception as exc:
             logger.debug("Retry failed for review %s: %s", idx, exc)
+            return idx, None, False
+        return idx, updated if changed else None, changed
 
+    done = 0
+    worker_count = max(1, min(int(max_workers or 1), total_candidates))
+    if worker_count == 1:
+        for job in candidates:
+            idx, updated, changed = _process_candidate(job)
+            if updated is not None:
+                retried[idx] = updated
+            done += 1
+            if progress_callback:
+                try:
+                    progress_callback(done, total_candidates, "running")
+                except Exception:
+                    pass
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(_process_candidate, job) for job in candidates]
+            for future in as_completed(futures):
+                idx, updated, changed = future.result()
+                if updated is not None:
+                    retried[idx] = updated
+                done += 1
+                if progress_callback:
+                    try:
+                        progress_callback(done, total_candidates, "running")
+                    except Exception:
+                        pass
+
+    if progress_callback:
+        try:
+            progress_callback(total_candidates, total_candidates, "complete")
+        except Exception:
+            pass
     return retried
+
 
 
 # ---------------------------------------------------------------------------
