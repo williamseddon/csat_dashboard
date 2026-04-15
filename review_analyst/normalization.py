@@ -389,9 +389,9 @@ def _pick_col(df: pd.DataFrame, aliases: List[str]):
     return None
 
 
-REVIEW_ID_ALIASES = ["Event Id", "Event ID", "Review ID", "Review Id", "Verbatim Id", "Verbatim ID", "Id", "review_id"]
-REVIEW_TEXT_ALIASES = ["Review Text", "Review", "Verbatim", "Body", "Content", "review_text"]
-TITLE_ALIASES = ["Title", "Review Title", "Review title", "Headline", "title"]
+REVIEW_ID_ALIASES = ["Event Id", "Event ID", "Review ID", "Review Id", "Id", "review_id"]
+REVIEW_TEXT_ALIASES = ["Review Text", "Review", "Body", "Content", "review_text"]
+TITLE_ALIASES = ["Title", "Review Title", "Headline", "title"]
 RATING_ALIASES = ["Rating (num)", "Rating", "Stars", "Star Rating", "rating"]
 DATE_ALIASES = ["Opened date", "Opened Date", "Submission Time", "Review Date", "Date", "submission_time"]
 LOCAL_META_ALIASES = {
@@ -483,19 +483,19 @@ def normalize_uploaded_df(raw_df: pd.DataFrame, *, source_name: str = "", includ
     working.columns = [str(col).strip() for col in working.columns]
     normalized = pd.DataFrame(index=working.index)
     normalized["review_id"] = _series_alias(working, REVIEW_ID_ALIASES)
-    normalized["product_id"] = _series_alias(working, ["Base SKU", "Model (SKU)", "Model SKU", "Product ID", "Product Id", "ProductId", "BaseSKU"])
-    normalized["base_sku"] = _series_alias(working, ["Base SKU", "Model (SKU)", "Model SKU", "BaseSKU"])
-    normalized["sku_item"] = _series_alias(working, ["SKU Item", "Model (SKU)", "Model SKU", "SKU", "Child SKU", "Variant SKU", "Item Number", "Item No"])
+    normalized["product_id"] = _series_alias(working, ["Base SKU", "Product ID", "Product Id", "ProductId", "BaseSKU"])
+    normalized["base_sku"] = _series_alias(working, ["Base SKU", "BaseSKU"])
+    normalized["sku_item"] = _series_alias(working, ["SKU Item", "SKU", "Child SKU", "Variant SKU", "Item Number", "Item No"])
     normalized["original_product_name"] = _series_alias(working, ["Product Name", "Product", "Name"])
     normalized["review_text"] = _series_alias(working, REVIEW_TEXT_ALIASES)
     normalized["title"] = _series_alias(working, TITLE_ALIASES)
-    normalized["post_link"] = _series_alias(working, ["Post Link", "Web Link", "URL", "Review URL", "Product URL"])
+    normalized["post_link"] = _series_alias(working, ["Post Link", "URL", "Review URL", "Product URL"])
     normalized["rating"] = _series_alias(working, RATING_ALIASES)
     normalized["submission_time"] = _series_alias(working, DATE_ALIASES)
-    normalized["content_locale"] = _series_alias(working, ["Content Locale", "Locale", "Reviewer Location", "Location", "Country"])
+    normalized["content_locale"] = _series_alias(working, ["Content Locale", "Locale", "Location", "Country"])
     normalized["retailer"] = _series_alias(working, ["Retailer", "Merchant", "Channel"])
     normalized["age_group"] = _series_alias(working, ["Age Group", "Age", "Age Range"])
-    normalized["user_location"] = _series_alias(working, ["Reviewer Location", "Location", "Country"])
+    normalized["user_location"] = _series_alias(working, ["Location", "Country"])
     normalized["user_nickname"] = pd.NA
     normalized["total_positive_feedback_count"] = pd.NA
     normalized["is_recommended"] = pd.NA
