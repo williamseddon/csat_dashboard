@@ -137,7 +137,7 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
 
 
 
-def _call_analyst(*, question, overall_df, filtered_df, summary, filter_description, chat_history, persona_name=None, target_words=1200, include_references=False):
+def _call_analyst(*, question, overall_df, filtered_df, summary, filter_description, chat_history, persona_name=None, target_words=1200, include_references=False, freeform_mode=False):
     client = _get_client()
     if client is None:
         raise ReviewDownloaderError("No OpenAI API key configured.")
@@ -146,17 +146,30 @@ def _call_analyst(*, question, overall_df, filtered_df, summary, filter_descript
     ceiling_words = min(2600, int(round(target_words * 1.15)))
     max_tok = _ai_target_token_budget(target_words)
     base_instructions = _persona_instructions(persona_name)
-    length_note = (
-        "RESPONSE LENGTH OVERRIDE: ignore any shorter length caps that may appear earlier in these instructions. "
-        f"Aim for about {target_words:,} words, with a practical range of roughly {floor_words:,} to {ceiling_words:,} words. "
-        "Use detailed evidence, concrete examples, and a full Next Steps section. Do not compress the answer into a short summary unless the user explicitly asks for that."
-    )
+    if freeform_mode:
+        base_instructions = base_instructions.replace(
+            '• End every response with a "**Next Steps**" section: 2–3 concrete actions.',
+            '• In freeform mode, answer in the most natural structure for the question. Use a "**Next Steps**" section only when it genuinely helps.',
+        )
+        length_note = (
+            "FREEFORM MODE: answer the user's actual question directly. Use the requested detail level as a ceiling, not a quota. "
+            f"For simple questions, answer simply. For broader analytical questions, you may expand up to about {target_words:,} words when useful. "
+            "Use compact markdown only when it helps. Do not force a template or fixed section structure."
+        )
+    else:
+        length_note = (
+            "RESPONSE LENGTH OVERRIDE: ignore any shorter length caps that may appear earlier in these instructions. "
+            f"Aim for about {target_words:,} words, with a practical range of roughly {floor_words:,} to {ceiling_words:,} words. "
+            "Use detailed evidence, concrete examples, and a full Next Steps section. Do not compress the answer into a short summary unless the user explicitly asks for that."
+        )
     reference_note = (
         "REFERENCE MODE: include inline evidence references using the exact format (review_ids: 12345, 67890) for material claims."
         if include_references else
         "REFERENCE MODE: do NOT include inline citations, do NOT emit (review_ids: ...), and do NOT add reference callouts in the final answer."
     )
     instructions = base_instructions + "\n\n" + length_note + "\n\n" + reference_note
+    if freeform_mode:
+        instructions += "\n\nFREEFORM ANSWERING: do not force a persona-specific frame. Answer the most natural interpretation of the user's request using the supplied review context. Use structure only when it improves clarity."
     ai_ctx = _build_ai_context(overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, question=question)
     msgs = [{"role": m["role"], "content": m["content"]} for m in list(chat_history)[-8:]]
     msgs.append({"role": "user", "content": f"User request:\n{question}\n\nReview dataset context (JSON):\n{ai_ctx}"})

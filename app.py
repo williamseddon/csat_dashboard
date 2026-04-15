@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import difflib
 import gc
+import hashlib
 import html
 import io
 import ipaddress
@@ -3145,6 +3146,274 @@ def _cumulative_avg_region_trend(df, *, organic_only=False, top_n=None, smoothin
     return trend.sort_values("day").reset_index(drop=True), regions
 
 
+def _first_non_empty(series):
+    for value in series:
+        text = _safe_text(value)
+        if text:
+            return text
+    return ""
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _prepare_source_rating_watch(df, *, organic_only=False, selected_regions=None, combine_regions=True):
+    if df is None or df.empty or "rating" not in df.columns:
+        return pd.DataFrame(), pd.DataFrame(), []
+
+    w = df.copy()
+    w["rating"] = pd.to_numeric(w.get("rating"), errors="coerce")
+    w = w.dropna(subset=["rating"]).copy()
+    if w.empty:
+        return pd.DataFrame(), pd.DataFrame(), []
+
+    if organic_only and "incentivized_review" in w.columns:
+        w = w[~w["incentivized_review"].fillna(False)].copy()
+    if w.empty:
+        return pd.DataFrame(), pd.DataFrame(), []
+
+    locale_series = w.get("content_locale", pd.Series(index=w.index, dtype="object")).fillna("").astype(str)
+    w["region"] = locale_series.map(_locale_to_region_label).fillna("Unknown")
+    known_regions = [r for r in sorted(set(w["region"])) if r and r != "Unknown"]
+
+    if known_regions and selected_regions:
+        selected = [str(r) for r in selected_regions if str(r) in known_regions]
+        if selected:
+            w = w[w["region"].isin(selected)].copy()
+    if w.empty:
+        return pd.DataFrame(), pd.DataFrame(), known_regions
+
+    retailer = w.get("retailer", pd.Series(index=w.index, dtype="object")).fillna("").astype(str).str.strip()
+    source_system = w.get("source_system", pd.Series(index=w.index, dtype="object")).fillna("").astype(str).str.strip()
+    w["retailer"] = retailer
+    w["source_system"] = source_system
+    w["source_label"] = retailer.mask(retailer.eq(""), source_system)
+    w.loc[w["source_label"].eq(""), "source_label"] = "Unknown Source"
+
+    if "submission_time" in w.columns:
+        w["submission_time"] = pd.to_datetime(w["submission_time"], errors="coerce", utc=True)
+    else:
+        w["submission_time"] = pd.NaT
+    anchor_time = w["submission_time"].dropna().max() if w["submission_time"].notna().any() else pd.Timestamp.now(tz="UTC")
+    recent_cutoff = anchor_time - pd.Timedelta(days=30)
+    w["_recent"] = w["submission_time"].notna() & (w["submission_time"] >= recent_cutoff)
+
+    group_cols = ["source_label"] if combine_regions or not known_regions else ["region", "source_label"]
+
+    agg = (
+        w.groupby(group_cols, dropna=False)
+        .agg(
+            retailer=("retailer", _first_non_empty),
+            source_system=("source_system", _first_non_empty),
+            reviews=("rating", "size"),
+            avg_rating=("rating", "mean"),
+        )
+        .reset_index()
+    )
+    recent = (
+        w[w["_recent"]]
+        .groupby(group_cols, dropna=False)
+        .agg(recent_reviews=("rating", "size"), recent_avg_rating=("rating", "mean"))
+        .reset_index()
+    )
+    table = agg.merge(recent, on=group_cols, how="left")
+    table["recent_reviews"] = pd.to_numeric(table.get("recent_reviews"), errors="coerce").fillna(0).astype(int)
+    table["recent_avg_rating"] = pd.to_numeric(table.get("recent_avg_rating"), errors="coerce")
+    table["delta_30d"] = np.where(table["recent_reviews"] >= 3, table["recent_avg_rating"] - table["avg_rating"], np.nan)
+    table["share_of_view"] = pd.to_numeric(table["reviews"], errors="coerce").fillna(0) / max(len(w), 1)
+    table["signal"] = ""
+    table.loc[(table["recent_reviews"] >= 5) & (table["delta_30d"] <= -0.20), "signal"] = "Recent rating down"
+    table.loc[(table["signal"] == "") & (table["reviews"] >= 10) & (table["avg_rating"] <= 3.80), "signal"] = "Low baseline"
+    sort_cols = ["region", "avg_rating"] if "region" in table.columns else ["avg_rating"]
+    ascending = [True, False] if "region" in table.columns else [False]
+    table = table.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+
+    if known_regions:
+        region_kpis = (
+            w.groupby("region", dropna=False)
+            .agg(reviews=("rating", "size"), avg_rating=("rating", "mean"))
+            .reset_index()
+        )
+        region_recent = (
+            w[w["_recent"]]
+            .groupby("region", dropna=False)
+            .agg(recent_reviews=("rating", "size"), recent_avg_rating=("rating", "mean"))
+            .reset_index()
+        )
+        region_kpis = region_kpis.merge(region_recent, on="region", how="left")
+        region_kpis["recent_reviews"] = pd.to_numeric(region_kpis.get("recent_reviews"), errors="coerce").fillna(0).astype(int)
+        region_kpis["delta_30d"] = np.where(region_kpis["recent_reviews"] >= 3, region_kpis["recent_avg_rating"] - region_kpis["avg_rating"], np.nan)
+        region_kpis = region_kpis.sort_values(["reviews", "avg_rating"], ascending=[False, False]).reset_index(drop=True)
+        region_kpis.rename(columns={"region": "Region"}, inplace=True)
+    else:
+        region_kpis = pd.DataFrame(columns=["Region", "reviews", "avg_rating", "recent_reviews", "recent_avg_rating", "delta_30d"])
+
+    overall_recent_df = w[w["_recent"]]
+    overall_recent_avg = pd.to_numeric(overall_recent_df.get("rating"), errors="coerce").mean() if not overall_recent_df.empty else np.nan
+    overall_recent_reviews = int(len(overall_recent_df))
+    overall_delta = overall_recent_avg - float(w["rating"].mean()) if overall_recent_reviews >= 3 and pd.notna(overall_recent_avg) else np.nan
+    overall_row = pd.DataFrame(
+        [{
+            "Region": "All selected",
+            "reviews": int(len(w)),
+            "avg_rating": float(w["rating"].mean()),
+            "recent_reviews": overall_recent_reviews,
+            "recent_avg_rating": overall_recent_avg,
+            "delta_30d": overall_delta,
+        }]
+    )
+    region_kpis = pd.concat([overall_row, region_kpis], ignore_index=True)
+    rename_map = {
+        "region": "Region",
+        "source_label": "Source",
+        "retailer": "Retailer",
+        "source_system": "Source System",
+        "reviews": "Reviews",
+        "avg_rating": "Avg Rating",
+        "recent_reviews": "Last 30d Reviews",
+        "recent_avg_rating": "Last 30d Avg",
+        "delta_30d": "30d Delta",
+        "share_of_view": "Share of View",
+        "signal": "Signal",
+    }
+    table = table.rename(columns=rename_map)
+    return table, region_kpis, known_regions
+
+
+def _source_rating_watch_export_bytes(table_df, region_kpis_df, *, split_by_region=False, organic_only=False):
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        pd.DataFrame(
+            [{
+                "Generated At UTC": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "Organic only": bool(organic_only),
+                "Split by region": bool(split_by_region),
+            }]
+        ).to_excel(writer, sheet_name="Config", index=False)
+        region_kpis_df.to_excel(writer, sheet_name="Region Summary", index=False)
+        if split_by_region and "Region" in table_df.columns:
+            for region, sub in table_df.groupby("Region", sort=False):
+                sub.to_excel(writer, sheet_name=str(region or "Region")[:31], index=False)
+        else:
+            table_df.to_excel(writer, sheet_name="Retailer Ratings", index=False)
+    out.seek(0)
+    return out.getvalue()
+
+
+def _render_source_rating_watch(df):
+    with st.container(border=True):
+        st.markdown("<div class='section-title'>🏪 Retailer rating watch</div>", unsafe_allow_html=True)
+        st.markdown("<div class='section-sub'>Spot smoke by retailer and region. Track average rating, review count, and whether the most recent 30-day window is drifting down.</div>", unsafe_allow_html=True)
+
+        preview_table, _, known_regions = _prepare_source_rating_watch(df, organic_only=False, selected_regions=None, combine_regions=True)
+        if preview_table.empty:
+            st.info("No rating data available for retailer watch.")
+            return
+
+        c0, c1, c2 = st.columns([1, 1.4, 1])
+        organic_only = c0.toggle("Organic only", value=False, key="retailer_watch_organic_only")
+        if known_regions:
+            selected_regions = c1.multiselect("Regions", known_regions, default=known_regions, key="retailer_watch_regions")
+            combine_regions = c2.radio("View", ["All combined", "Split by region"], horizontal=True, key="retailer_watch_view") == "All combined"
+        else:
+            selected_regions = []
+            combine_regions = True
+            c1.markdown("<div class='status-note'>Region metadata is not present in this workspace, so the table is shown combined.</div>", unsafe_allow_html=True)
+
+        table_df, region_kpis_df, _ = _prepare_source_rating_watch(
+            df,
+            organic_only=organic_only,
+            selected_regions=selected_regions,
+            combine_regions=combine_regions,
+        )
+        if table_df.empty:
+            st.info("No reviews match the current retailer-watch selection.")
+            return
+
+        metric_cards = []
+        for _, row in region_kpis_df.iterrows():
+            delta = row.get("delta_30d")
+            delta_txt = ""
+            if pd.notna(delta):
+                direction = "up" if float(delta) > 0 else "down"
+                delta_txt = f" · 30d {direction} {abs(float(delta)):.2f}★"
+            avg_value = float(row.get("avg_rating")) if pd.notna(row.get("avg_rating")) else 0.0
+            metric_cards.append(
+                f"<span class='dashboard-pill'><span class='meta'>{_esc(row.get('Region'))}</span><strong>{avg_value:.2f}★</strong><span class='meta'>{int(row.get('reviews') or 0):,} reviews{delta_txt}</span></span>"
+            )
+        st.markdown("<div class='dashboard-brief'><div class='dashboard-brief-title'>Region average rating snapshot</div><div class='dashboard-brief-row'>" + "".join(metric_cards) + "</div></div>", unsafe_allow_html=True)
+
+        chart_df = table_df.copy()
+        chart_df["Avg Rating"] = pd.to_numeric(chart_df.get("Avg Rating"), errors="coerce")
+        order_source = (
+            chart_df.groupby("Source", as_index=False)["Avg Rating"]
+            .mean()
+            .sort_values("Avg Rating", ascending=False)["Source"]
+            .tolist()
+        )
+        if "Region" in chart_df.columns:
+            fig = px.bar(
+                chart_df,
+                x="Source",
+                y="Avg Rating",
+                color="Region",
+                barmode="group",
+                category_orders={"Source": order_source},
+                hover_data={"Reviews": True, "Last 30d Avg": ":.2f", "30d Delta": ":.2f", "Share of View": ":.1%"},
+            )
+        else:
+            fig = px.bar(
+                chart_df,
+                x="Source",
+                y="Avg Rating",
+                category_orders={"Source": order_source},
+                hover_data={"Reviews": True, "Last 30d Avg": ":.2f", "30d Delta": ":.2f", "Share of View": ":.1%"},
+            )
+            fig.update_traces(marker_color="#3b82f6")
+        overall_avg = float(region_kpis_df.iloc[0]["avg_rating"]) if not region_kpis_df.empty else None
+        if overall_avg is not None and not math.isnan(overall_avg):
+            fig.add_hline(y=overall_avg, line_dash="dot", line_color="rgba(71,85,105,0.8)", annotation_text=f"Selected avg {overall_avg:.2f}★", annotation_position="top left")
+        fig.update_layout(
+            title=None,
+            margin=dict(l=20, r=18, t=18, b=60),
+            xaxis_title="",
+            yaxis_title="Average rating ★",
+            height=360,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            font_family="Inter",
+            legend=dict(orientation="h", y=-0.22, x=0, xanchor="left"),
+        )
+        fig = _sw_style_fig(fig)
+        _show_plotly(fig)
+
+        display_df = table_df.copy()
+        if "Region" in display_df.columns:
+            display_cols = ["Region", "Source", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Share of View", "Signal", "Retailer", "Source System"]
+        else:
+            display_cols = ["Source", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Share of View", "Signal", "Retailer", "Source System"]
+        display_df["Avg Rating"] = pd.to_numeric(display_df["Avg Rating"], errors="coerce").round(2)
+        display_df["Last 30d Avg"] = pd.to_numeric(display_df["Last 30d Avg"], errors="coerce").round(2)
+        display_df["30d Delta"] = pd.to_numeric(display_df["30d Delta"], errors="coerce").round(2)
+        export_df = display_df[display_cols].copy()
+        export_bytes = _source_rating_watch_export_bytes(export_df, region_kpis_df, split_by_region=("Region" in display_df.columns), organic_only=organic_only)
+        display_render_df = export_df.copy()
+        display_render_df["Share of View"] = pd.to_numeric(display_render_df["Share of View"], errors="coerce").map(lambda v: f"{v:.1%}" if pd.notna(v) else "")
+        st.download_button(
+            "⬇️ Export retailer rating watch",
+            data=export_bytes,
+            file_name="retailer_rating_watch.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=False,
+            key="retailer_rating_watch_export",
+        )
+
+        if "Region" in display_render_df.columns:
+            for region, sub in display_render_df.groupby("Region", sort=False):
+                st.markdown(f"<div class='section-sub' style='margin-top:.75rem;'><strong>{_esc(region)}</strong></div>", unsafe_allow_html=True)
+                st.dataframe(sub[display_cols[1:]], use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(display_render_df[display_cols], use_container_width=True, hide_index=True)
+
+
 def _build_volume_bar_series(trend, volume_mode):
     if trend is None or trend.empty:
         return pd.DataFrame(columns=["x", "volume", "width_ms", "label"]), "Reviews/day"
@@ -4602,7 +4871,7 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
     return full_json
 
 
-def _call_analyst(*, question, overall_df, filtered_df, summary, filter_description, chat_history, persona_name=None, target_words=1200, include_references=False):
+def _call_analyst(*, question, overall_df, filtered_df, summary, filter_description, chat_history, persona_name=None, target_words=1200, include_references=False, freeform_mode=False):
     client = _get_client()
     if client is None:
         raise ReviewDownloaderError("No OpenAI API key configured.")
@@ -4611,11 +4880,22 @@ def _call_analyst(*, question, overall_df, filtered_df, summary, filter_descript
     ceiling_words = min(2600, int(round(target_words * 1.15)))
     max_tok = _ai_target_token_budget(target_words)
     base_instructions = _persona_instructions(persona_name)
-    length_note = (
-        "RESPONSE LENGTH OVERRIDE: ignore any shorter length caps that may appear earlier in these instructions. "
-        f"Aim for about {target_words:,} words, with a practical range of roughly {floor_words:,} to {ceiling_words:,} words. "
-        "Use detailed evidence, concrete examples, and a full Next Steps section. Do not compress the answer into a short summary unless the user explicitly asks for that."
-    )
+    if freeform_mode:
+        base_instructions = base_instructions.replace(
+            '• End every response with a "**Next Steps**" section: 2–3 concrete actions.',
+            '• In freeform mode, answer in the most natural structure for the question. Use a "**Next Steps**" section only when it genuinely helps.',
+        )
+        length_note = (
+            "FREEFORM MODE: answer the user's actual question directly. Use the requested detail level as a ceiling, not a quota. "
+            f"For simple questions, answer simply. For broader analytical questions, you may expand up to about {target_words:,} words when useful. "
+            "Use compact markdown only when it helps. Do not force a template or fixed section structure."
+        )
+    else:
+        length_note = (
+            "RESPONSE LENGTH OVERRIDE: ignore any shorter length caps that may appear earlier in these instructions. "
+            f"Aim for about {target_words:,} words, with a practical range of roughly {floor_words:,} to {ceiling_words:,} words. "
+            "Use detailed evidence, concrete examples, and a full Next Steps section. Do not compress the answer into a short summary unless the user explicitly asks for that."
+        )
     reference_note = (
         "REFERENCE MODE: include inline evidence references using the exact format (review_ids: 12345, 67890) for material claims."
         if include_references else
@@ -4627,6 +4907,8 @@ def _call_analyst(*, question, overall_df, filtered_df, summary, filter_descript
         "If the data is thin or mixed, say that clearly instead of overcommitting."
     )
     instructions = base_instructions + "\n\n" + length_note + "\n\n" + reference_note + "\n\n" + quality_note
+    if freeform_mode:
+        instructions += "\n\nFREEFORM ANSWERING: do not force a persona-specific frame. Answer the most natural interpretation of the user's request using the supplied review context. Use structure only when it improves clarity."
     ai_ctx = _build_ai_context(overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, question=question)
     msgs = [{"role": m["role"], "content": m["content"]} for m in list(chat_history)[-8:]]
     msgs.append({"role": "user", "content": f"User request:\n{question}\n\nReview dataset context (JSON):\n{ai_ctx}"})
@@ -6480,18 +6762,111 @@ def _historical_symptom_counts_from_workspace(
 
     return dict(det_counts), dict(del_counts)
 
+
+def _symptomizer_cache_signature(
+    *,
+    allowed_detractors: Sequence[str],
+    allowed_delighters: Sequence[str],
+    aliases: Optional[Dict[str, List[str]]] = None,
+    detractor_specs: Optional[Sequence[Any]] = None,
+    delighter_specs: Optional[Sequence[Any]] = None,
+    product_profile: str = "",
+    product_knowledge: Any = None,
+    max_ev_chars: int = 120,
+    include_universal_neutral: bool = True,
+    taxonomy_category: str = "general",
+    v4_enabled: bool = True,
+) -> str:
+    """Build a stable fingerprint of the active symptomizer prompt context."""
+
+    def _default(value: Any) -> Any:
+        if isinstance(value, set):
+            return sorted(str(v) for v in value)
+        if hasattr(value, "__dict__"):
+            return value.__dict__
+        return str(value)
+
+    payload = {
+        "allowed_detractors": list(_normalize_tag_list(list(allowed_detractors or []))),
+        "allowed_delighters": list(_normalize_tag_list(list(allowed_delighters or []))),
+        "aliases": aliases or {},
+        "detractor_specs": list(detractor_specs or []),
+        "delighter_specs": list(delighter_specs or []),
+        "product_profile": _safe_text(product_profile),
+        "product_knowledge": product_knowledge or {},
+        "max_ev_chars": int(max_ev_chars or 0),
+        "include_universal_neutral": bool(include_universal_neutral),
+        "taxonomy_category": _safe_text(taxonomy_category) or "general",
+        "v4_enabled": bool(v4_enabled),
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=_default, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:24]
+
+
+def _invalidate_symptomizer_cache_if_needed(
+    *,
+    allowed_detractors: Sequence[str],
+    allowed_delighters: Sequence[str],
+    aliases: Optional[Dict[str, List[str]]] = None,
+    detractor_specs: Optional[Sequence[Any]] = None,
+    delighter_specs: Optional[Sequence[Any]] = None,
+    product_profile: str = "",
+    product_knowledge: Any = None,
+    max_ev_chars: int = 120,
+    include_universal_neutral: bool = True,
+    taxonomy_category: str = "general",
+    v4_enabled: bool = True,
+) -> None:
+    """Clear the session symptomizer cache when the active prompt context changes."""
+
+    if not _HAS_SYMPTOMIZER_V3:
+        return
+
+    signature = _symptomizer_cache_signature(
+        allowed_detractors=allowed_detractors,
+        allowed_delighters=allowed_delighters,
+        aliases=aliases,
+        detractor_specs=detractor_specs,
+        delighter_specs=delighter_specs,
+        product_profile=product_profile,
+        product_knowledge=product_knowledge,
+        max_ev_chars=max_ev_chars,
+        include_universal_neutral=include_universal_neutral,
+        taxonomy_category=taxonomy_category,
+        v4_enabled=v4_enabled,
+    )
+    previous = st.session_state.get("_sym_cache_signature")
+    if previous != signature:
+        _v3_result_cache.clear()
+        st.session_state["_sym_cache_signature"] = signature
+        if previous:
+            _log.info("Symptomizer cache cleared after prompt context change")
+
 def _call_symptomizer_batch(*, client, items, allowed_delighters, allowed_detractors,
                              product_profile="", product_knowledge=None, max_ev_chars=120, aliases=None, include_universal_neutral=True):
     if not items:
         return {}
     _det_specs = st.session_state.get("sym_detractor_specs", [])
     _del_specs = st.session_state.get("sym_delighter_specs", [])
+    _use_v4 = bool(st.session_state.get("sym_v4_pipeline", True))
+    _invalidate_symptomizer_cache_if_needed(
+        allowed_detractors=allowed_detractors,
+        allowed_delighters=allowed_delighters,
+        aliases=aliases,
+        detractor_specs=_det_specs or None,
+        delighter_specs=_del_specs or None,
+        product_profile=product_profile,
+        product_knowledge=product_knowledge,
+        max_ev_chars=max_ev_chars,
+        include_universal_neutral=include_universal_neutral,
+        taxonomy_category=st.session_state.get("sym_taxonomy_category", "general"),
+        v4_enabled=_use_v4,
+    )
     _hist_det_counts, _hist_del_counts = _historical_symptom_counts_from_workspace(
         allowed_detractors=allowed_detractors,
         allowed_delighters=allowed_delighters,
     )
 
-    _use_v4 = bool(st.session_state.get("sym_v4_pipeline", True))
     if _HAS_SYMPTOMIZER_V3 and _use_v4:
         from review_analyst.symptomizer import tag_review_batch_v4
         return tag_review_batch_v4(
@@ -7624,7 +7999,7 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
         st.divider()
         st.markdown("""<div class='sidebar-scope-card sidebar-scope-card--feature'>
           <div class='sidebar-scope-title'>Beta feature</div>
-          <div class='sidebar-scope-value'>Open the Social Listening demo route when you want to preview the mocked Meltwater-style workflow.</div>
+          <div class='sidebar-scope-value'>Open the Social Listening beta route when you want to preview the placeholder Meltwater-style workflow and five-module analysis experience.</div>
         </div>""", unsafe_allow_html=True)
         social_btn_kwargs = {"use_container_width": True, "key": "sidebar_open_social_beta"}
         if current_tab == TAB_SOCIAL_LISTENING:
@@ -8662,6 +9037,7 @@ def _render_dashboard(filtered_df, overall_df=None):
     st.markdown("<div style='height:.3rem'></div>", unsafe_allow_html=True)
     _render_dashboard_snapshot(chart_df, od)
     _render_reviews_over_time_chart(chart_df)
+    _render_source_rating_watch(chart_df)
 
     st.markdown("<div style='height:.75rem'></div>", unsafe_allow_html=True)
     _render_symptom_dashboard(chart_df, od)
@@ -9631,20 +10007,34 @@ The tagger reads more than the main review body — it may use pros, cons, comme
         checkpoint_every = 2 if total_batches > 2 else 1
 
         if _MAX_WORKERS > 1 and len(bidxs) > 1:
-            status.info(f"Tagging {total_n:,} reviews across {len(bidxs)} batches ({_MAX_WORKERS} concurrent)…")
-            with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-                futures = {executor.submit(_process_one_batch, bp): bp for bp in batch_inputs}
-                for future in as_completed(futures):
-                    result = future.result()
+            status.info(f"Tagging {total_n:,} reviews across {len(bidxs)} batches in adaptive waves ({_MAX_WORKERS} concurrent)…")
+            for wave_start in range(0, len(batch_inputs), _MAX_WORKERS):
+                wave = batch_inputs[wave_start:wave_start + _MAX_WORKERS]
+                wave_results = []
+                with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(wave))) as executor:
+                    futures = {executor.submit(_process_one_batch, bp): bp for bp in wave}
+                    for future in as_completed(futures):
+                        wave_results.append(future.result())
+                for result in sorted(wave_results, key=lambda x: x[0]):
                     all_batch_results.append(result)
-                    done_batches = len(all_batch_results)
-                    prep_progress = 0.65 * (done_batches / max(len(bidxs), 1))
-                    prog.progress(prep_progress, text=f"Batch {done_batches}/{len(bidxs)} complete")
+                    if _label_tracker:
+                        try:
+                            _label_tracker.record_batch(result[2])
+                        except Exception:
+                            pass
+                done_batches = len(all_batch_results)
+                prep_progress = 0.65 * (done_batches / max(len(bidxs), 1))
+                prog.progress(prep_progress, text=f"Batch {done_batches}/{len(bidxs)} complete")
         else:
             status.info(f"Tagging {total_n:,} reviews across {len(bidxs)} batch{'es' if len(bidxs) != 1 else ''}…")
             for bp in batch_inputs:
                 result = _process_one_batch(bp)
                 all_batch_results.append(result)
+                if _label_tracker:
+                    try:
+                        _label_tracker.record_batch(result[2])
+                    except Exception:
+                        pass
                 done_batches = len(all_batch_results)
                 prep_progress = 0.65 * (done_batches / max(len(bidxs), 1))
                 prog.progress(prep_progress, text=f"Batch {done_batches}/{len(bidxs)} complete")
@@ -9707,7 +10097,6 @@ The tagger reads more than the main review body — it may use pros, cons, comme
                 + (f" · ⚠️ {failed_count} failed" if failed_count > 0 else "")
             ]
             if _label_tracker:
-                _label_tracker.record_batch(outs)
                 alerts = _label_tracker.check_alerts(min_reviews=batch_size * 3)
                 for alert in alerts[:3]:
                     if alert["issue"] == "too_broad":
@@ -9722,7 +10111,17 @@ The tagger reads more than the main review body — it may use pros, cons, comme
             if bi % 4 == 0 or bi == total_batches:
                 gc.collect()
 
-        follow_up_candidates = sum(1 for rec in processed_local if (not rec.get("wrote_dets")) or (not rec.get("wrote_dels")))
+        def _needs_sparse_follow_up(rec):
+            if not _HAS_SYMPTOMIZER_V3:
+                return (not rec.get("wrote_dets")) or (not rec.get("wrote_dels"))
+            if rec.get("idx") not in updated_df.index:
+                return (not rec.get("wrote_dets")) or (not rec.get("wrote_dels"))
+            source_row = updated_df.loc[rec.get("idx")]
+            review_text = _symptomizer_review_text(source_row)
+            needs_det, needs_del = _v3_gate_polarity(source_row.get("rating"), review_text)
+            return (needs_det and not rec.get("wrote_dets")) or (needs_del and not rec.get("wrote_dels"))
+
+        follow_up_candidates = sum(1 for rec in processed_local if _needs_sparse_follow_up(rec))
         status.info(
             "Tagging complete. Finalizing results"
             + (f" · focused follow-up is checking {follow_up_candidates:,} under-tagged review(s)" if follow_up_candidates else "")
@@ -10464,7 +10863,7 @@ def main():
               <div class='app-title'>StarWalk Review Analyst</div>
               <span class='beta-chip'>Beta</span>
             </div>
-            <div class='app-subtitle'>Single-file Streamlit workspace for executive review, deep-dive exploration, Review Prompt, Symptomizer, and a demo Social Listening studio that previews the future Meltwater + AI workflow even before live sources are wired.</div>
+            <div class='app-subtitle'>Single-file Streamlit workspace for executive review, deep-dive exploration, Review Prompt, Symptomizer, and a placeholder Social Listening Beta route that works even before reviews exist.</div>
           </div>
         </div>
       </div>
@@ -10752,14 +11151,14 @@ def main():
         active_tab = st.session_state.get("workspace_active_tab", TAB_DASHBOARD)
         if active_tab == TAB_SOCIAL_LISTENING:
             st.markdown("""<div class='soft-panel' style='margin-top:.55rem;'>
-              <b>Social-only beta mode</b> · No uploaded review file is required here. The demo Social Listening studio below previews the future Meltwater + AI workflow with polished placeholder content while live source rules are still being finalized.
+              <b>Social-only beta mode</b> · No uploaded review file is required here. The placeholder social experience below previews the future Meltwater-powered workflow before Bazaarvoice / PowerReviews / uploads are brought in.
             </div>""", unsafe_allow_html=True)
             _render_social_listening_tab()
             return
         st.markdown("""<div class='empty-state-card'>
           <div style="font-size:2.5rem;margin-bottom:.75rem;">📊</div>
           <div class='empty-state-title' style="font-size:16px;">No workspace loaded</div>
-          <div class='empty-state-sub'>Build a workspace above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer. Or skip reviews entirely and open <b>Social Listening Beta</b> from the sidebar to explore the demo social studio and preview the future Meltwater + AI experience.</div>
+          <div class='empty-state-sub'>Build a workspace above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer. Or skip reviews entirely and open <b>Social Listening Beta</b> from the sidebar to explore the placeholder Meltwater + AI social workflow.</div>
         </div>""", unsafe_allow_html=True)
         if st.button("📣 Open Social Listening Beta", type="primary", key="empty_state_open_social"):
             st.session_state["workspace_active_tab"] = TAB_SOCIAL_LISTENING
@@ -10829,14 +11228,16 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
     product_label = _product_name(summary, overall_df if isinstance(overall_df, pd.DataFrame) else pd.DataFrame())
 
     focus_options = [
+        "General",
         "Action plan",
         "Root cause",
         "Consumer language",
         "Product / CX opportunities",
     ]
-    if st.session_state.get("bottom_chat_focus") not in focus_options:
-        default_focus = "Root cause" if active_tab == TAB_SYMPTOMIZER else "Action plan"
-        st.session_state["bottom_chat_focus"] = default_focus
+    focus_version_key = "_bottom_chat_focus_default_v3"
+    if st.session_state.get(focus_version_key) != 3 or st.session_state.get("bottom_chat_focus") not in focus_options:
+        st.session_state["bottom_chat_focus"] = "General"
+        st.session_state[focus_version_key] = 3
     answer_styles = ["Actionable", "Balanced", "Deep dive"]
     if st.session_state.get("bottom_chat_answer_style") not in answer_styles:
         st.session_state["bottom_chat_answer_style"] = "Balanced"
@@ -10847,7 +11248,7 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
             st.markdown("### Ask AI about this product or workspace")
             st.caption(
                 "Grounded in the active filters, current symptom tags, product knowledge, and recent review evidence. "
-                "Use it for sharper summaries, root-cause hypotheses, action plans, consumer-language synthesis, and what-to-do-next guidance."
+                "Leave AI mode on General for open-ended questions, or switch to a guided mode when you want a sharper action-plan, root-cause, language, or opportunity frame."
             )
         with top_right:
             if st.button("Clear chat", key="bottom_chat_clear", use_container_width=True, disabled=not chat_messages):
@@ -10871,10 +11272,10 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
 
         ctl1, ctl2 = st.columns([1.25, 1.0])
         focus = ctl1.selectbox(
-            "AI focus",
+            "AI mode",
             options=focus_options,
             key="bottom_chat_focus",
-            help="Steers the answer toward a stronger action plan, root-cause readout, consumer-language summary, or opportunity framing.",
+            help="General is the default for freeform Q&A. Switch modes only when you want the answer intentionally framed as an action plan, root-cause readout, consumer-language summary, or opportunity scan.",
         )
         answer_style = ctl2.selectbox(
             "Answer style",
@@ -10902,23 +11303,23 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
             suggestions = []
             if has_symptoms:
                 suggestions.extend([
+                    "What is the general story in this view?",
                     "Which detractors deserve action first in this view?",
                     "What are the likely root causes behind the top detractors?",
                     "What do the strongest delighters suggest we should protect?",
-                    "Turn this view into a prioritized action plan for product and CX",
                 ])
             elif view_reviews > 0:
                 suggestions.extend([
+                    "What is the general story in this filtered view?",
                     "Summarize the biggest complaints in this filtered view",
                     "What are the clearest consumer themes here?",
                     "What separates the low-star reviews from the high-star reviews?",
-                    "What should I investigate next before symptomizing?",
                 ])
             else:
                 suggestions = [
                     "How should I use this workspace?",
+                    "Give me the general story here",
                     "What should I look for first?",
-                    "What should I export next?",
                     "How does the Symptomizer help here?",
                 ]
             rows = [suggestions[i:i + 2] for i in range(0, min(len(suggestions), 4), 2)]
@@ -10942,18 +11343,21 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
             return
 
         persona_map = {
+            "General": None,
             "Action plan": "Product Development",
             "Root cause": "Quality Engineer",
             "Consumer language": "Consumer Insights",
             "Product / CX opportunities": "Product Development",
         }
         focus_instructions = {
+            "General": "Answer the question directly using the current workspace and filtered view. Stay flexible and only impose structure when it helps the user.",
             "Action plan": "Prioritize what should happen now, next, and later. Be specific about product, CX, ops, or messaging actions.",
             "Root cause": "Explain the most likely failure modes, workflow friction, or taxonomy-level causes behind the patterns in this view. Separate confirmed evidence from inference.",
             "Consumer language": "Summarize the actual consumer language, emotional tone, and repeated phrasing. Highlight what customers care about and how they describe it.",
             "Product / CX opportunities": "Convert the current view into opportunity areas for product, support, onboarding, merchandising, retention, or messaging.",
         }
         response_scaffolds = {
+            "General": "",
             "Action plan": "Structure the answer as: What matters most; Prioritized actions (Now / Next / Later); Risks or dependencies; What to monitor next.",
             "Root cause": "Structure the answer as: What is happening; Most likely root causes; Evidence supporting each cause; What is still uncertain; What to verify next.",
             "Consumer language": "Structure the answer as: What customers keep saying; Emotional tone; Repeated phrases or ideas; Messaging implications; Quotes or examples only when they add value.",
@@ -10964,17 +11368,26 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
             "Balanced": "Balance diagnosis with recommendations. Include enough explanation to make the actions credible.",
             "Deep dive": "Go deeper on tradeoffs, evidence, uncertainty, and second-order implications."
         }
-        target_words = {"Actionable": 260, "Balanced": 430, "Deep dive": 650}.get(answer_style, 430)
-        enriched_prompt = (
-            f"{prompt}\n\n"
-            f"Focus mode: {focus}.\n"
-            f"Answer style: {answer_style}.\n"
-            f"Special instruction: {focus_instructions.get(focus, '')}\n"
-            f"Response format: {response_scaffolds.get(focus, '')}\n"
-            f"Style instruction: {style_instructions.get(answer_style, '')}\n"
-            "Ground the answer in the current filtered view and current workspace. Quantify where possible, separate evidence from inference, avoid generic advice, and end with concrete next steps. "
-            "Prefer named symptom themes, concrete consumer language, and likely owner-level actions over broad summaries."
+        general_target_words = {"Actionable": 220, "Balanced": 340, "Deep dive": 520}
+        guided_target_words = {"Actionable": 260, "Balanced": 430, "Deep dive": 650}
+        target_words = (general_target_words if focus == "General" else guided_target_words).get(answer_style, 340 if focus == "General" else 430)
+        grounding_note = (
+            "Ground the answer in the current filtered view and current workspace. Quantify where possible, separate evidence from inference, avoid generic advice, and answer simple questions plainly when the data supports them. "
+            "Use named symptom themes, concrete consumer language, and likely owner-level actions when they are relevant to the question."
         )
+        prompt_parts = [
+            prompt,
+            f"Mode: {focus}.",
+            f"Answer style: {answer_style}.",
+            f"Special instruction: {focus_instructions.get(focus, '')}",
+            f"Style instruction: {style_instructions.get(answer_style, '')}",
+            grounding_note,
+        ]
+        if focus != "General" and response_scaffolds.get(focus):
+            prompt_parts.insert(4, f"Response format: {response_scaffolds.get(focus, '')}")
+        else:
+            prompt_parts.insert(4, "Response format: Freeform. Answer naturally and only add sections when they improve clarity.")
+        enriched_prompt = "\n\n".join(part for part in prompt_parts if part)
 
         st.session_state.setdefault("chat_messages", []).append({"role": "user", "content": prompt})
         with st.spinner("Thinking through the current view…"):
@@ -10989,6 +11402,7 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
                     persona_name=persona_map.get(focus),
                     target_words=target_words,
                     include_references=bool(st.session_state.get("ai_include_references", False)),
+                    freeform_mode=(focus == "General"),
                 )
                 st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
             except Exception as exc:

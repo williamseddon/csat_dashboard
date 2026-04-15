@@ -97,10 +97,36 @@ class ResultCache:
         return {"size": len(self._store), "hits": self._hits, "misses": self._misses}
 
     @staticmethod
-    def catalog_hash(detractors: Sequence[str], delighters: Sequence[str]) -> str:
-        """Deterministic hash of the catalog for cache keying."""
-        raw = "|".join(sorted(str(d).lower() for d in detractors)) + "||" + "|".join(sorted(str(d).lower() for d in delighters))
-        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    def catalog_hash(
+        detractors: Sequence[str],
+        delighters: Sequence[str],
+        **context: Any,
+    ) -> str:
+        """Deterministic hash of the active tagging context for cache keying.
+
+        The early cache only keyed on the flat label lists, which meant a run
+        could incorrectly reuse stale outputs after changing aliases, guidance
+        specs, product knowledge, prompt context, or evidence settings.
+        Including those prompt-shaping inputs keeps the cache fast without
+        leaking prior decisions into materially different runs.
+        """
+
+        def _stable(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {str(key): _stable(value[key]) for key in sorted(value)}
+            if isinstance(value, (list, tuple, set)):
+                return [_stable(v) for v in value]
+            if hasattr(value, "__dict__"):
+                return _stable(value.__dict__)
+            return str(value)
+
+        payload = {
+            "detractors": [str(d).strip().lower() for d in (detractors or []) if str(d).strip()],
+            "delighters": [str(d).strip().lower() for d in (delighters or []) if str(d).strip()],
+            "context": _stable(context),
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
 # Module-level singleton — lives for the Streamlit session
@@ -602,6 +628,103 @@ def match_label(
     return None
 
 
+def rank_candidate_labels(
+    raw: str,
+    allowed: Sequence[str],
+    aliases: Optional[Mapping[str, Sequence[str]]] = None,
+    *,
+    cutoff: float = 0.42,
+    top_k: int = 5,
+) -> List[Tuple[str, float]]:
+    """Score likely catalog matches for free-text claim routing.
+
+    This is intentionally more permissive than :func:`match_label`. The staged
+    pipeline uses it to shortlist plausible taxonomy labels from an extracted
+    claim or aspect phrase, then chooses the best candidate deterministically.
+    """
+
+    if not raw or not allowed:
+        return []
+
+    raw_s = str(raw or "").strip()
+    if not raw_s:
+        return []
+    raw_lower = raw_s.lower()
+    raw_canon = _canon_alpha(raw_s)
+    raw_stems = _tokenize_stemmed(raw_s)
+    scores: Dict[str, float] = {}
+    order_map = {str(label): idx for idx, label in enumerate(list(allowed or []))}
+
+    for label in allowed:
+        canonical = str(label).strip()
+        if not canonical:
+            continue
+        variants = [canonical]
+        if aliases and canonical in aliases:
+            variants.extend(str(v).strip() for v in (aliases.get(canonical) or []) if str(v).strip())
+
+        best = scores.get(canonical, 0.0)
+        for variant in variants:
+            variant_lower = variant.lower()
+            variant_canon = _canon_alpha(variant)
+            variant_stems = _tokenize_stemmed(variant)
+
+            if raw_canon and variant_canon and raw_canon == variant_canon:
+                best = max(best, 1.0 if variant == canonical else 0.98)
+                continue
+
+            if raw_stems and variant_stems and raw_stems == variant_stems:
+                best = max(best, 0.94 if variant == canonical else 0.92)
+
+            if raw_lower in variant_lower or variant_lower in raw_lower:
+                containment_bonus = min(len(raw_lower), len(variant_lower)) / max(len(raw_lower), len(variant_lower), 1)
+                best = max(best, 0.80 + 0.15 * containment_bonus)
+
+            if raw_stems and variant_stems:
+                overlap = len(raw_stems & variant_stems) / max(len(raw_stems), len(variant_stems))
+                if overlap > 0:
+                    best = max(best, 0.45 + 0.40 * overlap)
+
+            seq = difflib.SequenceMatcher(None, raw_canon or raw_lower, variant_canon or variant_lower).ratio()
+            if seq > 0:
+                best = max(best, 0.35 + 0.45 * seq)
+
+        if best >= cutoff:
+            scores[canonical] = max(scores.get(canonical, 0.0), best)
+
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], order_map.get(item[0], 9999)))
+    return ranked[:max(int(top_k or 1), 1)]
+
+
+def _best_claim_label(
+    aspect: str,
+    text: str,
+    catalog: Sequence[str],
+    aliases: Optional[Mapping[str, Sequence[str]]] = None,
+) -> Optional[str]:
+    """Choose the best taxonomy label for a claim using weighted candidates."""
+
+    weighted_scores: Dict[str, float] = {}
+
+    def _add_candidates(raw: str, weight: float, cutoff: float) -> None:
+        for label, score in rank_candidate_labels(raw, catalog, aliases=aliases, cutoff=cutoff, top_k=4):
+            weighted_scores[label] = weighted_scores.get(label, 0.0) + (score * weight)
+
+    _add_candidates(aspect, 1.30, 0.48)
+    _add_candidates(str(text or "")[:96], 0.90, 0.42)
+
+    tokens = [w for w in re.findall(r"[a-zA-Z']+", str(text or "").lower()) if w not in _STOP_TOKENS and len(w) > 2]
+    for chunk_size, weight, cutoff in ((4, 0.55, 0.50), (3, 0.45, 0.52), (2, 0.30, 0.56)):
+        if len(tokens) < chunk_size:
+            continue
+        for i in range(len(tokens) - chunk_size + 1):
+            _add_candidates(" ".join(tokens[i:i + chunk_size]), weight, cutoff)
+
+    if not weighted_scores:
+        return None
+    return max(weighted_scores.items(), key=lambda item: item[1])[0]
+
+
 # ---------------------------------------------------------------------------
 # Evidence validation (improved)
 # ---------------------------------------------------------------------------
@@ -1049,24 +1172,7 @@ def tag_review_batch(
                     merged_aliases[spec.name].append(alias)
     aliases = merged_aliases or None
 
-    # ── Cache check: skip items we've already processed ──────────────
-    _cat_hash = ResultCache.catalog_hash(allowed_detractors, allowed_delighters)
-    cached_results: Dict[int, Dict[str, Any]] = {}
-    uncached_items: List[Mapping[str, Any]] = []
-    for it in items:
-        cached = _result_cache.get(str(it.get("review", "")), _cat_hash, _model)
-        if cached is not None:
-            cached_results[int(it["idx"])] = cached
-        else:
-            uncached_items.append(it)
-
-    # If everything was cached, return immediately
-    if not uncached_items:
-        logger.info("All %d items served from cache", len(items))
-        return cached_results
-
-    # Use uncached items for the AI call
-    items_to_process = uncached_items
+    items_to_process = list(items)
 
     # Build prompt context — use pre-computed category if available (saves an API call)
     category = "general"
@@ -1103,6 +1209,35 @@ def tag_review_batch(
             pk_text = product_knowledge_text_fn(product_knowledge, limit_per_section=4)
         except Exception:
             pass
+
+    # ── Cache check: skip items we've already processed ──────────────
+    _cat_hash = ResultCache.catalog_hash(
+        allowed_detractors,
+        allowed_delighters,
+        aliases=aliases,
+        detractor_specs=detractor_specs,
+        delighter_specs=delighter_specs,
+        product_profile=product_profile,
+        product_knowledge_text=pk_text,
+        taxonomy_context=taxonomy_context,
+        category=category,
+        include_universal_neutral=include_universal_neutral,
+        max_ev_chars=max_ev_chars,
+    )
+    cached_results: Dict[int, Dict[str, Any]] = {}
+    uncached_items: List[Mapping[str, Any]] = []
+    for it in items_to_process:
+        cached = _result_cache.get(str(it.get("review", "")), _cat_hash, _model)
+        if cached is not None:
+            cached_results[int(it["idx"])] = cached
+        else:
+            uncached_items.append(it)
+
+    if not uncached_items:
+        logger.info("All %d items served from cache", len(items_to_process))
+        return cached_results
+
+    items_to_process = uncached_items
 
     system_prompt = _build_system_prompt(
         allowed_detractors=allowed_detractors,
@@ -1263,26 +1398,51 @@ def needs_verification(
     review_text: str,
     rating: Any,
 ) -> bool:
-    """Identify results that deserve a lightweight verification pass."""
+    """Identify results that deserve a lightweight verification pass.
+
+    The earlier gate was too rating-driven and over-verified nuanced mixed
+    reviews. This version focuses on higher-risk symptoms: missing evidence,
+    zero-tag substantive reviews, obvious over-tagging, and extreme-rating
+    cross-polarity results that lack balancing evidence on the expected side.
+    """
 
     dets = list(result.get("dets") or [])
     dels = list(result.get("dels") or [])
+    ev_det = dict(result.get("ev_det") or {})
+    ev_del = dict(result.get("ev_del") or {})
     review_words = len(str(review_text or "").split())
+    total_tags = len(dets) + len(dels)
 
     if not dets and not dels and review_words > 50:
         return True
 
+    weak_evidence_tags = 0
+    for label in dets:
+        evidence = [str(ev).strip() for ev in (ev_det.get(label) or []) if str(ev).strip()]
+        if not evidence or max(len(ev.split()) for ev in evidence) < 3:
+            weak_evidence_tags += 1
+    for label in dels:
+        evidence = [str(ev).strip() for ev in (ev_del.get(label) or []) if str(ev).strip()]
+        if not evidence or max(len(ev.split()) for ev in evidence) < 3:
+            weak_evidence_tags += 1
+    if weak_evidence_tags >= 2:
+        return True
+
     try:
         r = float(rating)
-        if r >= 5 and dets:
+        if r >= 4.8 and dets and not dels:
             return True
-        if r <= 1 and dels:
+        if r <= 1.2 and dels and not dets:
             return True
     except (TypeError, ValueError):
         pass
 
-    if review_words < 40 and (len(dets) + len(dels)) > 4:
+    if review_words < 40 and total_tags > 4:
         return True
+
+    if total_tags >= 6 and review_words < 80:
+        return True
+
     return False
 
 
@@ -1945,11 +2105,10 @@ def extract_claims(*, client, review_text, rating, chat_fn=None, json_fn=None, m
 
 def map_claims_to_taxonomy(claims, allowed_detractors, allowed_delighters, aliases=None):
     """Stage 2: Map extracted claims to catalog labels deterministically (no AI call).
-    
-    Uses a three-strategy matching cascade per claim:
-    1. Match the AI-generated aspect label directly to catalog
-    2. Match the first 60 chars of the verbatim claim text to catalog
-    3. Extract key noun phrases from claim and match those
+
+    The v4 version uses weighted candidate routing instead of the earlier
+    first-hit cascade. This makes long-review mapping more deterministic and
+    better at collapsing paraphrases onto the intended taxonomy label.
     """
     det_labels, del_labels = [], []
     det_ev, del_ev = {}, {}
@@ -1966,23 +2125,7 @@ def map_claims_to_taxonomy(claims, allowed_detractors, allowed_delighters, alias
             targets.append(("det", allowed_detractors, det_labels, det_ev))
             targets.append(("del", allowed_delighters, del_labels, del_ev))
         for side, catalog, labels, ev in targets:
-            # Strategy 1: Match aspect label directly
-            label = match_label(aspect, catalog, aliases=aliases)
-            # Strategy 2: Match claim text (first 60 chars)
-            if not label:
-                label = match_label(text[:60], catalog, aliases=aliases, cutoff=0.65)
-            # Strategy 3: Extract 2-3 word chunks from claim text and try each
-            if not label and len(text.split()) >= 3:
-                words = [w for w in text.lower().split() if w not in _STOP_TOKENS and len(w) > 2]
-                # Try consecutive 2-3 word chunks
-                for chunk_size in (3, 2):
-                    if label:
-                        break
-                    for i in range(len(words) - chunk_size + 1):
-                        chunk = " ".join(words[i:i + chunk_size])
-                        label = match_label(chunk, catalog, aliases=aliases, cutoff=0.68)
-                        if label:
-                            break
+            label = _best_claim_label(aspect, text, catalog, aliases=aliases)
             if label and label not in labels:
                 labels.append(label)
                 ev[label] = [text[:120]]
@@ -2069,11 +2212,19 @@ def retry_zero_tag_reviews(
     items_by_idx = {int(it["idx"]): it for it in items}
     retried = dict(results)
 
+    def _label_list(payload: Mapping[str, Any], primary_key: str, fallback_key: str) -> List[str]:
+        raw = payload.get(primary_key)
+        if raw is None:
+            raw = payload.get(fallback_key)
+        if isinstance(raw, str):
+            raw = [raw]
+        return [str(value).strip() for value in (raw or []) if str(value).strip()]
+
     def _retry_flags(item: Mapping[str, Any], result: Mapping[str, Any]):
         rating = item.get("rating")
         review_text = item.get("review", "")
-        dets_found = result.get("dets") or []
-        dels_found = result.get("dels") or []
+        dets_found = _label_list(result, "dets", "wrote_dets")
+        dels_found = _label_list(result, "dels", "wrote_dels")
         try:
             r = float(rating)
         except (TypeError, ValueError):
