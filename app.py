@@ -3168,7 +3168,19 @@ def _first_non_empty(series):
 
 def _clean_watch_dimension_series(series: pd.Series, *, unknown: str = "Unknown") -> pd.Series:
     cleaned = series.astype("string").fillna("").str.strip()
-    cleaned = cleaned.replace({"": unknown, "nan": unknown, "none": unknown, "null": unknown, "<na>": unknown})
+    null_tokens = {
+        "": unknown,
+        "nan": unknown,
+        "none": unknown,
+        "null": unknown,
+        "<na>": unknown,
+        "n/a": unknown,
+        "na": unknown,
+        "undefined": unknown,
+        "unknown": unknown,
+    }
+    cleaned = cleaned.str.lower().replace(null_tokens)
+    cleaned = cleaned.where(cleaned.ne(""), unknown)
     return cleaned.fillna(unknown)
 
 
@@ -3196,7 +3208,7 @@ _REGION_TEXT_ALIASES = {
 
 def _region_label_from_value(value: Any) -> str:
     raw = _safe_text(value).strip()
-    if not raw:
+    if not raw or raw.lower() in {"undefined", "unknown", "nan", "none", "null", "n/a", "na", "<na>"}:
         return "Unknown"
     upper_words = re.sub(r"[^A-Za-z ]", " ", raw).upper()
     upper_words = re.sub(r"\s+", " ", upper_words).strip()
@@ -3910,7 +3922,8 @@ def _render_source_rating_watch(df):
             if gap_col:
                 hover_data[gap_col] = ":.2f"
             if "Region" in chart_df.columns:
-                region_series = chart_df["Region"].astype("string").fillna("").str.strip().replace("", "All selected regions")
+                region_series = _clean_watch_dimension_series(chart_df["Region"], unknown="All selected regions")
+                region_series = region_series.replace({"unknown": "All selected regions", "all selected": "All selected regions"})
                 chart_df["Region"] = region_series
                 use_region_color = chart_df["Region"].nunique(dropna=True) > 1
                 if use_region_color:
@@ -3949,14 +3962,14 @@ def _render_source_rating_watch(df):
                 fig.add_hline(y=overall_avg, line_dash="dot", line_color="rgba(71,85,105,0.8)", annotation_text=f"Selected avg {overall_avg:.2f}★", annotation_position="top left")
             fig.update_layout(
                 title=None,
-                margin=dict(l=20, r=18, t=34, b=72),
+                margin=dict(l=20, r=18, t=48, b=72),
                 xaxis_title="",
                 yaxis_title="Average rating ★",
-                height=380,
+                height=400,
                 plot_bgcolor="rgba(0,0,0,0)",
                 paper_bgcolor="rgba(0,0,0,0)",
                 font_family="Inter",
-                legend=dict(orientation="h", y=1.08, x=0, xanchor="left", yanchor="bottom"),
+                legend=dict(title_text="", orientation="h", y=1.16, x=0, xanchor="left", yanchor="bottom"),
             )
             fig.update_xaxes(tickangle=-20, automargin=True)
             fig = _sw_style_fig(fig)
