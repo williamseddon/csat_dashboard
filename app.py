@@ -1779,9 +1779,9 @@ def _pick_col(df, aliases):
     return None
 
 
-UPLOAD_REVIEW_ID_ALIASES = ["Event Id", "Event ID", "Review ID", "Review Id", "Id", "review_id"]
-UPLOAD_REVIEW_TEXT_ALIASES = ["Review Text", "Review", "Body", "Content", "review_text"]
-UPLOAD_TITLE_ALIASES = ["Title", "Review Title", "Headline", "title"]
+UPLOAD_REVIEW_ID_ALIASES = ["Event Id", "Event ID", "Review ID", "Review Id", "Verbatim Id", "Verbatim ID", "Id", "review_id"]
+UPLOAD_REVIEW_TEXT_ALIASES = ["Review Text", "Review", "Verbatim", "Body", "Content", "review_text"]
+UPLOAD_TITLE_ALIASES = ["Title", "Review Title", "Review title", "Headline", "title"]
 UPLOAD_RATING_ALIASES = ["Rating (num)", "Rating", "Stars", "Star Rating", "rating"]
 UPLOAD_DATE_ALIASES = ["Opened date", "Opened Date", "Submission Time", "Review Date", "Date", "submission_time"]
 LOCAL_SYMPTOM_META_ALIASES = {
@@ -1879,21 +1879,22 @@ def _best_uploaded_excel_sheet_name(raw_bytes):
 def _normalize_uploaded_df(raw, *, source_name="", include_local_symptomization=False):
     w = raw.copy()
     w.columns = [str(c).strip() for c in w.columns]
+    w = _collapse_duplicate_named_columns(w)
     n = pd.DataFrame(index=w.index)
     n["review_id"] = _series_alias(w, UPLOAD_REVIEW_ID_ALIASES)
-    n["product_id"] = _series_alias(w, ["Base SKU", "Product ID", "Product Id", "ProductId", "BaseSKU"])
-    n["base_sku"] = _series_alias(w, ["Base SKU", "BaseSKU"])
-    n["sku_item"] = _series_alias(w, ["SKU Item", "SKU", "Child SKU", "Variant SKU", "Item Number", "Item No"])
+    n["product_id"] = _series_alias(w, ["Base SKU", "Model (SKU)", "Model SKU", "Product ID", "Product Id", "ProductId", "BaseSKU"])
+    n["base_sku"] = _series_alias(w, ["Base SKU", "Model (SKU)", "Model SKU", "BaseSKU"])
+    n["sku_item"] = _series_alias(w, ["SKU Item", "Model (SKU)", "Model SKU", "SKU", "Child SKU", "Variant SKU", "Item Number", "Item No"])
     n["original_product_name"] = _series_alias(w, ["Product Name", "Product", "Name"])
     n["review_text"] = _series_alias(w, UPLOAD_REVIEW_TEXT_ALIASES)
     n["title"] = _series_alias(w, UPLOAD_TITLE_ALIASES)
-    n["post_link"] = _series_alias(w, ["Post Link", "URL", "Review URL", "Product URL"])
+    n["post_link"] = _series_alias(w, ["Post Link", "Web Link", "URL", "Review URL", "Product URL"])
     n["rating"] = _series_alias(w, UPLOAD_RATING_ALIASES)
     n["submission_time"] = _series_alias(w, UPLOAD_DATE_ALIASES)
-    n["content_locale"] = _series_alias(w, ["Content Locale", "Locale", "Location", "Country"])
+    n["content_locale"] = _series_alias(w, ["Content Locale", "Locale", "Reviewer Location", "Location", "Country"])
     n["retailer"] = _series_alias(w, ["Retailer", "Merchant", "Channel", "Source"])
     n["age_group"] = _series_alias(w, ["Age Group", "Age", "Age Range"])
-    n["user_location"] = _series_alias(w, ["Location", "Country"])
+    n["user_location"] = _series_alias(w, ["Reviewer Location", "Location", "Country"])
     n["user_nickname"] = pd.NA
     n["total_positive_feedback_count"] = pd.NA
     n["is_recommended"] = pd.NA
@@ -1916,6 +1917,17 @@ def _normalize_uploaded_df(raw, *, source_name="", include_local_symptomization=
             source = _pick_col(w, aliases)
             if source is not None:
                 n[target] = w[source].astype("string").fillna("").str.strip().replace({"": pd.NA})
+
+    existing_labels = {str(col) for col in n.columns}
+    for raw_col in _all_dataframe_columns(w):
+        raw_label = str(raw_col).strip()
+        if not raw_label or raw_label in existing_labels:
+            continue
+        series = _select_column_series(w, raw_label)
+        if series is None:
+            continue
+        n[raw_label] = series
+        existing_labels.add(raw_label)
     return _finalize_df(n)
 
 
@@ -3221,8 +3233,133 @@ def _organic_only_mask(series: pd.Series, column_name: str) -> pd.Series:
     return (~mapped.fillna(False))
 
 
+
+
+def _watch_split_labels(value: Any) -> List[str]:
+    """Split a symptom cell into normalized labels."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        out: List[str] = []
+        for item in value:
+            out.extend(_watch_split_labels(item))
+        return _normalize_tag_list(out)
+    try:
+        if isinstance(pd.isna(value), bool) and pd.isna(value):
+            return []
+    except Exception:
+        pass
+    text = _safe_text(value)
+    if not text:
+        return []
+    parts = re.split(r"[\n;,|]+", text)
+    return _normalize_tag_list(parts)
+
+
+
+def _watch_symptom_column_groups(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
+    det_cols = [str(c) for c in df.columns if str(c).startswith("AI Symptom Detractor")]
+    del_cols = [str(c) for c in df.columns if str(c).startswith("AI Symptom Delighter")]
+    for candidate in ["L2 Detractor Condition", "Detractors"]:
+        if candidate in df.columns and candidate not in det_cols:
+            det_cols.append(candidate)
+    for candidate in ["L2 Delighter Condition", "Delighters"]:
+        if candidate in df.columns and candidate not in del_cols:
+            del_cols.append(candidate)
+    return det_cols, del_cols
+
+
+
+def _watch_signal_metadata(*, reviews: Any, avg_rating: Any, recent_reviews: Any, delta_30d: Any, gap_vs_region: Any) -> Tuple[str, str]:
+    reviews_n = int(pd.to_numeric(reviews, errors="coerce") or 0)
+    recent_n = int(pd.to_numeric(recent_reviews, errors="coerce") or 0)
+    avg_n = pd.to_numeric(avg_rating, errors="coerce")
+    delta_n = pd.to_numeric(delta_30d, errors="coerce")
+    gap_n = pd.to_numeric(gap_vs_region, errors="coerce")
+
+    reasons: List[str] = []
+    level_rank = 0
+    if recent_n >= 3 and pd.notna(delta_n) and float(delta_n) <= -0.35:
+        reasons.append("Sharp 30d drop")
+        level_rank = max(level_rank, 3)
+    elif recent_n >= 3 and pd.notna(delta_n) and float(delta_n) <= -0.20:
+        reasons.append("Recent rating down")
+        level_rank = max(level_rank, 2)
+    if reviews_n >= 5 and pd.notna(gap_n) and float(gap_n) <= -0.25:
+        reasons.append("Below region avg")
+        level_rank = max(level_rank, 2)
+    if reviews_n >= 10 and pd.notna(avg_n) and float(avg_n) <= 3.80:
+        reasons.append("Low baseline")
+        level_rank = max(level_rank, 1)
+
+    if level_rank <= 0:
+        return "", ""
+    level = {3: "High", 2: "Watch", 1: "Baseline"}.get(level_rank, "Watch")
+    return level, " · ".join(dict.fromkeys(reasons))
+
+
+
+def _build_watch_review_rows(df: pd.DataFrame) -> pd.DataFrame:
+    title_series = _select_column_series(df, "title") if "title" in df.columns else pd.Series(pd.NA, index=df.index)
+    review_series = _select_column_series(df, "review_text") if "review_text" in df.columns else pd.Series(pd.NA, index=df.index)
+    review_id_series = _select_column_series(df, "review_id") if "review_id" in df.columns else pd.Series(pd.NA, index=df.index)
+    post_link_series = _select_column_series(df, "post_link") if "post_link" in df.columns else pd.Series(pd.NA, index=df.index)
+    out = pd.DataFrame(
+        {
+            "Region": df.get("region", pd.Series("All selected", index=df.index)).astype("string").fillna("Unknown"),
+            "Retailer": df.get("retailer_display", pd.Series("Unknown Retailer", index=df.index)).astype("string").fillna("Unknown Retailer"),
+            "Date": pd.to_datetime(df.get("_watch_date"), errors="coerce", utc=True).dt.tz_convert("UTC").dt.tz_localize(None),
+            "Rating": pd.to_numeric(df.get("rating"), errors="coerce"),
+            "Review ID": review_id_series.astype("string").fillna(""),
+            "Title": title_series.astype("string").fillna(""),
+            "Review": review_series.astype("string").fillna(""),
+            "Post Link": post_link_series.astype("string").fillna(""),
+            "Recent Window": np.where(df.get("_recent", pd.Series(False, index=df.index)).astype(bool), "Last 30d", "Older"),
+            "Symptom Detractors": [", ".join(v or []) for v in df.get("_watch_detractors", pd.Series([[] for _ in range(len(df))], index=df.index))],
+            "Symptom Delighters": [", ".join(v or []) for v in df.get("_watch_delighters", pd.Series([[] for _ in range(len(df))], index=df.index))],
+        }
+    )
+    return out
+
+
+
+def _build_watch_symptom_summary(df: pd.DataFrame) -> pd.DataFrame:
+    records: List[Dict[str, Any]] = []
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Region", "Retailer", "Side", "Label", "Mentions", "Scope Reviews", "Share of Reviews"])
+
+    for row in df[["region", "retailer_display", "_watch_detractors", "_watch_delighters"]].itertuples(index=False):
+        region = _safe_text(row[0], "Unknown")
+        retailer = _safe_text(row[1], "Unknown Retailer")
+        for label in row[2] or []:
+            records.append({"Region": region, "Retailer": retailer, "Side": "Detractor", "Label": label})
+        for label in row[3] or []:
+            records.append({"Region": region, "Retailer": retailer, "Side": "Delighter", "Label": label})
+
+    if not records:
+        return pd.DataFrame(columns=["Region", "Retailer", "Side", "Label", "Mentions", "Scope Reviews", "Share of Reviews"])
+
+    symptom_long = pd.DataFrame(records)
+    scope_reviews = (
+        df.groupby(["region", "retailer_display"], dropna=False)
+        .size()
+        .reset_index(name="Scope Reviews")
+        .rename(columns={"region": "Region", "retailer_display": "Retailer"})
+    )
+    summary = (
+        symptom_long.groupby(["Region", "Retailer", "Side", "Label"], dropna=False)
+        .size()
+        .reset_index(name="Mentions")
+    )
+    summary = summary.merge(scope_reviews, on=["Region", "Retailer"], how="left")
+    summary["Share of Reviews"] = pd.to_numeric(summary["Mentions"], errors="coerce").fillna(0) / pd.to_numeric(summary["Scope Reviews"], errors="coerce").replace(0, np.nan)
+    summary["Share of Reviews"] = summary["Share of Reviews"].fillna(0.0)
+    summary = summary.sort_values(["Region", "Retailer", "Side", "Mentions", "Label"], ascending=[True, True, True, False, True]).reset_index(drop=True)
+    return summary
+
+
 @st.cache_data(show_spinner=False, ttl=300)
-def _prepare_source_rating_watch(
+def _prepare_source_rating_watch_payload(
     df,
     *,
     organic_only: bool = False,
@@ -3233,13 +3370,37 @@ def _prepare_source_rating_watch(
     date_col: Optional[str] = None,
 ):
     if df is None or df.empty or "rating" not in df.columns:
-        return pd.DataFrame(), pd.DataFrame(), []
+        return {
+            "table_df": pd.DataFrame(),
+            "region_kpis_df": pd.DataFrame(),
+            "known_regions": [],
+            "alerts_df": pd.DataFrame(),
+            "trend_df": pd.DataFrame(),
+            "review_rows_df": pd.DataFrame(),
+            "symptom_summary_df": pd.DataFrame(),
+            "resolved_source_col": None,
+            "resolved_region_col": None,
+            "resolved_date_col": None,
+            "organic_flag_col": None,
+        }
 
-    w = df.copy()
+    w = _collapse_duplicate_named_columns(df.copy())
     w["rating"] = pd.to_numeric(w.get("rating"), errors="coerce")
     w = w.dropna(subset=["rating"]).copy()
     if w.empty:
-        return pd.DataFrame(), pd.DataFrame(), []
+        return {
+            "table_df": pd.DataFrame(),
+            "region_kpis_df": pd.DataFrame(),
+            "known_regions": [],
+            "alerts_df": pd.DataFrame(),
+            "trend_df": pd.DataFrame(),
+            "review_rows_df": pd.DataFrame(),
+            "symptom_summary_df": pd.DataFrame(),
+            "resolved_source_col": None,
+            "resolved_region_col": None,
+            "resolved_date_col": None,
+            "organic_flag_col": None,
+        }
 
     resolved_source_col = source_col if source_col in w.columns else _resolve_column_alias(w, WATCH_SOURCE_COLUMN_ALIASES)
     resolved_region_col = region_col if region_col in w.columns else _resolve_column_alias(w, WATCH_REGION_COLUMN_ALIASES)
@@ -3250,7 +3411,19 @@ def _prepare_source_rating_watch(
     if organic_only and organic_col and organic_series is not None:
         w = w[_organic_only_mask(organic_series, organic_col)].copy()
     if w.empty:
-        return pd.DataFrame(), pd.DataFrame(), []
+        return {
+            "table_df": pd.DataFrame(),
+            "region_kpis_df": pd.DataFrame(),
+            "known_regions": [],
+            "alerts_df": pd.DataFrame(),
+            "trend_df": pd.DataFrame(),
+            "review_rows_df": pd.DataFrame(),
+            "symptom_summary_df": pd.DataFrame(),
+            "resolved_source_col": resolved_source_col,
+            "resolved_region_col": resolved_region_col,
+            "resolved_date_col": resolved_date_col,
+            "organic_flag_col": organic_col,
+        }
 
     region_series = _select_column_series(w, resolved_region_col) if resolved_region_col else None
     if region_series is not None:
@@ -3264,7 +3437,19 @@ def _prepare_source_rating_watch(
         if selected:
             w = w[w["region"].isin(selected)].copy()
     if w.empty:
-        return pd.DataFrame(), pd.DataFrame(), known_regions
+        return {
+            "table_df": pd.DataFrame(),
+            "region_kpis_df": pd.DataFrame(),
+            "known_regions": known_regions,
+            "alerts_df": pd.DataFrame(),
+            "trend_df": pd.DataFrame(),
+            "review_rows_df": pd.DataFrame(),
+            "symptom_summary_df": pd.DataFrame(),
+            "resolved_source_col": resolved_source_col,
+            "resolved_region_col": resolved_region_col,
+            "resolved_date_col": resolved_date_col,
+            "organic_flag_col": organic_col,
+        }
 
     source_input = _select_column_series(w, resolved_source_col) if resolved_source_col else None
     source_series = _clean_watch_dimension_series(source_input, unknown="") if source_input is not None else pd.Series("", index=w.index, dtype="object")
@@ -3283,8 +3468,27 @@ def _prepare_source_rating_watch(
     recent_cutoff = anchor_time - pd.Timedelta(days=30)
     w["_recent"] = w["_watch_date"].notna() & (w["_watch_date"] >= recent_cutoff)
 
-    group_cols = ["retailer_display"] if combine_regions or not known_regions else ["region", "retailer_display"]
+    det_cols, del_cols = _watch_symptom_column_groups(w)
+    if det_cols or del_cols:
+        det_lists: List[List[str]] = []
+        del_lists: List[List[str]] = []
+        symptom_cols = [c for c in det_cols + del_cols if c in w.columns]
+        for _, row in w[symptom_cols].iterrows():
+            dets: List[str] = []
+            dels: List[str] = []
+            for col in det_cols:
+                dets.extend(_watch_split_labels(row.get(col)))
+            for col in del_cols:
+                dels.extend(_watch_split_labels(row.get(col)))
+            det_lists.append(_normalize_tag_list(dets))
+            del_lists.append(_normalize_tag_list(dels))
+        w["_watch_detractors"] = det_lists
+        w["_watch_delighters"] = del_lists
+    else:
+        w["_watch_detractors"] = [[] for _ in range(len(w))]
+        w["_watch_delighters"] = [[] for _ in range(len(w))]
 
+    group_cols = ["retailer_display"] if combine_regions or not known_regions else ["region", "retailer_display"]
     agg = (
         w.groupby(group_cols, dropna=False)
         .agg(
@@ -3305,12 +3509,6 @@ def _prepare_source_rating_watch(
     table["recent_avg_rating"] = pd.to_numeric(table.get("recent_avg_rating"), errors="coerce")
     table["delta_30d"] = np.where(table["recent_reviews"] >= 3, table["recent_avg_rating"] - table["avg_rating"], np.nan)
     table["share_of_view"] = pd.to_numeric(table["reviews"], errors="coerce").fillna(0) / max(len(w), 1)
-    table["signal"] = ""
-    table.loc[(table["recent_reviews"] >= 5) & (table["delta_30d"] <= -0.20), "signal"] = "Recent rating down"
-    table.loc[(table["signal"] == "") & (table["reviews"] >= 10) & (table["avg_rating"] <= 3.80), "signal"] = "Low baseline"
-    sort_cols = ["region", "avg_rating"] if "region" in table.columns else ["avg_rating"]
-    ascending = [True, False] if "region" in table.columns else [False]
-    table = table.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
 
     if known_regions:
         region_kpis = (
@@ -3328,25 +3526,60 @@ def _prepare_source_rating_watch(
         region_kpis["recent_reviews"] = pd.to_numeric(region_kpis.get("recent_reviews"), errors="coerce").fillna(0).astype(int)
         region_kpis["delta_30d"] = np.where(region_kpis["recent_reviews"] >= 3, region_kpis["recent_avg_rating"] - region_kpis["avg_rating"], np.nan)
         region_kpis = region_kpis.sort_values(["reviews", "avg_rating"], ascending=[False, False]).reset_index(drop=True)
+        region_lookup = dict(zip(region_kpis["region"], region_kpis["avg_rating"]))
+        if "region" in table.columns:
+            table["gap_vs_region_avg"] = table["region"].map(region_lookup)
+            table["gap_vs_region_avg"] = table["avg_rating"] - pd.to_numeric(table["gap_vs_region_avg"], errors="coerce")
         region_kpis.rename(columns={"region": "Region"}, inplace=True)
     else:
         region_kpis = pd.DataFrame(columns=["Region", "reviews", "avg_rating", "recent_reviews", "recent_avg_rating", "delta_30d"])
+        table["gap_vs_region_avg"] = np.nan
 
     overall_recent_df = w[w["_recent"]]
     overall_recent_avg = pd.to_numeric(overall_recent_df.get("rating"), errors="coerce").mean() if not overall_recent_df.empty else np.nan
     overall_recent_reviews = int(len(overall_recent_df))
-    overall_delta = overall_recent_avg - float(w["rating"].mean()) if overall_recent_reviews >= 3 and pd.notna(overall_recent_avg) else np.nan
+    overall_avg = float(w["rating"].mean()) if not w.empty else np.nan
+    overall_delta = overall_recent_avg - overall_avg if overall_recent_reviews >= 3 and pd.notna(overall_recent_avg) else np.nan
     overall_row = pd.DataFrame(
         [{
             "Region": "All selected",
             "reviews": int(len(w)),
-            "avg_rating": float(w["rating"].mean()),
+            "avg_rating": overall_avg,
             "recent_reviews": overall_recent_reviews,
             "recent_avg_rating": overall_recent_avg,
             "delta_30d": overall_delta,
         }]
     )
     region_kpis = pd.concat([overall_row, region_kpis], ignore_index=True)
+
+    if "region" not in table.columns:
+        table["gap_vs_region_avg"] = table["avg_rating"] - overall_avg
+
+    alert_levels: List[str] = []
+    alert_signals: List[str] = []
+    for row in table.itertuples(index=False):
+        level, signal = _watch_signal_metadata(
+            reviews=getattr(row, "reviews", 0),
+            avg_rating=getattr(row, "avg_rating", np.nan),
+            recent_reviews=getattr(row, "recent_reviews", 0),
+            delta_30d=getattr(row, "delta_30d", np.nan),
+            gap_vs_region=getattr(row, "gap_vs_region_avg", np.nan),
+        )
+        alert_levels.append(level)
+        alert_signals.append(signal)
+    table["alert_level"] = alert_levels
+    table["signal"] = alert_signals
+
+    gap_label = "gap_vs_region_avg" if "region" in table.columns else "gap_vs_region_avg"
+    sort_cols = ["alert_level", "avg_rating"]
+    table["_alert_rank"] = table["alert_level"].map({"High": 3, "Watch": 2, "Baseline": 1}).fillna(0)
+    if "region" in table.columns:
+        sort_cols = ["region", "_alert_rank", "avg_rating"]
+        ascending = [True, False, False]
+    else:
+        ascending = [False, False]
+    table = table.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+
     rename_map = {
         "region": "Region",
         "retailer_display": "Retailer",
@@ -3357,16 +3590,91 @@ def _prepare_source_rating_watch(
         "recent_avg_rating": "Last 30d Avg",
         "delta_30d": "30d Delta",
         "share_of_view": "Share of View",
+        "gap_vs_region_avg": ("Gap vs Region Avg" if "region" in table.columns else "Gap vs Selected Avg"),
+        "alert_level": "Alert Level",
         "signal": "Signal",
     }
-    table = _collapse_duplicate_named_columns(table.rename(columns=rename_map))
-    return table, region_kpis, known_regions
+    table = _collapse_duplicate_named_columns(table.rename(columns=rename_map)).drop(columns=[c for c in ["_alert_rank"] if c in table.columns], errors="ignore")
+
+    alerts_df = table.copy()
+    if "Alert Level" in alerts_df.columns:
+        alerts_df = alerts_df[alerts_df["Alert Level"].astype("string").fillna("").str.strip().ne("")].copy()
+    if not alerts_df.empty:
+        level_rank = {"High": 3, "Watch": 2, "Baseline": 1}
+        alerts_df["_rank"] = alerts_df["Alert Level"].map(level_rank).fillna(0)
+        sort_cols = ["_rank", "30d Delta", "Avg Rating"]
+        ascending = [False, True, True]
+        if "Region" in alerts_df.columns:
+            sort_cols = ["_rank", "Region", "30d Delta", "Avg Rating"]
+            ascending = [False, True, True, True]
+        alerts_df = alerts_df.sort_values(sort_cols, ascending=ascending).drop(columns=["_rank"]).reset_index(drop=True)
+
+    if resolved_date_col and w["_watch_date"].notna().any():
+        trend_source = w[w["_watch_date"].notna()].copy()
+        trend_source["_watch_week"] = trend_source["_watch_date"].dt.tz_convert("UTC").dt.tz_localize(None).dt.to_period("W-SUN").dt.start_time
+        trend_group_cols = ["_watch_week", "retailer_display"]
+        if known_regions:
+            trend_group_cols.insert(1, "region")
+        trend_df = (
+            trend_source.groupby(trend_group_cols, dropna=False)
+            .agg(reviews=("rating", "size"), avg_rating=("rating", "mean"))
+            .reset_index()
+            .rename(columns={"_watch_week": "Week", "retailer_display": "Retailer", "region": "Region", "reviews": "Reviews", "avg_rating": "Avg Rating"})
+        )
+        trend_df = trend_df.sort_values([c for c in ["Region", "Retailer", "Week"] if c in trend_df.columns]).reset_index(drop=True)
+    else:
+        trend_df = pd.DataFrame(columns=["Week", "Region", "Retailer", "Reviews", "Avg Rating"])
+
+    review_rows_df = _build_watch_review_rows(w)
+    symptom_summary_df = _build_watch_symptom_summary(w)
+
+    return {
+        "table_df": table,
+        "region_kpis_df": region_kpis,
+        "known_regions": known_regions,
+        "alerts_df": alerts_df,
+        "trend_df": trend_df,
+        "review_rows_df": review_rows_df,
+        "symptom_summary_df": symptom_summary_df,
+        "resolved_source_col": resolved_source_col,
+        "resolved_region_col": resolved_region_col,
+        "resolved_date_col": resolved_date_col,
+        "organic_flag_col": organic_col,
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _prepare_source_rating_watch(
+    df,
+    *,
+    organic_only: bool = False,
+    selected_regions: Optional[Sequence[str]] = None,
+    combine_regions: bool = True,
+    source_col: Optional[str] = None,
+    region_col: Optional[str] = None,
+    date_col: Optional[str] = None,
+):
+    payload = _prepare_source_rating_watch_payload(
+        df,
+        organic_only=organic_only,
+        selected_regions=selected_regions,
+        combine_regions=combine_regions,
+        source_col=source_col,
+        region_col=region_col,
+        date_col=date_col,
+    )
+    return payload.get("table_df", pd.DataFrame()), payload.get("region_kpis_df", pd.DataFrame()), payload.get("known_regions", [])
+
 
 
 def _source_rating_watch_export_bytes(
     table_df,
     region_kpis_df,
     *,
+    alerts_df: Optional[pd.DataFrame] = None,
+    trend_df: Optional[pd.DataFrame] = None,
+    review_rows_df: Optional[pd.DataFrame] = None,
+    symptom_summary_df: Optional[pd.DataFrame] = None,
     split_by_region: bool = False,
     organic_only: bool = False,
     source_col: Optional[str] = None,
@@ -3393,6 +3701,14 @@ def _source_rating_watch_export_bytes(
                 sub.to_excel(writer, sheet_name=str(region or "Region")[:31], index=False)
         else:
             table_df.to_excel(writer, sheet_name="Retailer Ratings", index=False)
+        if alerts_df is not None and not alerts_df.empty:
+            alerts_df.to_excel(writer, sheet_name="Smoke Alerts", index=False)
+        if trend_df is not None and not trend_df.empty:
+            trend_df.to_excel(writer, sheet_name="Weekly Trend", index=False)
+        if review_rows_df is not None and not review_rows_df.empty:
+            review_rows_df.to_excel(writer, sheet_name="Review Drilldown", index=False)
+        if symptom_summary_df is not None and not symptom_summary_df.empty:
+            symptom_summary_df.to_excel(writer, sheet_name="Symptom Overlay", index=False)
     out.seek(0)
     return out.getvalue()
 
@@ -3401,7 +3717,7 @@ def _source_rating_watch_export_bytes(
 def _render_source_rating_watch(df):
     with st.container(border=True):
         st.markdown("<div class='section-title'>🏪 Retailer rating watch</div>", unsafe_allow_html=True)
-        st.markdown("<div class='section-sub'>Spot smoke by retailer and region. Track average rating, review count, and whether the most recent 30-day window is drifting down.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='section-sub'>Spot smoke by retailer and region. Track average rating, review count, weekly movement, recent drops, and the review/symptom signals sitting behind those shifts.</div>", unsafe_allow_html=True)
 
         if df is None or df.empty or "rating" not in df.columns:
             st.info("No rating data available for retailer watch.")
@@ -3424,21 +3740,21 @@ def _render_source_rating_watch(df):
                 options=source_options,
                 key="retailer_watch_source_col",
                 format_func=_format_column_choice_label,
-                help="Default is Retailer. Override it here if the uploaded file uses a different retailer field.",
+                help="Defaults to Retailer when it exists. Override it here if the workspace uses a different retailer field.",
             )
             m2.selectbox(
                 "Region column",
                 options=region_options,
                 key="retailer_watch_region_col",
                 format_func=_format_column_choice_label,
-                help="Auto-detect works for locale / region / market columns, but you can override it here.",
+                help="Defaults to Reviewer Location / Region style columns when present.",
             )
             m3.selectbox(
                 "Review date column",
                 options=date_options,
                 key="retailer_watch_date_col",
                 format_func=_format_column_choice_label,
-                help="Used for the rolling 30-day smoke signal and trend deltas.",
+                help="Used for weekly trends and rolling 30-day smoke checks.",
             )
 
         resolved_source_col = _resolve_optional_column_choice(df, st.session_state.get("retailer_watch_source_col"), WATCH_SOURCE_COLUMN_ALIASES)
@@ -3453,7 +3769,7 @@ def _render_source_rating_watch(df):
             mapping_bits.append(f"Organic flag: <strong>{_esc(organic_flag_col)}</strong>")
         st.markdown("<div class='status-note'>" + " · ".join(mapping_bits) + "</div>", unsafe_allow_html=True)
 
-        preview_table, _, known_regions = _prepare_source_rating_watch(
+        preview_payload = _prepare_source_rating_watch_payload(
             df,
             organic_only=False,
             selected_regions=None,
@@ -3462,11 +3778,13 @@ def _render_source_rating_watch(df):
             region_col=resolved_region_col,
             date_col=resolved_date_col,
         )
+        preview_table = preview_payload.get("table_df", pd.DataFrame())
+        known_regions = preview_payload.get("known_regions", [])
         if preview_table.empty:
             st.info("No rating data is available for the current retailer-watch mapping.")
             return
 
-        c0, c1, c2 = st.columns([1, 1.4, 1])
+        c0, c1, c2, c3 = st.columns([1, 1.6, 1.05, 1.1])
         organic_only = c0.toggle(
             "Organic only",
             value=False,
@@ -3485,10 +3803,11 @@ def _render_source_rating_watch(df):
             selected_regions = []
             combine_regions = True
             c1.markdown("<div class='status-note'>Region metadata is not available for the current mapping, so the table is shown combined.</div>", unsafe_allow_html=True)
+            c2.markdown("<div style='height:1px;'></div>", unsafe_allow_html=True)
         if organic_flag_col is None:
             c0.caption("No organic flag detected in this workspace.")
 
-        table_df, region_kpis_df, _ = _prepare_source_rating_watch(
+        payload = _prepare_source_rating_watch_payload(
             df,
             organic_only=organic_only,
             selected_regions=selected_regions,
@@ -3497,107 +3816,279 @@ def _render_source_rating_watch(df):
             region_col=resolved_region_col,
             date_col=resolved_date_col,
         )
+        table_df = payload.get("table_df", pd.DataFrame())
+        region_kpis_df = payload.get("region_kpis_df", pd.DataFrame())
+        alerts_df = payload.get("alerts_df", pd.DataFrame())
+        trend_df = payload.get("trend_df", pd.DataFrame())
+        review_rows_df = payload.get("review_rows_df", pd.DataFrame())
+        symptom_summary_df = payload.get("symptom_summary_df", pd.DataFrame())
         if table_df.empty:
             st.info("No reviews match the current retailer-watch selection.")
             return
 
-        metric_cards = []
-        for _, row in region_kpis_df.iterrows():
-            delta = row.get("delta_30d")
-            delta_txt = ""
-            if pd.notna(delta):
-                direction = "up" if float(delta) > 0 else "down"
-                delta_txt = f" · 30d {direction} {abs(float(delta)):.2f}★"
-            avg_value = float(row.get("avg_rating")) if pd.notna(row.get("avg_rating")) else 0.0
-            metric_cards.append(
-                f"<span class='dashboard-pill'><span class='meta'>{_esc(row.get('Region'))}</span><strong>{avg_value:.2f}★</strong><span class='meta'>{int(row.get('reviews') or 0):,} reviews{delta_txt}</span></span>"
-            )
-        st.markdown("<div class='dashboard-brief'><div class='dashboard-brief-title'>Region average rating snapshot</div><div class='dashboard-brief-row'>" + "".join(metric_cards) + "</div></div>", unsafe_allow_html=True)
-
-        chart_df = table_df.copy()
-        chart_df["Avg Rating"] = pd.to_numeric(chart_df.get("Avg Rating"), errors="coerce")
-        order_source = (
-            chart_df.groupby("Retailer", as_index=False)["Avg Rating"]
-            .mean()
-            .sort_values("Avg Rating", ascending=False)["Retailer"]
-            .tolist()
-        )
-        if "Region" in chart_df.columns:
-            fig = px.bar(
-                chart_df,
-                x="Retailer",
-                y="Avg Rating",
-                color="Region",
-                barmode="group",
-                category_orders={"Retailer": order_source},
-                hover_data={"Reviews": True, "Last 30d Avg": ":.2f", "30d Delta": ":.2f", "Share of View": ":.1%"},
-            )
-        else:
-            fig = px.bar(
-                chart_df,
-                x="Retailer",
-                y="Avg Rating",
-                category_orders={"Retailer": order_source},
-                hover_data={"Reviews": True, "Last 30d Avg": ":.2f", "30d Delta": ":.2f", "Share of View": ":.1%"},
-            )
-            fig.update_traces(marker_color="#3b82f6")
-        overall_avg = float(region_kpis_df.iloc[0]["avg_rating"]) if not region_kpis_df.empty else None
-        if overall_avg is not None and not math.isnan(overall_avg):
-            fig.add_hline(y=overall_avg, line_dash="dot", line_color="rgba(71,85,105,0.8)", annotation_text=f"Selected avg {overall_avg:.2f}★", annotation_position="top left")
-        fig.update_layout(
-            title=None,
-            margin=dict(l=20, r=18, t=18, b=60),
-            xaxis_title="",
-            yaxis_title="Average rating ★",
-            height=360,
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            font_family="Inter",
-            legend=dict(orientation="h", y=-0.22, x=0, xanchor="left"),
-        )
-        fig = _sw_style_fig(fig)
-        _show_plotly(fig)
-
-        display_df = table_df.copy()
-        base_cols = ["Region", "Retailer", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Share of View", "Signal"] if "Region" in display_df.columns else ["Retailer", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Share of View", "Signal"]
-        meta_cols = []
-        for col in ["Source System"]:
-            if col in display_df.columns and col not in base_cols:
-                present = display_df[col].astype("string").fillna("").str.strip().replace("", pd.NA).dropna()
-                if not present.empty:
-                    meta_cols.append(col)
-        display_cols = base_cols + meta_cols
-        display_df["Avg Rating"] = pd.to_numeric(display_df["Avg Rating"], errors="coerce").round(2)
-        display_df["Last 30d Avg"] = pd.to_numeric(display_df["Last 30d Avg"], errors="coerce").round(2)
-        display_df["30d Delta"] = pd.to_numeric(display_df["30d Delta"], errors="coerce").round(2)
-        export_df = display_df[display_cols].copy()
         export_bytes = _source_rating_watch_export_bytes(
-            export_df,
-            region_kpis_df,
-            split_by_region=("Region" in display_df.columns),
+            table_df.copy(),
+            region_kpis_df.copy(),
+            alerts_df=alerts_df.copy(),
+            trend_df=trend_df.copy(),
+            review_rows_df=review_rows_df.copy(),
+            symptom_summary_df=symptom_summary_df.copy(),
+            split_by_region=("Region" in table_df.columns),
             organic_only=organic_only,
             source_col=resolved_source_col,
             region_col=resolved_region_col,
             date_col=resolved_date_col,
             organic_flag_col=organic_flag_col,
         )
-        display_render_df = export_df.copy()
-        display_render_df["Share of View"] = pd.to_numeric(display_render_df["Share of View"], errors="coerce").map(lambda v: f"{v:.1%}" if pd.notna(v) else "")
-        st.download_button(
-            "⬇️ Export retailer rating watch",
+        c3.download_button(
+            "⬇️ Export retailer watch",
             data=export_bytes,
             file_name="retailer_rating_watch.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=False,
+            use_container_width=True,
             key="retailer_rating_watch_export",
         )
 
-        if "Region" in display_render_df.columns:
-            for region, sub in display_render_df.groupby("Region", sort=False):
-                st.markdown(f"<div class='section-sub' style='margin-top:.75rem;'><strong>{_esc(region)}</strong></div>", unsafe_allow_html=True)
-                st.dataframe(sub[display_cols[1:]], use_container_width=True, hide_index=True)
-        else:
-            st.dataframe(display_render_df[display_cols], use_container_width=True, hide_index=True)
+        summary_pills = [
+            f"<span class='dashboard-pill'><span class='meta'>Retailers</span><strong>{int(table_df['Retailer'].nunique())}</strong></span>",
+            f"<span class='dashboard-pill'><span class='meta'>Rows in view</span><strong>{int(pd.to_numeric(table_df['Reviews'], errors='coerce').fillna(0).sum()):,}</strong></span>",
+            f"<span class='dashboard-pill'><span class='meta'>Smoke alerts</span><strong>{int(len(alerts_df))}</strong></span>",
+        ]
+        if resolved_date_col and not trend_df.empty:
+            min_week = pd.to_datetime(trend_df['Week'], errors='coerce').min()
+            max_week = pd.to_datetime(trend_df['Week'], errors='coerce').max()
+            if pd.notna(min_week) and pd.notna(max_week):
+                summary_pills.append(f"<span class='dashboard-pill'><span class='meta'>Trend coverage</span><strong>{min_week.strftime('%Y-%m-%d')}</strong><span class='meta'>to {max_week.strftime('%Y-%m-%d')}</span></span>")
+        st.markdown("<div class='dashboard-brief'><div class='dashboard-brief-row'>" + "".join(summary_pills) + "</div></div>", unsafe_allow_html=True)
+
+        watch_tabs = st.tabs(["Overview", "Smoke alerts", "Trend line", "Reviews behind shifts", "Symptom overlay"])
+
+        with watch_tabs[0]:
+            metric_cards = []
+            for _, row in region_kpis_df.iterrows():
+                delta = row.get("delta_30d")
+                delta_txt = ""
+                if pd.notna(delta):
+                    direction = "up" if float(delta) > 0 else "down"
+                    delta_txt = f" · 30d {direction} {abs(float(delta)):.2f}★"
+                avg_value = float(row.get("avg_rating")) if pd.notna(row.get("avg_rating")) else 0.0
+                metric_cards.append(
+                    f"<span class='dashboard-pill'><span class='meta'>{_esc(row.get('Region'))}</span><strong>{avg_value:.2f}★</strong><span class='meta'>{int(row.get('reviews') or 0):,} reviews{delta_txt}</span></span>"
+                )
+            st.markdown("<div class='dashboard-brief'><div class='dashboard-brief-title'>Region average rating snapshot</div><div class='dashboard-brief-row'>" + "".join(metric_cards) + "</div></div>", unsafe_allow_html=True)
+
+            chart_df = table_df.copy()
+            chart_df["Avg Rating"] = pd.to_numeric(chart_df.get("Avg Rating"), errors="coerce")
+            order_source = (
+                chart_df.groupby("Retailer", as_index=False)["Avg Rating"]
+                .mean()
+                .sort_values("Avg Rating", ascending=False)["Retailer"]
+                .tolist()
+            )
+            hover_data = {"Reviews": True, "Last 30d Avg": ":.2f", "30d Delta": ":.2f", "Share of View": ":.1%", "Alert Level": True}
+            gap_col = "Gap vs Region Avg" if "Gap vs Region Avg" in chart_df.columns else ("Gap vs Selected Avg" if "Gap vs Selected Avg" in chart_df.columns else None)
+            if gap_col:
+                hover_data[gap_col] = ":.2f"
+            if "Region" in chart_df.columns:
+                fig = px.bar(
+                    chart_df,
+                    x="Retailer",
+                    y="Avg Rating",
+                    color="Region",
+                    barmode="group",
+                    category_orders={"Retailer": order_source},
+                    hover_data=hover_data,
+                )
+            else:
+                color_field = "Alert Level" if chart_df["Alert Level"].astype("string").fillna("").str.strip().ne("").any() else None
+                fig = px.bar(
+                    chart_df,
+                    x="Retailer",
+                    y="Avg Rating",
+                    color=color_field,
+                    category_orders={"Retailer": order_source},
+                    hover_data=hover_data,
+                )
+                if color_field is None:
+                    fig.update_traces(marker_color="#3b82f6")
+            overall_avg = float(region_kpis_df.iloc[0]["avg_rating"]) if not region_kpis_df.empty else None
+            if overall_avg is not None and not math.isnan(overall_avg):
+                fig.add_hline(y=overall_avg, line_dash="dot", line_color="rgba(71,85,105,0.8)", annotation_text=f"Selected avg {overall_avg:.2f}★", annotation_position="top left")
+            fig.update_layout(
+                title=None,
+                margin=dict(l=20, r=18, t=18, b=60),
+                xaxis_title="",
+                yaxis_title="Average rating ★",
+                height=360,
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                font_family="Inter",
+                legend=dict(orientation="h", y=-0.22, x=0, xanchor="left"),
+            )
+            fig = _sw_style_fig(fig)
+            _show_plotly(fig)
+
+            display_df = table_df.copy()
+            base_cols = ["Region", "Retailer", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Gap vs Region Avg", "Share of View", "Alert Level", "Signal"] if "Region" in display_df.columns else ["Retailer", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Gap vs Selected Avg", "Share of View", "Alert Level", "Signal"]
+            display_cols = [c for c in base_cols if c in display_df.columns]
+            if "Source System" in display_df.columns:
+                present = display_df["Source System"].astype("string").fillna("").str.strip().replace("", pd.NA).dropna()
+                if not present.empty:
+                    display_cols.append("Source System")
+            display_render_df = display_df[display_cols].copy()
+            for col in ["Avg Rating", "Last 30d Avg", "30d Delta", "Gap vs Region Avg", "Gap vs Selected Avg"]:
+                if col in display_render_df.columns:
+                    display_render_df[col] = pd.to_numeric(display_render_df[col], errors="coerce").round(2)
+            if "Share of View" in display_render_df.columns:
+                display_render_df["Share of View"] = pd.to_numeric(display_render_df["Share of View"], errors="coerce").map(lambda v: f"{v:.1%}" if pd.notna(v) else "")
+
+            if "Region" in display_render_df.columns:
+                for region, sub in display_render_df.groupby("Region", sort=False):
+                    st.markdown(f"<div class='section-sub' style='margin-top:.75rem;'><strong>{_esc(region)}</strong></div>", unsafe_allow_html=True)
+                    st.dataframe(sub[[c for c in display_cols if c != "Region"]], use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(display_render_df[display_cols], use_container_width=True, hide_index=True)
+
+        with watch_tabs[1]:
+            if alerts_df.empty:
+                st.info("No smoke alerts are firing for the current selection.")
+            else:
+                top_alert = alerts_df.iloc[0]
+                headline = f"Top alert: {_esc(top_alert.get('Retailer'))}"
+                if "Region" in alerts_df.columns and _safe_text(top_alert.get("Region")):
+                    headline += f" · {_esc(top_alert.get('Region'))}"
+                detail = f"{_esc(top_alert.get('Alert Level'))} — {_esc(top_alert.get('Signal'))}"
+                st.markdown(f"<div class='status-note'><strong>{headline}</strong><br>{detail}</div>", unsafe_allow_html=True)
+                alerts_render = alerts_df.copy()
+                for col in ["Avg Rating", "Last 30d Avg", "30d Delta", "Gap vs Region Avg", "Gap vs Selected Avg"]:
+                    if col in alerts_render.columns:
+                        alerts_render[col] = pd.to_numeric(alerts_render[col], errors="coerce").round(2)
+                if "Share of View" in alerts_render.columns:
+                    alerts_render["Share of View"] = pd.to_numeric(alerts_render["Share of View"], errors="coerce").map(lambda v: f"{v:.1%}" if pd.notna(v) else "")
+                st.dataframe(alerts_render, use_container_width=True, hide_index=True)
+
+        default_retailer = None
+        default_region = "All selected"
+        if not alerts_df.empty:
+            default_retailer = _safe_text(alerts_df.iloc[0].get("Retailer"))
+            if "Region" in alerts_df.columns:
+                default_region = _safe_text(alerts_df.iloc[0].get("Region"), "All selected") or "All selected"
+        if not default_retailer and not table_df.empty:
+            default_retailer = _safe_text(table_df.iloc[0].get("Retailer"))
+        retailer_options = ["All retailers (avg)"] + sorted([_safe_text(v) for v in table_df["Retailer"].dropna().unique() if _safe_text(v)])
+        if st.session_state.get("retailer_watch_focus_retailer") not in retailer_options:
+            st.session_state["retailer_watch_focus_retailer"] = default_retailer or retailer_options[0]
+        region_focus_options = ["All selected"] + known_regions if known_regions else ["All selected"]
+        if st.session_state.get("retailer_watch_focus_region") not in region_focus_options:
+            st.session_state["retailer_watch_focus_region"] = default_region if default_region in region_focus_options else "All selected"
+
+        with watch_tabs[2]:
+            if trend_df.empty:
+                st.info("Trend lines need a usable review date column. Select one in Data mapping to unlock weekly tracking.")
+            else:
+                t1, t2 = st.columns([1.2, 1])
+                focus_retailer = t1.selectbox("Trend focus", retailer_options, key="retailer_watch_focus_retailer")
+                focus_region = t2.selectbox("Trend region", region_focus_options, key="retailer_watch_focus_region")
+                trend_view = trend_df.copy()
+                if focus_retailer != "All retailers (avg)":
+                    trend_view = trend_view[trend_view["Retailer"] == focus_retailer].copy()
+                if focus_region != "All selected" and "Region" in trend_view.columns:
+                    trend_view = trend_view[trend_view["Region"] == focus_region].copy()
+                if trend_view.empty:
+                    st.info("No trend rows match the current focus.")
+                else:
+                    if focus_retailer == "All retailers (avg)":
+                        group_cols = ["Week"] + (["Region"] if ("Region" in trend_view.columns and focus_region == "All selected" and trend_view["Region"].nunique() > 1) else [])
+                        trend_plot_df = trend_view.groupby(group_cols, dropna=False).agg(Reviews=("Reviews", "sum"), **{"Avg Rating": ("Avg Rating", "mean")}).reset_index()
+                    else:
+                        trend_plot_df = trend_view.copy()
+                    line_color_col = "Region" if "Region" in trend_plot_df.columns and trend_plot_df["Region"].nunique() > 1 else None
+                    fig = make_subplots(specs=[[{"secondary_y": True}]])
+                    volume_df = trend_plot_df.groupby("Week", as_index=False)["Reviews"].sum().sort_values("Week")
+                    fig.add_bar(x=volume_df["Week"], y=volume_df["Reviews"], name="Reviews", opacity=0.22, secondary_y=True)
+                    if line_color_col:
+                        for key, sub in trend_plot_df.sort_values("Week").groupby(line_color_col, sort=False):
+                            fig.add_scatter(x=sub["Week"], y=sub["Avg Rating"], mode="lines+markers", name=str(key), secondary_y=False)
+                    else:
+                        sub = trend_plot_df.sort_values("Week")
+                        name = focus_retailer if focus_retailer != "All retailers (avg)" else "Selected view"
+                        fig.add_scatter(x=sub["Week"], y=sub["Avg Rating"], mode="lines+markers", name=name, secondary_y=False)
+                    fig.update_layout(
+                        height=360,
+                        margin=dict(l=20, r=18, t=18, b=40),
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        font_family="Inter",
+                        legend=dict(orientation="h", y=-0.22, x=0, xanchor="left"),
+                    )
+                    fig.update_yaxes(title_text="Average rating ★", range=[0, 5.2], secondary_y=False)
+                    fig.update_yaxes(title_text="Reviews/week", secondary_y=True, rangemode="tozero")
+                    fig = _sw_style_fig(fig)
+                    _show_plotly(fig)
+                    latest_row = trend_plot_df.sort_values("Week").iloc[-1]
+                    latest_avg = pd.to_numeric(latest_row.get("Avg Rating"), errors="coerce")
+                    latest_reviews = int(pd.to_numeric(latest_row.get("Reviews"), errors="coerce") or 0)
+                    st.markdown(
+                        f"<div class='status-note'><strong>Latest week:</strong> {pd.to_datetime(latest_row.get('Week')).strftime('%Y-%m-%d')} · <strong>{latest_avg:.2f}★</strong> across <strong>{latest_reviews:,}</strong> reviews</div>",
+                        unsafe_allow_html=True,
+                    )
+
+        with watch_tabs[3]:
+            if review_rows_df.empty:
+                st.info("No review detail rows are available for the current selection.")
+            else:
+                r1, r2, r3, r4 = st.columns([1.2, 1.0, 0.85, 0.85])
+                review_focus_retailer = r1.selectbox("Retailer focus", retailer_options[1:] or retailer_options, key="retailer_watch_reviews_retailer")
+                review_focus_region = r2.selectbox("Region focus", region_focus_options, key="retailer_watch_reviews_region")
+                recent_only = r3.toggle("Last 30 days only", value=True, key="retailer_watch_reviews_recent")
+                low_only = r4.toggle("Ratings ≤3 only", value=True, key="retailer_watch_reviews_low")
+                review_view = review_rows_df.copy()
+                if review_focus_retailer and review_focus_retailer != "All retailers (avg)":
+                    review_view = review_view[review_view["Retailer"] == review_focus_retailer].copy()
+                if review_focus_region != "All selected" and "Region" in review_view.columns:
+                    review_view = review_view[review_view["Region"] == review_focus_region].copy()
+                if recent_only:
+                    review_view = review_view[review_view["Recent Window"] == "Last 30d"].copy()
+                if low_only:
+                    review_view = review_view[pd.to_numeric(review_view["Rating"], errors="coerce") <= 3].copy()
+                review_view = review_view.sort_values(["Rating", "Date"], ascending=[True, False], na_position="last").reset_index(drop=True)
+                if review_view.empty:
+                    st.info("No review rows match this smoke-investigation focus.")
+                else:
+                    render = review_view.copy()
+                    render["Date"] = pd.to_datetime(render["Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+                    render["Title"] = render["Title"].map(lambda x: _trunc(x, 100))
+                    render["Review"] = render["Review"].map(lambda x: _trunc(x, 220))
+                    st.dataframe(render[[c for c in ["Date", "Rating", "Region", "Retailer", "Title", "Review", "Symptom Detractors", "Symptom Delighters", "Post Link"] if c in render.columns]], use_container_width=True, hide_index=True)
+
+        with watch_tabs[4]:
+            if symptom_summary_df.empty:
+                st.info("No symptomized fields are available in the current view yet. Run the Symptomizer or keep AI symptom columns during upload to unlock this overlay.")
+            else:
+                s1, s2 = st.columns([1.2, 1.0])
+                symptom_focus_retailer = s1.selectbox("Retailer focus", retailer_options[1:] or retailer_options, key="retailer_watch_symptoms_retailer")
+                symptom_focus_region = s2.selectbox("Region focus", region_focus_options, key="retailer_watch_symptoms_region")
+                sym_view = symptom_summary_df.copy()
+                if symptom_focus_retailer and symptom_focus_retailer != "All retailers (avg)":
+                    sym_view = sym_view[sym_view["Retailer"] == symptom_focus_retailer].copy()
+                if symptom_focus_region != "All selected":
+                    sym_view = sym_view[sym_view["Region"] == symptom_focus_region].copy()
+                if sym_view.empty:
+                    st.info("No symptom summary rows match this focus.")
+                else:
+                    det_df = sym_view[sym_view["Side"] == "Detractor"].head(12).copy()
+                    del_df = sym_view[sym_view["Side"] == "Delighter"].head(12).copy()
+                    for frame in [det_df, del_df]:
+                        if not frame.empty:
+                            frame["Share of Reviews"] = pd.to_numeric(frame["Share of Reviews"], errors="coerce").map(lambda v: f"{v:.1%}" if pd.notna(v) else "")
+                    sx1, sx2 = st.columns(2)
+                    with sx1:
+                        st.markdown("<div class='section-sub'><strong>Top detractors in this slice</strong></div>", unsafe_allow_html=True)
+                        st.dataframe(det_df[[c for c in ["Label", "Mentions", "Share of Reviews"] if c in det_df.columns]], use_container_width=True, hide_index=True)
+                    with sx2:
+                        st.markdown("<div class='section-sub'><strong>Top delighters in this slice</strong></div>", unsafe_allow_html=True)
+                        st.dataframe(del_df[[c for c in ["Label", "Mentions", "Share of Reviews"] if c in del_df.columns]], use_container_width=True, hide_index=True)
+
 
 def _build_volume_bar_series(trend, volume_mode):
     if trend is None or trend.empty:
@@ -4416,7 +4907,7 @@ WATCH_SOURCE_COLUMN_ALIASES = [
     "channel", "source_label", "source", "source_system", "platform", "provider", "loaded_from_host",
 ]
 WATCH_REGION_COLUMN_ALIASES = [
-    "reviewer_location", "user_location", "location", "content_locale", "locale", "region", "market", "country", "country_code", "geo", "marketplace",
+    "reviewer_location", "Reviewer Location", "user_location", "location", "content_locale", "locale", "region", "market", "country", "country_code", "geo", "marketplace",
 ]
 WATCH_DATE_COLUMN_ALIASES = [
     "submission_time", "submission_date", "review_date", "published", "published_at", "created_at", "date",
