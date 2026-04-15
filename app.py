@@ -5227,30 +5227,28 @@ def _extra_filter_column_score(df: pd.DataFrame, col: str) -> Optional[Tuple[int
         num = pd.to_numeric(s, errors="coerce").dropna()
         if num.nunique(dropna=True) <= 1:
             return None
-        return (70, col)
+        return (82, col)
     if kind == "date":
         dt = pd.to_datetime(s, errors="coerce").dropna()
         if dt.nunique(dropna=True) <= 1:
             return None
-        return (68, col)
+        return (80, col)
     clean = s.astype("string").fillna("").str.strip().replace("", pd.NA).dropna()
     nunique = int(clean.nunique(dropna=True))
     if nunique <= 1:
         return None
-    if _looks_like_blob_or_text_column(df, col) or _looks_like_identifier_or_link(df, col):
-        return None
-    row_count = max(len(df), 1)
-    upper_reasonable = max(50, min(800, int(row_count * 0.8)))
-    if nunique > upper_reasonable:
-        return None
+    if kind == "text":
+        avg_len = float(clean.str.len().mean()) if not clean.empty else 0.0
+        score = 74 if avg_len >= 90 else 76
+        return (score, col)
     if nunique <= 12:
         score = 95
     elif nunique <= 40:
-        score = 88
+        score = 90
     elif nunique <= 120:
-        score = 80
+        score = 84
     else:
-        score = 72
+        score = 78
     return (score, col)
 
 
@@ -5290,6 +5288,16 @@ def _infer_extra_filter_kind(df: pd.DataFrame, col: str) -> str:
             return "numeric"
     except Exception:
         pass
+    if _looks_like_blob_or_text_column(df, col) or _looks_like_identifier_or_link(df, col):
+        return "text"
+    try:
+        clean = s.astype("string").fillna("").str.strip().replace("", pd.NA).dropna()
+        nunique = int(clean.nunique(dropna=True))
+        row_count = max(len(clean), 1)
+        if nunique > max(120, int(row_count * 0.7)):
+            return "text"
+    except Exception:
+        pass
     return "categorical"
 
 
@@ -5301,6 +5309,16 @@ def _extra_filter_candidates(df: pd.DataFrame) -> List[str]:
         excluded.add(rating_col)
     excluded.update(set(det_cols + del_cols))
     excluded.update({str(c) for c in df.columns if str(c).startswith("AI Symptom ") or str(c).startswith("Symptom ")})
+    excluded.update({
+        "title_and_text",
+        "review_length_chars",
+        "review_length_words",
+        "rating_label",
+        "year_month_sort",
+        "submission_month",
+        "has_photos",
+        "has_media",
+    })
 
     scored: List[Tuple[int, str]] = []
     for raw_col in df.columns:
@@ -5463,6 +5481,8 @@ def _apply_live_review_filters(df_base: pd.DataFrame) -> Dict[str, Any]:
             cv = _safe_text(st.session_state.get(ck)).strip()
             if cv:
                 mask &= s.astype("string").fillna("").str.contains(cv, case=False, na=False, regex=False)
+            elif kind == "text":
+                pass
             else:
                 sel = st.session_state.get(f"rf_{col}", ["ALL"])
                 sel_list = sel if isinstance(sel, list) else [sel]
@@ -8872,7 +8892,7 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
             current_extra = [c for c in (st.session_state.get("rf_extra_filter_cols", []) or []) if c in extra_candidates]
             st.session_state["rf_extra_filter_cols"] = current_extra
             with st.expander("➕ Add Filters", expanded=False):
-                st.caption("Suggested from the current workspace schema so this list adapts to each uploaded file.")
+                st.caption("Pulled directly from the loaded workspace schema so uploaded-file headers can become sidebar filters too.")
                 st.multiselect("Available columns from this workspace", options=extra_candidates, default=current_extra, key="rf_extra_filter_cols")
             extra_cols = st.session_state.get("rf_extra_filter_cols", []) or []
             if extra_cols:
@@ -8912,8 +8932,8 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
                                 nunique = int(s.astype("string").replace({"": pd.NA}).nunique(dropna=True))
                             except Exception:
                                 nunique = 0
-                            if nunique > 600:
-                                st.text_input(f"{col} contains", value=str(st.session_state.get(f"rf_{col}_contains") or ""), key=f"rf_{col}_contains", help="High-cardinality column — using a contains filter for speed.")
+                            if kind == "text" or nunique > 600:
+                                st.text_input(f"{col} contains", value=str(st.session_state.get(f"rf_{col}_contains") or ""), key=f"rf_{col}_contains", help="Text / high-cardinality column — using a contains filter so any uploaded header can still be filtered.")
                             else:
                                 opts = _col_options(df, col, max_vals=None)
                                 _sanitize_multiselect(f"rf_{col}", opts, ["ALL"])
