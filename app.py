@@ -3822,6 +3822,26 @@ def _render_source_rating_watch(df):
         trend_df = payload.get("trend_df", pd.DataFrame())
         review_rows_df = payload.get("review_rows_df", pd.DataFrame())
         symptom_summary_df = payload.get("symptom_summary_df", pd.DataFrame())
+
+        def _watch_fill_label(frame, col, fallback):
+            if frame is None or frame.empty or col not in frame.columns:
+                return frame
+            out = frame.copy()
+            vals = out[col].astype("string").fillna("").str.strip()
+            out[col] = vals.mask(vals.eq(""), fallback)
+            return out
+
+        table_df = _watch_fill_label(table_df, "Retailer", "Unknown retailer")
+        table_df = _watch_fill_label(table_df, "Region", "All selected regions")
+        region_kpis_df = _watch_fill_label(region_kpis_df, "Region", "All selected regions")
+        alerts_df = _watch_fill_label(alerts_df, "Retailer", "Unknown retailer")
+        alerts_df = _watch_fill_label(alerts_df, "Region", "All selected regions")
+        trend_df = _watch_fill_label(trend_df, "Retailer", "Unknown retailer")
+        trend_df = _watch_fill_label(trend_df, "Region", "All selected regions")
+        review_rows_df = _watch_fill_label(review_rows_df, "Retailer", "Unknown retailer")
+        review_rows_df = _watch_fill_label(review_rows_df, "Region", "All selected regions")
+        symptom_summary_df = _watch_fill_label(symptom_summary_df, "Retailer", "Unknown retailer")
+        symptom_summary_df = _watch_fill_label(symptom_summary_df, "Region", "All selected regions")
         if table_df.empty:
             st.info("No reviews match the current retailer-watch selection.")
             return
@@ -3890,15 +3910,28 @@ def _render_source_rating_watch(df):
             if gap_col:
                 hover_data[gap_col] = ":.2f"
             if "Region" in chart_df.columns:
-                fig = px.bar(
-                    chart_df,
-                    x="Retailer",
-                    y="Avg Rating",
-                    color="Region",
-                    barmode="group",
-                    category_orders={"Retailer": order_source},
-                    hover_data=hover_data,
-                )
+                region_series = chart_df["Region"].astype("string").fillna("").str.strip().replace("", "All selected regions")
+                chart_df["Region"] = region_series
+                use_region_color = chart_df["Region"].nunique(dropna=True) > 1
+                if use_region_color:
+                    fig = px.bar(
+                        chart_df,
+                        x="Retailer",
+                        y="Avg Rating",
+                        color="Region",
+                        barmode="group",
+                        category_orders={"Retailer": order_source},
+                        hover_data=hover_data,
+                    )
+                else:
+                    fig = px.bar(
+                        chart_df,
+                        x="Retailer",
+                        y="Avg Rating",
+                        category_orders={"Retailer": order_source},
+                        hover_data=hover_data,
+                    )
+                    fig.update_traces(marker_color="#3b82f6", name="Selected view")
             else:
                 color_field = "Alert Level" if chart_df["Alert Level"].astype("string").fillna("").str.strip().ne("").any() else None
                 fig = px.bar(
@@ -3916,15 +3949,16 @@ def _render_source_rating_watch(df):
                 fig.add_hline(y=overall_avg, line_dash="dot", line_color="rgba(71,85,105,0.8)", annotation_text=f"Selected avg {overall_avg:.2f}★", annotation_position="top left")
             fig.update_layout(
                 title=None,
-                margin=dict(l=20, r=18, t=18, b=60),
+                margin=dict(l=20, r=18, t=34, b=72),
                 xaxis_title="",
                 yaxis_title="Average rating ★",
-                height=360,
+                height=380,
                 plot_bgcolor="rgba(0,0,0,0)",
                 paper_bgcolor="rgba(0,0,0,0)",
                 font_family="Inter",
-                legend=dict(orientation="h", y=-0.22, x=0, xanchor="left"),
+                legend=dict(orientation="h", y=1.08, x=0, xanchor="left", yanchor="bottom"),
             )
+            fig.update_xaxes(tickangle=-20, automargin=True)
             fig = _sw_style_fig(fig)
             _show_plotly(fig)
 
@@ -4014,13 +4048,14 @@ def _render_source_rating_watch(df):
                         name = focus_retailer if focus_retailer != "All retailers (avg)" else "Selected view"
                         fig.add_scatter(x=sub["Week"], y=sub["Avg Rating"], mode="lines+markers", name=name, secondary_y=False)
                     fig.update_layout(
-                        height=360,
-                        margin=dict(l=20, r=18, t=18, b=40),
+                        height=380,
+                        margin=dict(l=20, r=18, t=34, b=60),
                         plot_bgcolor="rgba(0,0,0,0)",
                         paper_bgcolor="rgba(0,0,0,0)",
                         font_family="Inter",
-                        legend=dict(orientation="h", y=-0.22, x=0, xanchor="left"),
+                        legend=dict(orientation="h", y=1.08, x=0, xanchor="left", yanchor="bottom"),
                     )
+                    fig.update_xaxes(automargin=True)
                     fig.update_yaxes(title_text="Average rating ★", range=[0, 5.2], secondary_y=False)
                     fig.update_yaxes(title_text="Reviews/week", secondary_y=True, rangemode="tozero")
                     fig = _sw_style_fig(fig)
