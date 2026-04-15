@@ -3348,7 +3348,7 @@ def _prepare_source_rating_watch(
     region_kpis = pd.concat([overall_row, region_kpis], ignore_index=True)
     rename_map = {
         "region": "Region",
-        "source_label": "Source",
+        "source_label": "Retailer",
         "retailer": "Retailer",
         "source_system": "Source System",
         "reviews": "Reviews",
@@ -3381,7 +3381,7 @@ def _source_rating_watch_export_bytes(
                 "Generated At UTC": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 "Organic only": bool(organic_only),
                 "Split by region": bool(split_by_region),
-                "Source column": source_col or "Auto-detect",
+                "Retailer column": source_col or "Retailer (default) / auto-detect",
                 "Region column": region_col or "None / auto-unavailable",
                 "Date column": date_col or "None / auto-unavailable",
                 "Organic flag column": organic_flag_col or "Not detected",
@@ -3411,20 +3411,20 @@ def _render_source_rating_watch(df):
         region_options = _source_rating_watch_column_options(df, allow_none=True)
         date_options = _source_rating_watch_column_options(df, allow_none=True)
         if st.session_state.get("retailer_watch_source_col") not in source_options:
-            st.session_state["retailer_watch_source_col"] = AUTO_COLUMN_SENTINEL
+            st.session_state["retailer_watch_source_col"] = _resolve_column_alias(df, WATCH_SOURCE_COLUMN_ALIASES) or AUTO_COLUMN_SENTINEL
         if st.session_state.get("retailer_watch_region_col") not in region_options:
-            st.session_state["retailer_watch_region_col"] = AUTO_COLUMN_SENTINEL
+            st.session_state["retailer_watch_region_col"] = _resolve_column_alias(df, WATCH_REGION_COLUMN_ALIASES) or AUTO_COLUMN_SENTINEL
         if st.session_state.get("retailer_watch_date_col") not in date_options:
-            st.session_state["retailer_watch_date_col"] = AUTO_COLUMN_SENTINEL
+            st.session_state["retailer_watch_date_col"] = _resolve_column_alias(df, WATCH_DATE_COLUMN_ALIASES) or AUTO_COLUMN_SENTINEL
 
         with st.expander("🧭 Data mapping", expanded=False):
             m1, m2, m3 = st.columns(3)
             m1.selectbox(
-                "Retailer / source column",
+                "Retailer column",
                 options=source_options,
                 key="retailer_watch_source_col",
                 format_func=_format_column_choice_label,
-                help="Point the watch at the column that best represents retailer, channel, merchant, or source.",
+                help="Default is Retailer. Override it here if the uploaded file uses a different retailer field.",
             )
             m2.selectbox(
                 "Region column",
@@ -3446,7 +3446,7 @@ def _render_source_rating_watch(df):
         resolved_date_col = _resolve_optional_column_choice(df, st.session_state.get("retailer_watch_date_col"), WATCH_DATE_COLUMN_ALIASES, allow_none=True)
         organic_flag_col = _resolve_column_alias(df, WATCH_ORGANIC_COLUMN_ALIASES)
 
-        mapping_bits = [f"Source: <strong>{_esc(resolved_source_col or 'not found')}</strong>"]
+        mapping_bits = [f"Retailer: <strong>{_esc(resolved_source_col or 'not found')}</strong>"]
         mapping_bits.append(f"Region: <strong>{_esc(resolved_region_col or 'none')}</strong>")
         mapping_bits.append(f"Date: <strong>{_esc(resolved_date_col or 'none')}</strong>")
         if organic_flag_col:
@@ -3517,27 +3517,27 @@ def _render_source_rating_watch(df):
         chart_df = table_df.copy()
         chart_df["Avg Rating"] = pd.to_numeric(chart_df.get("Avg Rating"), errors="coerce")
         order_source = (
-            chart_df.groupby("Source", as_index=False)["Avg Rating"]
+            chart_df.groupby("Retailer", as_index=False)["Avg Rating"]
             .mean()
-            .sort_values("Avg Rating", ascending=False)["Source"]
+            .sort_values("Avg Rating", ascending=False)["Retailer"]
             .tolist()
         )
         if "Region" in chart_df.columns:
             fig = px.bar(
                 chart_df,
-                x="Source",
+                x="Retailer",
                 y="Avg Rating",
                 color="Region",
                 barmode="group",
-                category_orders={"Source": order_source},
+                category_orders={"Retailer": order_source},
                 hover_data={"Reviews": True, "Last 30d Avg": ":.2f", "30d Delta": ":.2f", "Share of View": ":.1%"},
             )
         else:
             fig = px.bar(
                 chart_df,
-                x="Source",
+                x="Retailer",
                 y="Avg Rating",
-                category_orders={"Source": order_source},
+                category_orders={"Retailer": order_source},
                 hover_data={"Reviews": True, "Last 30d Avg": ":.2f", "30d Delta": ":.2f", "Share of View": ":.1%"},
             )
             fig.update_traces(marker_color="#3b82f6")
@@ -3559,7 +3559,7 @@ def _render_source_rating_watch(df):
         _show_plotly(fig)
 
         display_df = table_df.copy()
-        base_cols = ["Region", "Source", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Share of View", "Signal"] if "Region" in display_df.columns else ["Source", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Share of View", "Signal"]
+        base_cols = ["Region", "Retailer", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Share of View", "Signal"] if "Region" in display_df.columns else ["Retailer", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Share of View", "Signal"]
         meta_cols = []
         for col in ["Retailer", "Source System"]:
             if col in display_df.columns:
@@ -4412,11 +4412,11 @@ CORE_REVIEW_FILTER_SPECS = [
 ]
 
 WATCH_SOURCE_COLUMN_ALIASES = [
-    "retailer", "source_label", "merchant", "channel", "store", "seller", "retailer_name",
-    "retail_partner", "site_name", "source", "source_system", "platform", "provider", "loaded_from_host",
+    "retailer", "retailer_name", "merchant", "store", "seller", "retail_partner", "site_name",
+    "channel", "source_label", "source", "source_system", "platform", "provider", "loaded_from_host",
 ]
 WATCH_REGION_COLUMN_ALIASES = [
-    "content_locale", "locale", "region", "market", "country", "country_code", "geo", "marketplace",
+    "reviewer_location", "user_location", "content_locale", "locale", "region", "market", "country", "country_code", "geo", "marketplace",
 ]
 WATCH_DATE_COLUMN_ALIASES = [
     "submission_time", "submission_date", "review_date", "published", "published_at", "created_at", "date",
@@ -4498,7 +4498,7 @@ def _source_rating_watch_column_options(df: Optional[pd.DataFrame], *, allow_non
 
 def _format_column_choice_label(value: str) -> str:
     if value == AUTO_COLUMN_SENTINEL:
-        return "Auto-detect"
+        return "Default / auto-detect"
     if value == NONE_COLUMN_SENTINEL:
         return "None"
     return str(value)
