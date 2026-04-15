@@ -3154,8 +3154,84 @@ def _first_non_empty(series):
     return ""
 
 
+def _clean_watch_dimension_series(series: pd.Series, *, unknown: str = "Unknown") -> pd.Series:
+    cleaned = series.astype("string").fillna("").str.strip()
+    cleaned = cleaned.replace({"": unknown, "nan": unknown, "none": unknown, "null": unknown, "<na>": unknown})
+    return cleaned.fillna(unknown)
+
+
+_REGION_TEXT_ALIASES = {
+    "UNITED STATES": "USA",
+    "UNITED STATES OF AMERICA": "USA",
+    "US": "USA",
+    "USA": "USA",
+    "UNITED KINGDOM": "UK",
+    "GREAT BRITAIN": "UK",
+    "GB": "UK",
+    "UK": "UK",
+    "CANADA": "Canada",
+    "AUSTRALIA": "Australia",
+    "GERMANY": "Germany",
+    "FRANCE": "France",
+    "SPAIN": "Spain",
+    "ITALY": "Italy",
+    "JAPAN": "Japan",
+    "MEXICO": "Mexico",
+    "BRAZIL": "Brazil",
+    "NETHERLANDS": "Netherlands",
+}
+
+
+def _region_label_from_value(value: Any) -> str:
+    raw = _safe_text(value).strip()
+    if not raw:
+        return "Unknown"
+    upper_words = re.sub(r"[^A-Za-z ]", " ", raw).upper()
+    upper_words = re.sub(r"\s+", " ", upper_words).strip()
+    if upper_words in _REGION_TEXT_ALIASES:
+        return _REGION_TEXT_ALIASES[upper_words]
+    if re.search(r"^[A-Za-z]{2,3}(?:[_-][A-Za-z]{2,3})+$", raw):
+        return _locale_to_region_label(raw)
+    compact = re.sub(r"[^A-Z]", "", upper_words)
+    if compact in REGION_NAME_MAP:
+        return REGION_NAME_MAP[compact]
+    titled = re.sub(r"\s+", " ", raw).strip()
+    return titled or "Unknown"
+
+
+def _region_series_from_column(series: pd.Series) -> pd.Series:
+    cleaned = series.astype("string").fillna("").str.strip()
+    return cleaned.map(_region_label_from_value).fillna("Unknown")
+
+
+def _organic_only_mask(series: pd.Series, column_name: str) -> pd.Series:
+    norm_name = _normalize_col_key(column_name)
+    if pd.api.types.is_bool_dtype(series) or str(series.dtype).lower() == "boolean":
+        base = series.astype("boolean")
+        return base.fillna(False) if "organic" in norm_name else (~base.fillna(False))
+
+    text = series.astype("string").fillna("").str.strip().str.lower()
+    true_like = {"true", "yes", "y", "1", "paid", "sponsored", "incentivized", "gifted"}
+    organic_like = {"organic", "unpaid", "earned", "consumer", "false", "no", "n", "0"}
+    mapped = pd.Series(pd.NA, index=text.index, dtype="boolean")
+    mapped.loc[text.isin(true_like)] = True
+    mapped.loc[text.isin(organic_like)] = False
+    if "organic" in norm_name:
+        return mapped.fillna(False)
+    return (~mapped.fillna(False))
+
+
 @st.cache_data(show_spinner=False, ttl=300)
-def _prepare_source_rating_watch(df, *, organic_only=False, selected_regions=None, combine_regions=True):
+def _prepare_source_rating_watch(
+    df,
+    *,
+    organic_only: bool = False,
+    selected_regions: Optional[Sequence[str]] = None,
+    combine_regions: bool = True,
+    source_col: Optional[str] = None,
+    region_col: Optional[str] = None,
+    date_col: Optional[str] = None,
+):
     if df is None or df.empty or "rating" not in df.columns:
         return pd.DataFrame(), pd.DataFrame(), []
 
@@ -3165,13 +3241,20 @@ def _prepare_source_rating_watch(df, *, organic_only=False, selected_regions=Non
     if w.empty:
         return pd.DataFrame(), pd.DataFrame(), []
 
-    if organic_only and "incentivized_review" in w.columns:
-        w = w[~w["incentivized_review"].fillna(False)].copy()
+    resolved_source_col = source_col if source_col in w.columns else _resolve_column_alias(w, WATCH_SOURCE_COLUMN_ALIASES)
+    resolved_region_col = region_col if region_col in w.columns else _resolve_column_alias(w, WATCH_REGION_COLUMN_ALIASES)
+    resolved_date_col = date_col if date_col in w.columns else _resolve_column_alias(w, WATCH_DATE_COLUMN_ALIASES)
+    organic_col = _resolve_column_alias(w, WATCH_ORGANIC_COLUMN_ALIASES)
+
+    if organic_only and organic_col and organic_col in w.columns:
+        w = w[_organic_only_mask(w[organic_col], organic_col)].copy()
     if w.empty:
         return pd.DataFrame(), pd.DataFrame(), []
 
-    locale_series = w.get("content_locale", pd.Series(index=w.index, dtype="object")).fillna("").astype(str)
-    w["region"] = locale_series.map(_locale_to_region_label).fillna("Unknown")
+    if resolved_region_col and resolved_region_col in w.columns:
+        w["region"] = _region_series_from_column(w[resolved_region_col])
+    else:
+        w["region"] = "Unknown"
     known_regions = [r for r in sorted(set(w["region"])) if r and r != "Unknown"]
 
     if known_regions and selected_regions:
@@ -3181,20 +3264,22 @@ def _prepare_source_rating_watch(df, *, organic_only=False, selected_regions=Non
     if w.empty:
         return pd.DataFrame(), pd.DataFrame(), known_regions
 
-    retailer = w.get("retailer", pd.Series(index=w.index, dtype="object")).fillna("").astype(str).str.strip()
-    source_system = w.get("source_system", pd.Series(index=w.index, dtype="object")).fillna("").astype(str).str.strip()
-    w["retailer"] = retailer
-    w["source_system"] = source_system
-    w["source_label"] = retailer.mask(retailer.eq(""), source_system)
-    w.loc[w["source_label"].eq(""), "source_label"] = "Unknown Source"
+    source_series = pd.Series("", index=w.index, dtype="object")
+    if resolved_source_col and resolved_source_col in w.columns:
+        source_series = _clean_watch_dimension_series(w[resolved_source_col], unknown="")
+    source_system_col = _resolve_column_alias(w, ["source_system", "source", "platform", "provider", "review_source"])
+    source_system_series = _clean_watch_dimension_series(w[source_system_col], unknown="") if source_system_col and source_system_col in w.columns else pd.Series("", index=w.index, dtype="object")
+    w["retailer"] = _clean_watch_dimension_series(w[resolved_source_col], unknown="") if resolved_source_col and resolved_source_col in w.columns else source_series.copy()
+    w["source_system"] = source_system_series
+    w["source_label"] = _clean_watch_dimension_series(source_series.mask(source_series.eq(""), source_system_series), unknown="Unknown Source")
 
-    if "submission_time" in w.columns:
-        w["submission_time"] = pd.to_datetime(w["submission_time"], errors="coerce", utc=True)
+    if resolved_date_col and resolved_date_col in w.columns:
+        w["_watch_date"] = pd.to_datetime(w[resolved_date_col], errors="coerce", utc=True)
     else:
-        w["submission_time"] = pd.NaT
-    anchor_time = w["submission_time"].dropna().max() if w["submission_time"].notna().any() else pd.Timestamp.now(tz="UTC")
+        w["_watch_date"] = pd.NaT
+    anchor_time = w["_watch_date"].dropna().max() if w["_watch_date"].notna().any() else pd.Timestamp.now(tz="UTC")
     recent_cutoff = anchor_time - pd.Timedelta(days=30)
-    w["_recent"] = w["submission_time"].notna() & (w["submission_time"] >= recent_cutoff)
+    w["_recent"] = w["_watch_date"].notna() & (w["_watch_date"] >= recent_cutoff)
 
     group_cols = ["source_label"] if combine_regions or not known_regions else ["region", "source_label"]
 
@@ -3278,7 +3363,17 @@ def _prepare_source_rating_watch(df, *, organic_only=False, selected_regions=Non
     return table, region_kpis, known_regions
 
 
-def _source_rating_watch_export_bytes(table_df, region_kpis_df, *, split_by_region=False, organic_only=False):
+def _source_rating_watch_export_bytes(
+    table_df,
+    region_kpis_df,
+    *,
+    split_by_region: bool = False,
+    organic_only: bool = False,
+    source_col: Optional[str] = None,
+    region_col: Optional[str] = None,
+    date_col: Optional[str] = None,
+    organic_flag_col: Optional[str] = None,
+):
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         pd.DataFrame(
@@ -3286,6 +3381,10 @@ def _source_rating_watch_export_bytes(table_df, region_kpis_df, *, split_by_regi
                 "Generated At UTC": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 "Organic only": bool(organic_only),
                 "Split by region": bool(split_by_region),
+                "Source column": source_col or "Auto-detect",
+                "Region column": region_col or "None / auto-unavailable",
+                "Date column": date_col or "None / auto-unavailable",
+                "Organic flag column": organic_flag_col or "Not detected",
             }]
         ).to_excel(writer, sheet_name="Config", index=False)
         region_kpis_df.to_excel(writer, sheet_name="Region Summary", index=False)
@@ -3298,31 +3397,105 @@ def _source_rating_watch_export_bytes(table_df, region_kpis_df, *, split_by_regi
     return out.getvalue()
 
 
+
 def _render_source_rating_watch(df):
     with st.container(border=True):
         st.markdown("<div class='section-title'>🏪 Retailer rating watch</div>", unsafe_allow_html=True)
         st.markdown("<div class='section-sub'>Spot smoke by retailer and region. Track average rating, review count, and whether the most recent 30-day window is drifting down.</div>", unsafe_allow_html=True)
 
-        preview_table, _, known_regions = _prepare_source_rating_watch(df, organic_only=False, selected_regions=None, combine_regions=True)
-        if preview_table.empty:
+        if df is None or df.empty or "rating" not in df.columns:
             st.info("No rating data available for retailer watch.")
             return
 
+        source_options = _source_rating_watch_column_options(df, allow_none=False)
+        region_options = _source_rating_watch_column_options(df, allow_none=True)
+        date_options = _source_rating_watch_column_options(df, allow_none=True)
+        if st.session_state.get("retailer_watch_source_col") not in source_options:
+            st.session_state["retailer_watch_source_col"] = AUTO_COLUMN_SENTINEL
+        if st.session_state.get("retailer_watch_region_col") not in region_options:
+            st.session_state["retailer_watch_region_col"] = AUTO_COLUMN_SENTINEL
+        if st.session_state.get("retailer_watch_date_col") not in date_options:
+            st.session_state["retailer_watch_date_col"] = AUTO_COLUMN_SENTINEL
+
+        with st.expander("🧭 Data mapping", expanded=False):
+            m1, m2, m3 = st.columns(3)
+            m1.selectbox(
+                "Retailer / source column",
+                options=source_options,
+                key="retailer_watch_source_col",
+                format_func=_format_column_choice_label,
+                help="Point the watch at the column that best represents retailer, channel, merchant, or source.",
+            )
+            m2.selectbox(
+                "Region column",
+                options=region_options,
+                key="retailer_watch_region_col",
+                format_func=_format_column_choice_label,
+                help="Auto-detect works for locale / region / market columns, but you can override it here.",
+            )
+            m3.selectbox(
+                "Review date column",
+                options=date_options,
+                key="retailer_watch_date_col",
+                format_func=_format_column_choice_label,
+                help="Used for the rolling 30-day smoke signal and trend deltas.",
+            )
+
+        resolved_source_col = _resolve_optional_column_choice(df, st.session_state.get("retailer_watch_source_col"), WATCH_SOURCE_COLUMN_ALIASES)
+        resolved_region_col = _resolve_optional_column_choice(df, st.session_state.get("retailer_watch_region_col"), WATCH_REGION_COLUMN_ALIASES, allow_none=True)
+        resolved_date_col = _resolve_optional_column_choice(df, st.session_state.get("retailer_watch_date_col"), WATCH_DATE_COLUMN_ALIASES, allow_none=True)
+        organic_flag_col = _resolve_column_alias(df, WATCH_ORGANIC_COLUMN_ALIASES)
+
+        mapping_bits = [f"Source: <strong>{_esc(resolved_source_col or 'not found')}</strong>"]
+        mapping_bits.append(f"Region: <strong>{_esc(resolved_region_col or 'none')}</strong>")
+        mapping_bits.append(f"Date: <strong>{_esc(resolved_date_col or 'none')}</strong>")
+        if organic_flag_col:
+            mapping_bits.append(f"Organic flag: <strong>{_esc(organic_flag_col)}</strong>")
+        st.markdown("<div class='status-note'>" + " · ".join(mapping_bits) + "</div>", unsafe_allow_html=True)
+
+        preview_table, _, known_regions = _prepare_source_rating_watch(
+            df,
+            organic_only=False,
+            selected_regions=None,
+            combine_regions=True,
+            source_col=resolved_source_col,
+            region_col=resolved_region_col,
+            date_col=resolved_date_col,
+        )
+        if preview_table.empty:
+            st.info("No rating data is available for the current retailer-watch mapping.")
+            return
+
         c0, c1, c2 = st.columns([1, 1.4, 1])
-        organic_only = c0.toggle("Organic only", value=False, key="retailer_watch_organic_only")
+        organic_only = c0.toggle(
+            "Organic only",
+            value=False,
+            key="retailer_watch_organic_only",
+            disabled=(organic_flag_col is None),
+            help=("Uses the detected organic / incentivized flag." if organic_flag_col else "No organic / incentivized flag was detected in this workspace."),
+        )
         if known_regions:
-            selected_regions = c1.multiselect("Regions", known_regions, default=known_regions, key="retailer_watch_regions")
+            current_regions = [r for r in (st.session_state.get("retailer_watch_regions") or known_regions) if r in known_regions]
+            if not current_regions:
+                current_regions = known_regions
+            st.session_state["retailer_watch_regions"] = current_regions
+            selected_regions = c1.multiselect("Regions", known_regions, default=current_regions, key="retailer_watch_regions")
             combine_regions = c2.radio("View", ["All combined", "Split by region"], horizontal=True, key="retailer_watch_view") == "All combined"
         else:
             selected_regions = []
             combine_regions = True
-            c1.markdown("<div class='status-note'>Region metadata is not present in this workspace, so the table is shown combined.</div>", unsafe_allow_html=True)
+            c1.markdown("<div class='status-note'>Region metadata is not available for the current mapping, so the table is shown combined.</div>", unsafe_allow_html=True)
+        if organic_flag_col is None:
+            c0.caption("No organic flag detected in this workspace.")
 
         table_df, region_kpis_df, _ = _prepare_source_rating_watch(
             df,
             organic_only=organic_only,
             selected_regions=selected_regions,
             combine_regions=combine_regions,
+            source_col=resolved_source_col,
+            region_col=resolved_region_col,
+            date_col=resolved_date_col,
         )
         if table_df.empty:
             st.info("No reviews match the current retailer-watch selection.")
@@ -3386,15 +3559,28 @@ def _render_source_rating_watch(df):
         _show_plotly(fig)
 
         display_df = table_df.copy()
-        if "Region" in display_df.columns:
-            display_cols = ["Region", "Source", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Share of View", "Signal", "Retailer", "Source System"]
-        else:
-            display_cols = ["Source", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Share of View", "Signal", "Retailer", "Source System"]
+        base_cols = ["Region", "Source", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Share of View", "Signal"] if "Region" in display_df.columns else ["Source", "Reviews", "Avg Rating", "Last 30d Avg", "30d Delta", "Share of View", "Signal"]
+        meta_cols = []
+        for col in ["Retailer", "Source System"]:
+            if col in display_df.columns:
+                present = display_df[col].astype("string").fillna("").str.strip().replace("", pd.NA).dropna()
+                if not present.empty:
+                    meta_cols.append(col)
+        display_cols = base_cols + meta_cols
         display_df["Avg Rating"] = pd.to_numeric(display_df["Avg Rating"], errors="coerce").round(2)
         display_df["Last 30d Avg"] = pd.to_numeric(display_df["Last 30d Avg"], errors="coerce").round(2)
         display_df["30d Delta"] = pd.to_numeric(display_df["30d Delta"], errors="coerce").round(2)
         export_df = display_df[display_cols].copy()
-        export_bytes = _source_rating_watch_export_bytes(export_df, region_kpis_df, split_by_region=("Region" in display_df.columns), organic_only=organic_only)
+        export_bytes = _source_rating_watch_export_bytes(
+            export_df,
+            region_kpis_df,
+            split_by_region=("Region" in display_df.columns),
+            organic_only=organic_only,
+            source_col=resolved_source_col,
+            region_col=resolved_region_col,
+            date_col=resolved_date_col,
+            organic_flag_col=organic_flag_col,
+        )
         display_render_df = export_df.copy()
         display_render_df["Share of View"] = pd.to_numeric(display_render_df["Share of View"], errors="coerce").map(lambda v: f"{v:.1%}" if pd.notna(v) else "")
         st.download_button(
@@ -3412,7 +3598,6 @@ def _render_source_rating_watch(df):
                 st.dataframe(sub[display_cols[1:]], use_container_width=True, hide_index=True)
         else:
             st.dataframe(display_render_df[display_cols], use_container_width=True, hide_index=True)
-
 
 def _build_volume_bar_series(trend, volume_mode):
     if trend is None or trend.empty:
@@ -4212,19 +4397,111 @@ def _render_symptom_dashboard(filtered_df, overall_df=None):
 #  FILTERS
 # ═══════════════════════════════════════════════════════════════════════════════
 CORE_REVIEW_FILTER_SPECS = [
-    {"key": "product_or_sku", "label": "SKU / Product", "kind": "column", "column": "product_or_sku"},
-    {"key": "content_locale", "label": "Market / Locale", "kind": "column", "column": "content_locale"},
-    {"key": "retailer", "label": "Retailer", "kind": "column", "column": "retailer"},
-    {"key": "source_system", "label": "Source System", "kind": "column", "column": "source_system"},
-    {"key": "loaded_from_host", "label": "Loaded Site", "kind": "column", "column": "loaded_from_host"},
-    {"key": "source_file", "label": "Source File", "kind": "column", "column": "source_file"},
-    {"key": "age_group", "label": "Age Group", "kind": "column", "column": "age_group"},
-    {"key": "user_location", "label": "Reviewer Location", "kind": "column", "column": "user_location"},
+    {"key": "product_or_sku", "label": "SKU / Product", "kind": "column", "aliases": ["product_or_sku", "product_name", "product", "product_id", "sku", "item_id", "model", "model_number", "asin"]},
+    {"key": "content_locale", "label": "Market / Locale", "kind": "column", "aliases": ["content_locale", "locale", "market", "region", "country", "country_code", "geo", "marketplace"]},
+    {"key": "retailer", "label": "Retailer", "kind": "column", "aliases": ["retailer", "merchant", "channel", "store", "seller", "retailer_name", "retail_partner", "site_name"]},
+    {"key": "source_system", "label": "Source System", "kind": "column", "aliases": ["source_system", "source", "platform", "provider", "review_source", "connector", "system"]},
+    {"key": "loaded_from_host", "label": "Loaded Site", "kind": "column", "aliases": ["loaded_from_host", "loaded_host", "domain", "host", "site", "website"]},
+    {"key": "source_file", "label": "Source File", "kind": "column", "aliases": ["source_file", "file_name", "filename", "import_file", "upload_name"]},
+    {"key": "age_group", "label": "Age Group", "kind": "column", "aliases": ["age_group", "age_bucket", "age_band", "age"]},
+    {"key": "user_location", "label": "Reviewer Location", "kind": "column", "aliases": ["user_location", "reviewer_location", "location", "city", "state", "province"]},
     {"key": "review_type", "label": "Review Type", "kind": "derived"},
     {"key": "recommendation", "label": "Recommendation", "kind": "derived"},
     {"key": "syndication", "label": "Syndication", "kind": "derived"},
     {"key": "media", "label": "Media", "kind": "derived"},
 ]
+
+WATCH_SOURCE_COLUMN_ALIASES = [
+    "retailer", "source_label", "merchant", "channel", "store", "seller", "retailer_name",
+    "retail_partner", "site_name", "source", "source_system", "platform", "provider", "loaded_from_host",
+]
+WATCH_REGION_COLUMN_ALIASES = [
+    "content_locale", "locale", "region", "market", "country", "country_code", "geo", "marketplace",
+]
+WATCH_DATE_COLUMN_ALIASES = [
+    "submission_time", "submission_date", "review_date", "published", "published_at", "created_at", "date",
+    "timestamp", "posted_at",
+]
+WATCH_ORGANIC_COLUMN_ALIASES = [
+    "incentivized_review", "is_incentivized", "incentivized", "sponsored", "is_sponsored", "paid",
+]
+AUTO_COLUMN_SENTINEL = "__auto__"
+NONE_COLUMN_SENTINEL = "__none__"
+
+
+def _normalize_col_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _all_dataframe_columns(df: Optional[pd.DataFrame]) -> List[str]:
+    if df is None or not isinstance(df, pd.DataFrame):
+        return []
+    return [str(col) for col in df.columns]
+
+
+def _resolve_column_alias(df: Optional[pd.DataFrame], aliases: Sequence[str]) -> Optional[str]:
+    columns = _all_dataframe_columns(df)
+    if not columns:
+        return None
+    norm_to_actual: Dict[str, str] = {}
+    for col in columns:
+        norm_to_actual.setdefault(_normalize_col_key(col), col)
+
+    alias_list = [str(alias) for alias in aliases or [] if str(alias).strip()]
+    for alias in alias_list:
+        match = norm_to_actual.get(_normalize_col_key(alias))
+        if match:
+            return match
+
+    best: Optional[Tuple[Tuple[int, int, int], str]] = None
+    for col in columns:
+        norm_col = _normalize_col_key(col)
+        col_tokens = {tok for tok in norm_col.split("_") if tok}
+        for alias in alias_list:
+            norm_alias = _normalize_col_key(alias)
+            alias_tokens = {tok for tok in norm_alias.split("_") if tok}
+            score: Optional[Tuple[int, int, int]] = None
+            if norm_alias and norm_alias in norm_col:
+                score = (4, len(norm_alias), -len(norm_col))
+            elif alias_tokens and alias_tokens.issubset(col_tokens):
+                score = (3, len(alias_tokens), -len(norm_col))
+            elif len(alias_tokens) >= 2 and len(alias_tokens & col_tokens) >= 2:
+                score = (2, len(alias_tokens & col_tokens), -len(norm_col))
+            if score and (best is None or score > best[0]):
+                best = (score, col)
+    return best[1] if best else None
+
+
+def _resolve_optional_column_choice(
+    df: Optional[pd.DataFrame],
+    selection: Optional[str],
+    aliases: Sequence[str],
+    *,
+    allow_none: bool = False,
+) -> Optional[str]:
+    choice = str(selection or AUTO_COLUMN_SENTINEL)
+    columns = set(_all_dataframe_columns(df))
+    if allow_none and choice == NONE_COLUMN_SENTINEL:
+        return None
+    if choice not in {AUTO_COLUMN_SENTINEL, NONE_COLUMN_SENTINEL} and choice in columns:
+        return choice
+    return _resolve_column_alias(df, aliases)
+
+
+def _source_rating_watch_column_options(df: Optional[pd.DataFrame], *, allow_none: bool = False) -> List[str]:
+    options: List[str] = [AUTO_COLUMN_SENTINEL]
+    if allow_none:
+        options.append(NONE_COLUMN_SENTINEL)
+    options.extend(sorted(_all_dataframe_columns(df), key=lambda x: x.lower()))
+    return options
+
+
+def _format_column_choice_label(value: str) -> str:
+    if value == AUTO_COLUMN_SENTINEL:
+        return "Auto-detect"
+    if value == NONE_COLUMN_SENTINEL:
+        return "None"
+    return str(value)
 
 
 def _series_matches_any(series: pd.Series, values: Sequence[str]) -> pd.Series:
@@ -4291,17 +4568,99 @@ def _filter_series_for_spec(df: pd.DataFrame, spec: Dict[str, Any]) -> pd.Series
 
 def _core_filter_specs_for_df(df: pd.DataFrame) -> List[Dict[str, Any]]:
     specs: List[Dict[str, Any]] = []
+    used_columns: Set[str] = set()
     for spec in CORE_REVIEW_FILTER_SPECS:
-        if spec["kind"] == "column" and spec.get("column") not in df.columns:
-            continue
-        s = _filter_series_for_spec(df, spec)
+        resolved_spec = dict(spec)
+        if spec["kind"] == "column":
+            resolved_col = _resolve_column_alias(df, spec.get("aliases") or ([spec.get("column")] if spec.get("column") else []))
+            if not resolved_col or resolved_col in used_columns:
+                continue
+            resolved_spec["column"] = resolved_col
+            used_columns.add(resolved_col)
+        s = _filter_series_for_spec(df, resolved_spec)
         opts = [x for x in sorted({str(v).strip() for v in s.dropna().astype(str) if str(v).strip()}, key=lambda x: x.lower()) if x]
         if not opts:
             continue
         if len(opts) == 1 and opts[0] == "Unknown":
             continue
-        specs.append({**spec, "options": ["ALL"] + opts})
+        specs.append({**resolved_spec, "options": ["ALL"] + opts})
     return specs
+
+
+def _resolved_core_filter_columns(df: pd.DataFrame) -> Set[str]:
+    return {str(spec.get("column")) for spec in _core_filter_specs_for_df(df) if spec.get("kind") == "column" and spec.get("column")}
+
+
+def _looks_like_blob_or_text_column(df: pd.DataFrame, col: str) -> bool:
+    if col not in df.columns:
+        return False
+    norm_name = _normalize_col_key(col)
+    if any(tok in norm_name for tok in ["review_text", "title_and_text", "body", "content", "description", "summary", "analysis", "evidence", "prompt", "response", "raw", "json", "html"]):
+        return True
+    s = df[col].astype("string").fillna("").str.strip()
+    non_empty = s[s != ""].head(120)
+    if non_empty.empty:
+        return False
+    avg_len = float(non_empty.str.len().mean())
+    return avg_len >= 90
+
+
+def _looks_like_identifier_or_link(df: pd.DataFrame, col: str) -> bool:
+    if col not in df.columns:
+        return False
+    norm_name = _normalize_col_key(col)
+    s = df[col].astype("string").fillna("").str.strip()
+    non_empty = s[s != ""]
+    if non_empty.empty:
+        return False
+    nunique = int(non_empty.nunique(dropna=True))
+    unique_ratio = nunique / max(len(non_empty), 1)
+    if any(tok in norm_name for tok in ["url", "uri", "link"]):
+        return unique_ratio >= 0.35
+    if any(tok in norm_name for tok in ["uuid", "guid", "hash"]):
+        return True
+    if norm_name.endswith("_id") or norm_name == "id" or norm_name.startswith("id_"):
+        return unique_ratio >= 0.8
+    return False
+
+
+def _extra_filter_column_score(df: pd.DataFrame, col: str) -> Optional[Tuple[int, str]]:
+    if col not in df.columns:
+        return None
+    kind = _infer_extra_filter_kind(df, col)
+    s = df[col]
+    non_null_ratio = float(s.notna().mean()) if len(s) else 0.0
+    if non_null_ratio < 0.05:
+        return None
+    if kind == "numeric":
+        num = pd.to_numeric(s, errors="coerce").dropna()
+        if num.nunique(dropna=True) <= 1:
+            return None
+        return (70, col)
+    if kind == "date":
+        dt = pd.to_datetime(s, errors="coerce").dropna()
+        if dt.nunique(dropna=True) <= 1:
+            return None
+        return (68, col)
+    clean = s.astype("string").fillna("").str.strip().replace("", pd.NA).dropna()
+    nunique = int(clean.nunique(dropna=True))
+    if nunique <= 1:
+        return None
+    if _looks_like_blob_or_text_column(df, col) or _looks_like_identifier_or_link(df, col):
+        return None
+    row_count = max(len(df), 1)
+    upper_reasonable = max(50, min(800, int(row_count * 0.8)))
+    if nunique > upper_reasonable:
+        return None
+    if nunique <= 12:
+        score = 95
+    elif nunique <= 40:
+        score = 88
+    elif nunique <= 120:
+        score = 80
+    else:
+        score = 72
+    return (score, col)
 
 
 def _col_options(df: pd.DataFrame, col: str, max_vals: Optional[int] = 250) -> List[str]:
@@ -4345,17 +4704,23 @@ def _infer_extra_filter_kind(df: pd.DataFrame, col: str) -> str:
 
 def _extra_filter_candidates(df: pd.DataFrame) -> List[str]:
     det_cols, del_cols = _get_symptom_col_lists(df)
-    excluded = {
-        "review_id", "title", "review_text", "title_and_text", "rating", "rating_label",
-        "submission_time", "submission_date", "submission_month", "year_month_sort",
-        "incentivized_review", "is_recommended", "is_syndicated", "has_photos", "has_media",
-        "photo_urls", "raw_json", "context_data_json", "review_length_chars", "review_length_words",
-        "AI Safety", "AI Reliability", "AI # of Sessions",
-    }
-    excluded.update({spec["column"] for spec in CORE_REVIEW_FILTER_SPECS if spec.get("kind") == "column"})
+    excluded = set(_resolved_core_filter_columns(df))
+    rating_col = _resolve_column_alias(df, ["rating", "stars", "star_rating", "score"])
+    if rating_col:
+        excluded.add(rating_col)
     excluded.update(set(det_cols + del_cols))
-    excluded.update({c for c in df.columns if str(c).startswith("AI Symptom ") or str(c).startswith("Symptom ")})
-    return sorted([str(c) for c in df.columns if str(c) not in excluded], key=lambda x: x.lower())
+    excluded.update({str(c) for c in df.columns if str(c).startswith("AI Symptom ") or str(c).startswith("Symptom ")})
+
+    scored: List[Tuple[int, str]] = []
+    for raw_col in df.columns:
+        col = str(raw_col)
+        if col in excluded:
+            continue
+        score = _extra_filter_column_score(df, col)
+        if score is not None:
+            scored.append(score)
+    scored.sort(key=lambda item: (-item[0], str(item[1]).lower()))
+    return [col for _, col in scored]
 
 
 def _symptom_filter_options(df: pd.DataFrame) -> Tuple[List[str], List[str], List[str], List[str]]:
@@ -7916,8 +8281,8 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
             current_extra = [c for c in (st.session_state.get("rf_extra_filter_cols", []) or []) if c in extra_candidates]
             st.session_state["rf_extra_filter_cols"] = current_extra
             with st.expander("➕ Add Filters", expanded=False):
-                st.caption("Choose additional columns to surface as filters.")
-                st.multiselect("Available columns", options=extra_candidates, default=current_extra, key="rf_extra_filter_cols")
+                st.caption("Suggested from the current workspace schema so this list adapts to each uploaded file.")
+                st.multiselect("Available columns from this workspace", options=extra_candidates, default=current_extra, key="rf_extra_filter_cols")
             extra_cols = st.session_state.get("rf_extra_filter_cols", []) or []
             if extra_cols:
                 with st.expander("🧩 Extra filters", expanded=False):
