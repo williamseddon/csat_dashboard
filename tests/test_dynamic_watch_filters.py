@@ -66,8 +66,31 @@ def test_core_filters_and_extra_filters_follow_workspace_schema(app_module):
     extra_candidates = app_module._extra_filter_candidates(df)
     assert "Custom Segment" in extra_candidates
     assert "Review Date" in extra_candidates
-    assert "Review Body" not in extra_candidates
-    assert "Review GUID" not in extra_candidates
+    assert "Review Body" in extra_candidates
+    assert "Review GUID" in extra_candidates
+    assert app_module._infer_extra_filter_kind(df, "Review Body") == "text"
+    assert app_module._infer_extra_filter_kind(df, "Review GUID") == "text"
+
+
+def test_clean_watch_dimension_series_preserves_display_case_and_cleans_null_tokens(app_module):
+    cleaned = app_module._clean_watch_dimension_series(pd.Series(["Amazon", " undefined ", None, "DTC"]), unknown="Unknown")
+
+    assert cleaned.tolist() == ["Amazon", "Unknown", "Unknown", "DTC"]
+
+
+
+def test_sw_style_fig_moves_dense_legends_vertical(app_module):
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    fig.add_bar(name="Unknown region", x=["Amazon"], y=[3.8])
+    fig.add_bar(name="UK", x=["Amazon"], y=[4.1])
+    fig.add_bar(name="USA", x=["Amazon"], y=[4.4])
+
+    styled = app_module._sw_style_fig(fig)
+
+    assert styled.layout.legend.orientation == "v"
+
 
 
 def test_retailer_watch_uses_selected_retailer_region_and_date_columns(app_module):
@@ -286,3 +309,53 @@ def test_uploaded_normalization_maps_verbatim_style_review_fields(app_module):
     assert normalized.loc[0, "title"] == "Great dryer"
     assert normalized.loc[0, "review_text"] == "Loved it and use it every day."
     assert normalized.loc[0, "post_link"] == "https://example.com/review"
+
+
+def test_extra_filters_can_surface_uploaded_text_and_id_headers(app_module):
+    df = pd.DataFrame(
+        {
+            "Merchant": ["Amazon", "Target", "Amazon"],
+            "Locale": ["en_US", "en_GB", "en_US"],
+            "Review Body": ["great value " * 20, "solid product " * 18, "love it " * 15],
+            "Review GUID": ["a1", "a2", "a3"],
+            "Review Date": ["2026-04-01", "2026-04-04", "2026-04-10"],
+            "Custom Segment": ["Premium", "Mass", "Premium"],
+            "rating": [5, 4, 3],
+        }
+    )
+
+    extra_candidates = app_module._extra_filter_candidates(df)
+    assert "Custom Segment" in extra_candidates
+    assert "Review Date" in extra_candidates
+    assert "Review Body" in extra_candidates
+    assert "Review GUID" in extra_candidates
+    assert app_module._infer_extra_filter_kind(df, "Review Body") == "text"
+    assert app_module._infer_extra_filter_kind(df, "Review GUID") == "text"
+    assert app_module._infer_extra_filter_kind(df, "Review Date") == "date"
+    assert app_module._infer_extra_filter_kind(df, "Custom Segment") == "categorical"
+
+
+def test_uploaded_normalization_preserves_original_headers_for_filter_builder(app_module):
+    raw = pd.DataFrame(
+        {
+            "Retailer": ["Amazon", "Target"],
+            "Campaign Name": ["Spring Promo", "Always On"],
+            "Reviewer Notes": ["Mentions loud motor", "Mentions easy setup"],
+            "Case ID": ["C-100", "C-101"],
+            "Review Date": ["2026-04-01", "2026-04-02"],
+            "Star Rating": [2, 5],
+            "Review": ["Too loud", "Very easy"],
+        }
+    )
+
+    normalized = app_module._normalize_uploaded_df(raw, source_name="sample.xlsx")
+    extra_candidates = app_module._extra_filter_candidates(normalized)
+
+    assert "Campaign Name" in normalized.columns
+    assert "Reviewer Notes" in normalized.columns
+    assert "Case ID" in normalized.columns
+    assert "Campaign Name" in extra_candidates
+    assert "Reviewer Notes" in extra_candidates
+    assert "Case ID" in extra_candidates
+    assert app_module._infer_extra_filter_kind(normalized, "Reviewer Notes") in {"text", "categorical"}
+    assert app_module._infer_extra_filter_kind(normalized, "Case ID") in {"text", "categorical"}

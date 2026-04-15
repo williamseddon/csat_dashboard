@@ -571,9 +571,12 @@ def normalize_uploaded_df(raw_df: pd.DataFrame, *, source_name: str = "", includ
                 normalized[target] = working[source].astype("string").fillna("").str.strip().replace({"": pd.NA})
 
     existing_labels = {str(col) for col in normalized.columns}
+    blocked_raw_columns = set()
+    if not include_local_symptomization:
+        blocked_raw_columns.update(_local_symptom_columns(list(working.columns)))
     for raw_col in _all_dataframe_columns(working):
         raw_label = str(raw_col).strip()
-        if not raw_label or raw_label in existing_labels:
+        if not raw_label or raw_label in existing_labels or raw_label in blocked_raw_columns:
             continue
         series = _select_column_series(working, raw_label)
         if series is None:

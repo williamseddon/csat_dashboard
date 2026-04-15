@@ -1919,9 +1919,12 @@ def _normalize_uploaded_df(raw, *, source_name="", include_local_symptomization=
                 n[target] = w[source].astype("string").fillna("").str.strip().replace({"": pd.NA})
 
     existing_labels = {str(col) for col in n.columns}
+    blocked_raw_columns = set()
+    if not include_local_symptomization:
+        blocked_raw_columns.update(_local_symptom_columns(list(w.columns)))
     for raw_col in _all_dataframe_columns(w):
         raw_label = str(raw_col).strip()
-        if not raw_label or raw_label in existing_labels:
+        if not raw_label or raw_label in existing_labels or raw_label in blocked_raw_columns:
             continue
         series = _select_column_series(w, raw_label)
         if series is None:
@@ -3001,8 +3004,20 @@ def _star_band_trend(df):
 
 def _sw_style_fig(fig):
     GRID = "rgba(148,163,184,0.18)"
-    trace_count = len(getattr(fig, "data", []) or [])
-    if trace_count > 3:
+    legend_labels: List[str] = []
+    for trace in list(getattr(fig, "data", []) or []):
+        if getattr(trace, "showlegend", True) is False:
+            continue
+        name = _safe_text(getattr(trace, "name", "")).strip()
+        if name and not name.lower().startswith("trace "):
+            legend_labels.append(name)
+    trace_count = len(legend_labels) or len(getattr(fig, "data", []) or [])
+    longest_label = max((len(label) for label in legend_labels), default=0)
+    total_label_chars = sum(len(label) for label in legend_labels)
+    use_vertical_legend = trace_count > 3 or (
+        trace_count >= 2 and (longest_label >= 10 or (trace_count >= 3 and total_label_chars >= 14))
+    )
+    if use_vertical_legend:
         legend_cfg = dict(
             orientation="v",
             y=1.0,
@@ -3014,7 +3029,7 @@ def _sw_style_fig(fig):
             borderwidth=1,
             font=dict(size=11),
         )
-        margin = dict(l=26, r=108, t=56, b=44)
+        margin = dict(l=26, r=118, t=56, b=44)
     else:
         legend_cfg = dict(
             orientation="h",
@@ -3167,20 +3182,11 @@ def _first_non_empty(series):
 
 
 def _clean_watch_dimension_series(series: pd.Series, *, unknown: str = "Unknown") -> pd.Series:
-    cleaned = series.astype("string").fillna("").str.strip()
-    null_tokens = {
-        "": unknown,
-        "nan": unknown,
-        "none": unknown,
-        "null": unknown,
-        "<na>": unknown,
-        "n/a": unknown,
-        "na": unknown,
-        "undefined": unknown,
-        "unknown": unknown,
-    }
-    cleaned = cleaned.str.lower().replace(null_tokens)
-    cleaned = cleaned.where(cleaned.ne(""), unknown)
+    cleaned = series.astype("string").fillna("").str.strip().str.replace(r"\s+", " ", regex=True)
+    lower = cleaned.str.lower()
+    null_tokens = {"", "nan", "none", "null", "<na>", "n/a", "na", "undefined", "unknown"}
+    cleaned = cleaned.mask(lower.isin(null_tokens), unknown)
+    cleaned = cleaned.mask(cleaned.eq(""), unknown)
     return cleaned.fillna(unknown)
 
 
@@ -3464,12 +3470,15 @@ def _prepare_source_rating_watch_payload(
         }
 
     source_input = _select_column_series(w, resolved_source_col) if resolved_source_col else None
-    source_series = _clean_watch_dimension_series(source_input, unknown="") if source_input is not None else pd.Series("", index=w.index, dtype="object")
+    source_series = _clean_watch_dimension_series(source_input, unknown="") if source_input is not None else pd.Series("", index=w.index, dtype="string")
     source_system_col = _resolve_column_alias(w, ["source_system", "source", "platform", "provider", "review_source"])
     source_system_input = _select_column_series(w, source_system_col) if source_system_col else None
-    source_system_series = _clean_watch_dimension_series(source_system_input, unknown="") if source_system_input is not None else pd.Series("", index=w.index, dtype="object")
+    source_system_series = _clean_watch_dimension_series(source_system_input, unknown="") if source_system_input is not None else pd.Series("", index=w.index, dtype="string")
     w["source_system"] = source_system_series
     w["retailer_display"] = _clean_watch_dimension_series(source_series.mask(source_series.eq(""), source_system_series), unknown="Unknown Retailer")
+    w["retailer_group"] = (
+        w["retailer_display"].astype("string").fillna("Unknown Retailer").str.strip().str.casefold().replace({"": "unknown retailer"})
+    )
 
     date_series = _select_column_series(w, resolved_date_col) if resolved_date_col else None
     if date_series is not None:
@@ -3500,10 +3509,11 @@ def _prepare_source_rating_watch_payload(
         w["_watch_detractors"] = [[] for _ in range(len(w))]
         w["_watch_delighters"] = [[] for _ in range(len(w))]
 
-    group_cols = ["retailer_display"] if combine_regions or not known_regions else ["region", "retailer_display"]
+    group_cols = ["retailer_group"] if combine_regions or not known_regions else ["region", "retailer_group"]
     agg = (
         w.groupby(group_cols, dropna=False)
         .agg(
+            retailer_display=("retailer_display", _first_non_empty),
             source_system=("source_system", _first_non_empty),
             reviews=("rating", "size"),
             avg_rating=("rating", "mean"),
@@ -3606,7 +3616,7 @@ def _prepare_source_rating_watch_payload(
         "alert_level": "Alert Level",
         "signal": "Signal",
     }
-    table = _collapse_duplicate_named_columns(table.rename(columns=rename_map)).drop(columns=[c for c in ["_alert_rank"] if c in table.columns], errors="ignore")
+    table = _collapse_duplicate_named_columns(table.rename(columns=rename_map)).drop(columns=[c for c in ["_alert_rank", "retailer_group"] if c in table.columns], errors="ignore")
 
     alerts_df = table.copy()
     if "Alert Level" in alerts_df.columns:
@@ -3624,14 +3634,15 @@ def _prepare_source_rating_watch_payload(
     if resolved_date_col and w["_watch_date"].notna().any():
         trend_source = w[w["_watch_date"].notna()].copy()
         trend_source["_watch_week"] = trend_source["_watch_date"].dt.tz_convert("UTC").dt.tz_localize(None).dt.to_period("W-SUN").dt.start_time
-        trend_group_cols = ["_watch_week", "retailer_display"]
+        trend_group_cols = ["_watch_week", "retailer_group"]
         if known_regions:
             trend_group_cols.insert(1, "region")
         trend_df = (
             trend_source.groupby(trend_group_cols, dropna=False)
-            .agg(reviews=("rating", "size"), avg_rating=("rating", "mean"))
+            .agg(retailer_display=("retailer_display", _first_non_empty), reviews=("rating", "size"), avg_rating=("rating", "mean"))
             .reset_index()
             .rename(columns={"_watch_week": "Week", "retailer_display": "Retailer", "region": "Region", "reviews": "Reviews", "avg_rating": "Avg Rating"})
+            .drop(columns=["retailer_group"], errors="ignore")
         )
         trend_df = trend_df.sort_values([c for c in ["Region", "Retailer", "Week"] if c in trend_df.columns]).reset_index(drop=True)
     else:
@@ -3839,21 +3850,24 @@ def _render_source_rating_watch(df):
             if frame is None or frame.empty or col not in frame.columns:
                 return frame
             out = frame.copy()
-            vals = out[col].astype("string").fillna("").str.strip()
-            out[col] = vals.mask(vals.eq(""), fallback)
+            vals = _clean_watch_dimension_series(out[col], unknown=fallback)
+            if str(col).strip().lower() == "region":
+                lowered = vals.astype("string").str.casefold()
+                vals = vals.mask(lowered.isin({"all selected", "all selected region", "all selected regions"}), "All selected")
+            out[col] = vals
             return out
 
         table_df = _watch_fill_label(table_df, "Retailer", "Unknown retailer")
-        table_df = _watch_fill_label(table_df, "Region", "All selected regions")
-        region_kpis_df = _watch_fill_label(region_kpis_df, "Region", "All selected regions")
+        table_df = _watch_fill_label(table_df, "Region", "Unknown region")
+        region_kpis_df = _watch_fill_label(region_kpis_df, "Region", "Unknown region")
         alerts_df = _watch_fill_label(alerts_df, "Retailer", "Unknown retailer")
-        alerts_df = _watch_fill_label(alerts_df, "Region", "All selected regions")
+        alerts_df = _watch_fill_label(alerts_df, "Region", "Unknown region")
         trend_df = _watch_fill_label(trend_df, "Retailer", "Unknown retailer")
-        trend_df = _watch_fill_label(trend_df, "Region", "All selected regions")
+        trend_df = _watch_fill_label(trend_df, "Region", "Unknown region")
         review_rows_df = _watch_fill_label(review_rows_df, "Retailer", "Unknown retailer")
-        review_rows_df = _watch_fill_label(review_rows_df, "Region", "All selected regions")
+        review_rows_df = _watch_fill_label(review_rows_df, "Region", "Unknown region")
         symptom_summary_df = _watch_fill_label(symptom_summary_df, "Retailer", "Unknown retailer")
-        symptom_summary_df = _watch_fill_label(symptom_summary_df, "Region", "All selected regions")
+        symptom_summary_df = _watch_fill_label(symptom_summary_df, "Region", "Unknown region")
         if table_df.empty:
             st.info("No reviews match the current retailer-watch selection.")
             return
@@ -3922,8 +3936,10 @@ def _render_source_rating_watch(df):
             if gap_col:
                 hover_data[gap_col] = ":.2f"
             if "Region" in chart_df.columns:
-                region_series = _clean_watch_dimension_series(chart_df["Region"], unknown="All selected regions")
-                region_series = region_series.replace({"unknown": "All selected regions", "all selected": "All selected regions"})
+                region_series = _clean_watch_dimension_series(chart_df["Region"], unknown="Unknown region")
+                lowered_regions = region_series.astype("string").str.casefold()
+                region_series = region_series.mask(lowered_regions.isin({"all selected", "all selected region", "all selected regions"}), "All selected")
+                region_series = region_series.map(_region_label_from_value).replace({"Unknown": "Unknown region"})
                 chart_df["Region"] = region_series
                 use_region_color = chart_df["Region"].nunique(dropna=True) > 1
                 if use_region_color:
@@ -4025,7 +4041,12 @@ def _render_source_rating_watch(df):
         retailer_options = ["All retailers (avg)"] + sorted([_safe_text(v) for v in table_df["Retailer"].dropna().unique() if _safe_text(v)])
         if st.session_state.get("retailer_watch_focus_retailer") not in retailer_options:
             st.session_state["retailer_watch_focus_retailer"] = default_retailer or retailer_options[0]
-        region_focus_options = ["All selected"] + known_regions if known_regions else ["All selected"]
+        display_regions: List[str] = []
+        for frame in [table_df, trend_df, review_rows_df, symptom_summary_df]:
+            if frame is not None and not frame.empty and "Region" in frame.columns:
+                display_regions.extend([_safe_text(v) for v in frame["Region"].dropna().tolist()])
+        extra_regions = sorted({r for r in display_regions if r and r != "All selected" and r not in known_regions}, key=lambda x: x.lower())
+        region_focus_options = ["All selected"] + known_regions + extra_regions if (known_regions or extra_regions) else ["All selected"]
         if st.session_state.get("retailer_watch_focus_region") not in region_focus_options:
             st.session_state["retailer_watch_focus_region"] = default_region if default_region in region_focus_options else "All selected"
 
