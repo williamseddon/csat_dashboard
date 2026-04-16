@@ -6301,7 +6301,7 @@ def _safe_get_master_bundle(summary, reviews_df, prompt_artifacts, **kwargs):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SYMPTOMIZER HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
-def _get_symptom_whitelists(file_bytes):
+def _get_symptom_whitelists(file_bytes, *, include_review_sheet_fallback=True):
     bio = io.BytesIO(file_bytes)
     df_sym = None
     try:
@@ -6349,6 +6349,8 @@ def _get_symptom_whitelists(file_bytes):
         if delighters or detractors:
             delighters, detractors = _canonical_symptom_catalog(delighters, detractors)
         return delighters, detractors, alias_map
+    if not include_review_sheet_fallback:
+        return [], [], {}
     try:
         review_df, _sheet_name = _read_best_uploaded_excel_sheet(file_bytes)
     except Exception:
@@ -6571,6 +6573,25 @@ def _parse_manual_tag_entries(raw_text):
     return _normalize_tag_list([part.strip() for part in re.split(r"[\n,;|]+", str(raw_text or "")) if part.strip()])
 
 
+def _coerce_tag_entries(raw_values):
+    if raw_values is None:
+        return []
+    if isinstance(raw_values, str):
+        return _parse_manual_tag_entries(raw_values)
+    if isinstance(raw_values, dict):
+        raw_values = list(raw_values.keys())
+    elif hasattr(raw_values, "tolist") and not isinstance(raw_values, (list, tuple, set)):
+        try:
+            raw_values = raw_values.tolist()
+        except Exception:
+            raw_values = list(raw_values)
+    elif isinstance(raw_values, (list, tuple, set)):
+        raw_values = list(raw_values)
+    else:
+        return _parse_manual_tag_entries(raw_values)
+    return _normalize_tag_list(raw_values)
+
+
 def _standardize_symptom_lists(delighters=None, detractors=None):
     try:
         return _canonicalize_taxonomy_catalog(delighters or [], detractors or [])
@@ -6578,16 +6599,95 @@ def _standardize_symptom_lists(delighters=None, detractors=None):
         return _normalize_tag_list(delighters or []), _normalize_tag_list(detractors or []), {}
 
 
+def _semantic_symptom_key(label, *, side):
+    cleaned = _normalize_tag_list([label])
+    if not cleaned:
+        return ""
+    side_key = str(side or "").lower()
+    try:
+        if side_key.startswith("del"):
+            canonical_dels, _, _ = _standardize_symptom_lists(cleaned, [])
+            return str((canonical_dels or cleaned)[0])
+        _, canonical_dets, _ = _standardize_symptom_lists([], cleaned)
+        return str((canonical_dets or cleaned)[0])
+    except Exception:
+        return str(cleaned[0])
+
+
+def _dedupe_semantic_labels(labels, *, side):
+    out = []
+    seen = set()
+    for label in _coerce_tag_entries(labels):
+        key = _semantic_symptom_key(label, side=side) or label
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(label)
+    return out
+
+
+def _prepare_active_taxonomy(delighters=None, detractors=None, *, include_universal_neutral=None):
+    if include_universal_neutral is None:
+        include_universal_neutral = bool(st.session_state.get("sym_include_universal_neutral", True))
+    clean_dels = _dedupe_semantic_labels(delighters or [], side="delighter")
+    clean_dets = _dedupe_semantic_labels(detractors or [], side="detractor")
+    if include_universal_neutral:
+        neutral_dels, neutral_dets = _universal_neutral_catalog()
+        del_keys = {_semantic_symptom_key(label, side="delighter") or label for label in clean_dels}
+        det_keys = {_semantic_symptom_key(label, side="detractor") or label for label in clean_dets}
+        clean_dels = [
+            label for label in _normalize_tag_list(neutral_dels)
+            if (_semantic_symptom_key(label, side="delighter") or label) not in del_keys
+        ] + clean_dels
+        clean_dets = [
+            label for label in _normalize_tag_list(neutral_dets)
+            if (_semantic_symptom_key(label, side="detractor") or label) not in det_keys
+        ] + clean_dets
+    return _normalize_tag_list(clean_dels), _normalize_tag_list(clean_dets)
+
+
+def _suggest_aliases_for_active_label(label, *, side):
+    cleaned = _normalize_tag_list([label])
+    if not cleaned:
+        return []
+    clean_label = cleaned[0]
+    try:
+        generated = _build_taxonomy_alias_map(
+            [clean_label] if str(side or "").lower().startswith("del") else [],
+            [clean_label] if str(side or "").lower().startswith("det") else [],
+        )
+    except Exception:
+        generated = {}
+    aliases = []
+    for key, values in (generated or {}).items():
+        for candidate in [key] + list(values or []):
+            candidate_clean = _normalize_tag_list([candidate])
+            if not candidate_clean:
+                continue
+            alias = candidate_clean[0]
+            if alias and alias != clean_label and alias not in aliases:
+                aliases.append(alias)
+    return aliases
+
+
 def _alias_map_for_catalog(delighters=None, detractors=None, *, extra_aliases=None, existing_aliases=None):
-    labels = set(_normalize_tag_list(list(delighters or []) + list(detractors or [])))
-    base = _build_taxonomy_alias_map(delighters or [], detractors or [], extra_aliases=extra_aliases or {})
+    clean_dels = _coerce_tag_entries(delighters or [])
+    clean_dets = _coerce_tag_entries(detractors or [])
+    labels = set(_normalize_tag_list(list(clean_dels) + list(clean_dets)))
+    base = _build_taxonomy_alias_map(clean_dels, clean_dets, extra_aliases=extra_aliases or {})
+    literal_base = {}
+    for side_key, side_labels in (("delighter", clean_dels), ("detractor", clean_dets)):
+        for label in side_labels:
+            suggestions = _suggest_aliases_for_active_label(label, side=side_key)
+            if suggestions:
+                literal_base[label] = suggestions
     filtered_existing = {}
     for key, values in (existing_aliases or {}).items():
         label = re.sub(r"\s+", " ", str(key or "").strip()).title()
         if not label or label not in labels:
             continue
         filtered_existing[label] = [re.sub(r"\s+", " ", str(v or "").strip()).title() for v in (values or []) if str(v or "").strip()]
-    merged = _merge_taxonomy_alias_maps(filtered_existing, base)
+    merged = _merge_taxonomy_alias_maps(filtered_existing, literal_base, base)
     return {key: vals for key, vals in merged.items() if key in labels and vals}
 
 
@@ -8644,8 +8744,9 @@ def _try_load_symptoms_from_file():
         return False
     d, t, a = _get_symptom_whitelists(raw)
     if d or t:
-        loaded_dels, loaded_dets = _canonical_symptom_catalog(d, t)
-        st.session_state.update(sym_delighters=loaded_dels, sym_detractors=loaded_dets, sym_aliases=_alias_map_for_catalog(loaded_dels, loaded_dets, extra_aliases=a, existing_aliases=st.session_state.get("sym_aliases", {})), sym_symptoms_source="file", sym_taxonomy_preview_items=[], sym_taxonomy_category="general")
+        loaded_dels, loaded_dets = _prepare_active_taxonomy(d, t)
+        st.session_state.update(sym_delighters=loaded_dels, sym_detractors=loaded_dets, sym_aliases=_alias_map_for_catalog(loaded_dels, loaded_dets, extra_aliases=a, existing_aliases=st.session_state.get("sym_aliases", {})), sym_symptoms_source="file", sym_taxonomy_preview_items=[], sym_taxonomy_category="general", _sym_taxonomy_auto_applied=False)
+        st.session_state.pop("sym_ai_build_result", None)
         return True
     return False
 
@@ -8656,64 +8757,236 @@ def _local_symptom_catalog(df):
     det_vals, del_vals, _, _ = _symptom_filter_options(df)
     if not del_vals and not det_vals:
         return [], []
-    del_vals, det_vals = _canonical_symptom_catalog(list(del_vals), list(det_vals))
+    del_vals, det_vals = _prepare_active_taxonomy(list(del_vals), list(det_vals), include_universal_neutral=False)
     return list(del_vals), list(det_vals)
+
+
+def _uploaded_workspace_catalog_seed(dataset, *, raw_bytes=None, include_local_symptomization=False):
+    """Resolve the best taxonomy seed available directly from an uploaded workspace."""
+    reviews_df = dataset.get("reviews_df", pd.DataFrame()) if isinstance(dataset, dict) else pd.DataFrame()
+    if raw_bytes:
+        file_dels, file_dets, file_aliases = _get_symptom_whitelists(raw_bytes, include_review_sheet_fallback=False)
+        if file_dels or file_dets:
+            return {
+                "delighters": list(file_dels),
+                "detractors": list(file_dets),
+                "aliases": dict(file_aliases or {}),
+                "source": "file",
+            }
+    if include_local_symptomization:
+        local_dels, local_dets = _local_symptom_catalog(reviews_df)
+        if local_dels or local_dets:
+            return {
+                "delighters": list(local_dels),
+                "detractors": list(local_dets),
+                "aliases": {},
+                "source": "local upload",
+            }
+    return {"delighters": [], "detractors": [], "aliases": {}, "source": "none"}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SESSION STATE
 # ═══════════════════════════════════════════════════════════════════════════════
+def _current_product_specific_taxonomy():
+    cur_dets = list(st.session_state.get("sym_detractors") or [])
+    cur_dels = list(st.session_state.get("sym_delighters") or [])
+    try:
+        product_dets, product_dels = _strip_universal_neutral_tags(cur_dets, cur_dels)
+    except Exception:
+        universal = set(_UNIVERSAL_NEUTRAL_DETRACTORS + _UNIVERSAL_NEUTRAL_DELIGHTERS)
+        product_dets = [tag for tag in cur_dets if tag not in universal]
+        product_dels = [tag for tag in cur_dels if tag not in universal]
+    return list(product_dels), list(product_dets)
+
+
+def _has_active_product_specific_taxonomy():
+    product_dels, product_dets = _current_product_specific_taxonomy()
+    source = str(st.session_state.get("sym_symptoms_source") or "none")
+    return bool(product_dels or product_dets) and source not in {"", "none", "built-in"}
+
+
+def _has_active_workspace_taxonomy():
+    source = str(st.session_state.get("sym_symptoms_source") or "none")
+    if source in {"", "none", "built-in"}:
+        return False
+    return bool(_coerce_tag_entries(st.session_state.get("sym_delighters") or [])) or bool(_coerce_tag_entries(st.session_state.get("sym_detractors") or []))
+
+
+def _activate_ai_taxonomy_result(tax_result, *, source="ai", preserve_draft=True, auto_applied=False):
+    if not isinstance(tax_result, dict):
+        return False
+    final_dels, final_dets = _prepare_active_taxonomy(
+        tax_result.get("delighters", []),
+        tax_result.get("detractors", []),
+        include_universal_neutral=bool(st.session_state.get("sym_include_universal_neutral", True)),
+    )
+    if not final_dels and not final_dets:
+        return False
+    st.session_state.update(
+        sym_delighters=final_dels,
+        sym_detractors=final_dets,
+        sym_aliases=_alias_map_for_catalog(
+            final_dels,
+            final_dets,
+            extra_aliases=tax_result.get("aliases") or {},
+            existing_aliases=st.session_state.get("sym_aliases", {}),
+        ),
+        sym_symptoms_source=source,
+        sym_taxonomy_preview_items=_taxonomy_preview_items_with_side(tax_result),
+        sym_taxonomy_category=str(tax_result.get("category") or st.session_state.get("sym_taxonomy_category") or "general"),
+        sym_product_profile_ai_note=(tax_result.get("taxonomy_note") or st.session_state.get("sym_product_profile_ai_note", "")),
+        sym_wizard_step=3,
+        sym_calibration_result=None,
+        sym_qa_baseline_map={},
+        sym_qa_accuracy={},
+        sym_qa_user_edited=False,
+        sym_qa_row_ids=[],
+        sym_qa_selected_row=None,
+        sym_qa_notice=None,
+        _sym_taxonomy_auto_applied=bool(auto_applied),
+    )
+    if preserve_draft:
+        st.session_state["sym_ai_build_result"] = dict(tax_result)
+    return True
+
+
+def _auto_prepare_product_profile_and_knowledge(dataset, *, max_sample=20, context_label="workspace build"):
+    reviews_df = dataset.get("reviews_df", pd.DataFrame()) if isinstance(dataset, dict) else pd.DataFrame()
+    existing_desc = _safe_text(st.session_state.get("sym_product_profile")).strip()
+    existing_knowledge = _normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {})
+    need_generation = (not existing_desc) or (not _has_visible_product_knowledge(existing_knowledge))
+    client = _get_client()
+    result = {
+        "status": "ok",
+        "reason": "",
+        "client": client,
+        "sample_reviews": [],
+        "description": existing_desc,
+        "product_knowledge": existing_knowledge,
+        "description_generated": False,
+        "knowledge_generated": False,
+        "category": str(st.session_state.get("sym_taxonomy_category") or "general"),
+    }
+    if reviews_df is None or reviews_df.empty:
+        result.update(status="skipped", reason="no_reviews")
+        return result
+    sample_reviews = _sample_reviews_for_symptomizer(reviews_df, max_sample)
+    result["sample_reviews"] = sample_reviews
+    if not sample_reviews:
+        result.update(status="skipped", reason="no_sample_reviews")
+        return result
+    if need_generation and not client:
+        result.update(status="skipped", reason="no_client")
+        return result
+    if need_generation:
+        profile_result = _ai_generate_product_description(
+            client=client,
+            sample_reviews=sample_reviews,
+            existing_description=existing_desc,
+        )
+        generated_desc = _safe_text(profile_result.get("description")).strip()
+        merged_desc = generated_desc or existing_desc
+        merged_knowledge = _normalize_product_knowledge(profile_result.get("product_knowledge") or existing_knowledge)
+        result["description_generated"] = bool(generated_desc and generated_desc != existing_desc)
+        result["knowledge_generated"] = bool(
+            _has_visible_product_knowledge(merged_knowledge) and not _has_visible_product_knowledge(existing_knowledge)
+        )
+        result["description"] = merged_desc
+        result["product_knowledge"] = merged_knowledge
+        if merged_desc:
+            st.session_state["sym_product_profile"] = merged_desc
+            st.session_state["sym_pdesc"] = merged_desc
+            st.session_state["_sym_pdesc_pending"] = merged_desc
+        if _has_visible_product_knowledge(merged_knowledge):
+            st.session_state["sym_product_knowledge"] = merged_knowledge
+        confidence_note = _safe_text(profile_result.get("confidence_note")).strip()
+        if confidence_note:
+            st.session_state["sym_product_profile_ai_note"] = confidence_note
+        elif merged_desc or _has_visible_product_knowledge(merged_knowledge):
+            st.session_state["sym_product_profile_ai_note"] = f"Auto-generated from review sample on {context_label}."
+    desc_for_category = _safe_text(result.get("description")).strip()
+    if desc_for_category:
+        category_info = _infer_taxonomy_category(desc_for_category, list(sample_reviews)[:12])
+        category = str(category_info.get("category") or st.session_state.get("sym_taxonomy_category") or "general")
+        st.session_state["sym_taxonomy_category"] = category
+        result["category"] = category
+    return result
+
+
+def _auto_prepare_workspace_taxonomy(dataset, *, max_sample=40, preserve_existing_taxonomy=True, auto_activate=True, context_label="workspace build"):
+    summary = dataset.get("summary") if isinstance(dataset, dict) else {}
+    reviews_df = dataset.get("reviews_df", pd.DataFrame()) if isinstance(dataset, dict) else pd.DataFrame()
+    status = {
+        "status": "skipped",
+        "reason": "",
+        "description_generated": False,
+        "knowledge_generated": False,
+        "taxonomy_generated": False,
+        "taxonomy_preserved": False,
+        "auto_applied": False,
+        "taxonomy_result": None,
+    }
+    try:
+        profile = _auto_prepare_product_profile_and_knowledge(
+            dataset,
+            max_sample=max_sample,
+            context_label=context_label,
+        )
+        status.update(
+            status=profile.get("status", "skipped"),
+            reason=profile.get("reason", ""),
+            description_generated=bool(profile.get("description_generated")),
+            knowledge_generated=bool(profile.get("knowledge_generated")),
+        )
+        if profile.get("status") != "ok":
+            return status
+        if preserve_existing_taxonomy and _has_active_workspace_taxonomy():
+            status.update(status="ok", taxonomy_preserved=True)
+            return status
+        sample_reviews = list(profile.get("sample_reviews") or [])
+        if not sample_reviews:
+            status.update(status="skipped", reason="no_sample_reviews")
+            return status
+        product_description = _safe_text(profile.get("description")).strip()
+        if not product_description:
+            product_description = _safe_text(_product_name(summary or {}, reviews_df)).strip() or "General consumer product"
+        tax_result = _ai_build_symptom_list(
+            client=profile.get("client"),
+            product_description=product_description,
+            sample_reviews=sample_reviews,
+            product_knowledge=profile.get("product_knowledge") or {},
+        )
+        if not tax_result or (not tax_result.get("delighters") and not tax_result.get("detractors")):
+            status.update(status="skipped", reason="empty_taxonomy")
+            return status
+        status.update(status="ok", taxonomy_generated=True, taxonomy_result=tax_result)
+        if auto_activate:
+            status["auto_applied"] = bool(_activate_ai_taxonomy_result(tax_result, source="ai", preserve_draft=True, auto_applied=True))
+        else:
+            st.session_state["sym_ai_build_result"] = dict(tax_result)
+            st.session_state["sym_wizard_step"] = 2
+            st.session_state["_sym_taxonomy_auto_applied"] = False
+        return status
+    except Exception as exc:
+        _log.warning("Auto-preparing workspace taxonomy failed: %s", exc, exc_info=True)
+        status.update(status="error", reason=str(exc))
+        return status
+
+
 def _auto_discover_product(dataset, *, max_sample=20):
     """Phase 1: Auto-discover product description + knowledge from reviews.
     Runs automatically after workspace build — no user action needed."""
-    client = _get_client()
-    if not client:
-        return
-    reviews_df = dataset.get("reviews_df", pd.DataFrame())
-    if reviews_df.empty:
-        return
     try:
-        # Sample reviews stratified by rating
-        sample = _sample_reviews_for_symptomizer(reviews_df, max_sample)
-        if not sample:
-            return
-        # Auto-generate product description
-        existing_desc = st.session_state.get("sym_product_profile", "")
-        if not existing_desc:
-            result = _ai_generate_product_description(
-                client=client, sample_reviews=sample, existing_description=""
-            )
-            if result and result.get("description"):
-                st.session_state["sym_product_profile"] = result["description"]
-                st.session_state["sym_product_profile_ai_note"] = result.get("confidence_note", "Auto-generated on workspace build.")
-                _log.info("Auto-discovered product description: %s", result["description"][:80])
-        # Auto-generate product knowledge
-        desc = st.session_state.get("sym_product_profile", "")
-        if desc and not st.session_state.get("sym_product_knowledge"):
-            category_info = _infer_taxonomy_category(desc, sample[:12])
-            category = category_info.get("category", "general")
-            st.session_state["sym_taxonomy_category"] = category
-            # Build knowledge from the description + sample
-            knowledge = {
-                "product_archetype": _infer_generic_archetype(desc, {}),
-                "confidence_note": "Auto-generated from review sample on workspace build.",
-            }
-            # Use the AI to fill in structured knowledge
-            try:
-                knowledge_result = _ai_generate_product_description(
-                    client=client, sample_reviews=sample, existing_description=desc
-                )
-                if knowledge_result:
-                    for key in ["product_areas", "desired_outcomes", "likely_failure_modes",
-                                "workflow_steps", "use_cases", "comparison_set", "user_contexts",
-                                "csat_drivers", "watchouts", "likely_delighter_themes", "likely_detractor_themes"]:
-                        if knowledge_result.get(key):
-                            knowledge[key] = knowledge_result[key]
-            except Exception:
-                pass
-            st.session_state["sym_product_knowledge"] = _normalize_product_knowledge(knowledge)
-            _log.info("Auto-discovered product knowledge for category: %s", category)
+        result = _auto_prepare_product_profile_and_knowledge(
+            dataset,
+            max_sample=max_sample,
+            context_label="workspace build",
+        )
+        if result.get("status") == "ok" and result.get("description"):
+            _log.info("Auto-discovered product profile for category: %s", result.get("category", "general"))
     except Exception as exc:
-        _log.warning("Auto-discovery failed: %s", exc)
+        _log.warning("Auto-discovery failed: %s", exc, exc_info=True)
 
 
 def _batch_html(*blocks):
@@ -8749,6 +9022,10 @@ def _init_state():
         workspace_product_urls_bulk="",
         workspace_file_uploader_nonce=0,
         workspace_include_local_symptomization=True,
+        workspace_auto_prepare_uploaded_taxonomy=True,
+        workspace_auto_build_uploaded_files=True,
+        _workspace_last_uploaded_build_sig=None,
+        _workspace_last_uploaded_build_error="",
         workspace_active_tab=TAB_DASHBOARD,
         workspace_tab_request=None,
         ai_scroll_to_top=False,
@@ -8763,6 +9040,7 @@ def _init_state():
         sym_processed_rows=[],
         sym_new_candidates={},
         sym_product_profile="",
+        sym_pdesc="",
         sym_product_knowledge={},
         sym_include_universal_neutral=True,
         sym_scope_choice="Missing both",
@@ -8779,7 +9057,10 @@ def _init_state():
         sym_qa_notice=None,
         sym_product_profile_ai_note="",
         sym_calibration_result=None,
+        sym_ai_build_result=None,
+        sym_wizard_step=1,
         sym_staged_pipeline=False,
+        _sym_taxonomy_auto_applied=False,
         sym_v4_pipeline=True,
         sym_last_run_stats=None,
         sidebar_manual_api_key="",
@@ -8803,6 +9084,9 @@ def _reset_workspace_state(*, reset_source=True):
     st.session_state["prompt_run_artifacts"] = None
     st.session_state["prompt_run_notice"] = None
     st.session_state["review_explorer_page"] = 1
+    st.session_state["workspace_name"] = ""
+    st.session_state["workspace_id"] = None
+    st.session_state["_ws_show_rename"] = False
     st.session_state["workspace_active_tab"] = TAB_DASHBOARD
     st.session_state["workspace_tab_request"] = None
     st.session_state["ai_scroll_to_top"] = False
@@ -8817,6 +9101,8 @@ def _reset_workspace_state(*, reset_source=True):
     st.session_state["sym_symptoms_source"] = "none"
     st.session_state["sym_delighters"] = []
     st.session_state["sym_detractors"] = []
+    st.session_state["sym_custom_universal_delighters"] = []
+    st.session_state["sym_custom_universal_detractors"] = []
     st.session_state["sym_aliases"] = {}
     st.session_state["sym_taxonomy_preview_items"] = []
     st.session_state["sym_taxonomy_category"] = "general"
@@ -8827,6 +9113,10 @@ def _reset_workspace_state(*, reset_source=True):
     st.session_state["sym_qa_selected_row"] = None
     st.session_state["sym_qa_notice"] = None
     st.session_state["sym_product_profile_ai_note"] = ""
+    st.session_state["sym_calibration_result"] = None
+    st.session_state["sym_wizard_step"] = 1
+    st.session_state["_sym_taxonomy_auto_applied"] = False
+    st.session_state.pop("_sym_old_taxonomy", None)
     st.session_state.pop("_sym_pdesc_pending", None)
     st.session_state.pop("_sym_inline_defaults_pending", None)
     st.session_state["_uploaded_raw_bytes"] = None
@@ -8841,6 +9131,96 @@ def _reset_workspace_state(*, reset_source=True):
         st.session_state["workspace_product_url"] = DEFAULT_PRODUCT_URL
         st.session_state["workspace_product_urls_bulk"] = ""
         st.session_state["workspace_file_uploader_nonce"] = int(st.session_state.get("workspace_file_uploader_nonce", 0)) + 1
+        st.session_state["_workspace_last_uploaded_build_sig"] = None
+        st.session_state["_workspace_last_uploaded_build_error"] = ""
+
+
+def _apply_workspace_dataset(dataset, *, raw_bytes=None, symptom_seed=None):
+    symptom_seed = dict(symptom_seed or {})
+    seed_dels = list(symptom_seed.get("delighters") or [])
+    seed_dets = list(symptom_seed.get("detractors") or [])
+    seed_aliases = dict(symptom_seed.get("aliases") or {})
+    seed_source = str(symptom_seed.get("source") or "none")
+    _reset_workspace_state(reset_source=False)
+    st.session_state["analysis_dataset"] = dataset
+    st.session_state["_uploaded_raw_bytes"] = raw_bytes
+    if seed_dels or seed_dets:
+        st.session_state["sym_symptoms_source"] = seed_source
+        st.session_state["sym_delighters"] = seed_dels
+        st.session_state["sym_detractors"] = seed_dets
+        st.session_state["sym_aliases"] = _alias_map_for_catalog(seed_dels, seed_dets, extra_aliases=seed_aliases)
+    return {"has_taxonomy_seed": bool(seed_dels or seed_dets), "source": seed_source}
+
+
+def _workspace_auto_prepare_notice(prep=None, seed_result=None):
+    prep = dict(prep or {})
+    seed_result = dict(seed_result or {})
+    if prep and prep.get("status") == "ok":
+        if prep.get("taxonomy_generated") and prep.get("auto_applied"):
+            return "Loaded the workbook and auto-generated product knowledge plus an AI taxonomy. The Symptomizer is ready to run immediately, and you can still review or edit the taxonomy in Step 1."
+        if seed_result.get("has_taxonomy_seed") and prep.get("taxonomy_preserved") and (prep.get("description_generated") or prep.get("knowledge_generated")):
+            return "Loaded the workbook, kept the uploaded taxonomy, and auto-generated product knowledge from the review sample."
+        if seed_result.get("has_taxonomy_seed") and prep.get("taxonomy_preserved"):
+            return "Loaded the workbook and kept the uploaded taxonomy automatically."
+        if prep.get("description_generated") or prep.get("knowledge_generated"):
+            return "Loaded the workbook and auto-generated product knowledge from the review sample."
+    if seed_result.get("has_taxonomy_seed"):
+        if seed_result.get("source") == "file":
+            return "Loaded the workbook and activated its Symptoms sheet taxonomy automatically."
+        return "Loaded the workbook and activated the uploaded symptom columns as the starting taxonomy."
+    return ""
+
+
+def _uploaded_file_build_signature(uploaded_files, *, include_local_symptomization=False, auto_prepare_uploaded_taxonomy=True):
+    if not uploaded_files:
+        return ""
+    digest = hashlib.sha1()
+    digest.update(str(int(bool(include_local_symptomization))).encode("utf-8"))
+    digest.update(str(int(bool(auto_prepare_uploaded_taxonomy))).encode("utf-8"))
+    for uploaded in uploaded_files or []:
+        name = str(getattr(uploaded, "name", "") or "")
+        size = str(getattr(uploaded, "size", "") or "")
+        digest.update(name.encode("utf-8", errors="ignore"))
+        digest.update(size.encode("utf-8", errors="ignore"))
+        try:
+            payload = uploaded.getvalue()
+        except Exception:
+            payload = b""
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8", errors="ignore")
+        elif payload is None:
+            payload = b""
+        digest.update(hashlib.sha1(bytes(payload)).digest())
+    return digest.hexdigest()
+
+
+def _build_workspace_from_uploaded_files(uploaded_files, *, include_local_symptomization=False, auto_prepare_uploaded_taxonomy=True):
+    files = list(uploaded_files or [])
+    nd = _load_uploaded_files_dispatch(files, include_local_symptomization=include_local_symptomization)
+    raw_bytes = None
+    if len(files) == 1:
+        fname = str(getattr(files[0], "name", "") or "")
+        if fname.lower().endswith((".xlsx", ".xlsm")):
+            raw_bytes = files[0].getvalue()
+    seed = _uploaded_workspace_catalog_seed(
+        nd,
+        raw_bytes=raw_bytes,
+        include_local_symptomization=include_local_symptomization,
+    )
+    seed_result = _apply_workspace_dataset(nd, raw_bytes=raw_bytes, symptom_seed=seed)
+    prep = None
+    if auto_prepare_uploaded_taxonomy:
+        prep = _auto_prepare_workspace_taxonomy(
+            nd,
+            max_sample=40,
+            preserve_existing_taxonomy=True,
+            auto_activate=True,
+            context_label="uploaded workspace build",
+        )
+    notice = _workspace_auto_prepare_notice(prep, seed_result)
+    if notice:
+        st.session_state["sym_run_notice"] = notice
+    return {"dataset": nd, "seed_result": seed_result, "prep": prep, "notice": notice, "raw_bytes": raw_bytes}
 
 
 _init_state()
@@ -10707,12 +11087,11 @@ The tagger reads more than the main review body — it may use pros, cons, comme
                 btn_cols = st.columns([1.5, 1, 1])
                 if btn_cols[0].button("✅ Approve & run symptomizer", type="primary", use_container_width=True, key="sym_approve_and_run"):
                     # Accept taxonomy
-                    accepted_dels, accepted_dets = _canonical_symptom_catalog(
-                        _parse_manual_tag_entries(st.session_state.get("sym_ai_del_edit", "\n".join(ai_result.get("delighters", [])))),
-                        _parse_manual_tag_entries(st.session_state.get("sym_ai_det_edit", "\n".join(ai_result.get("detractors", [])))),
+                    final_dels, final_dets = _prepare_active_taxonomy(
+                        st.session_state.get("sym_ai_del_edit", "\n".join(ai_result.get("delighters", []))),
+                        st.session_state.get("sym_ai_det_edit", "\n".join(ai_result.get("detractors", []))),
+                        include_universal_neutral=bool(st.session_state.get("sym_include_universal_neutral", True)),
                     )
-                    include_neutral = bool(st.session_state.get("sym_include_universal_neutral", True))
-                    final_dets, final_dels = _ensure_universal_taxonomy(accepted_dets, accepted_dels, include_universal_neutral=include_neutral)
                     st.session_state.update(
                         sym_delighters=final_dels,
                         sym_detractors=final_dets,
@@ -10725,6 +11104,7 @@ The tagger reads more than the main review body — it may use pros, cons, comme
                         sym_wizard_auto_run=True,
                         _sym_run_n_reviews=int(n_reviews),
                         _sym_run_batch_size=int(batch_size),
+                        _sym_taxonomy_auto_applied=False,
                     )
                     if taxonomy_edited_in_wizard:
                         st.session_state["sym_qa_user_edited"] = True
@@ -10744,13 +11124,25 @@ The tagger reads more than the main review body — it may use pros, cons, comme
             elif wizard_step >= 3 or has_taxonomy:
                 st.session_state["sym_wizard_step"] = 3
                 st.caption(f"Product-specific taxonomy loaded ({len(st.session_state.get('sym_detractors', []))} det · {len(st.session_state.get('sym_delighters', []))} del). Scroll down to Section 2 to run the symptomizer, or rebuild here.")
-                if st.button("🔄 Rebuild taxonomy from scratch", use_container_width=True, key="sym_rebuild_taxonomy"):
+                auto_applied_taxonomy = bool(st.session_state.get("_sym_taxonomy_auto_applied")) and bool(st.session_state.get("sym_ai_build_result"))
+                if auto_applied_taxonomy:
+                    st.caption("This taxonomy was auto-generated and activated from the loaded workspace so you can run immediately. Review or edit it any time, or rebuild from scratch.")
+                    ac1, ac2 = st.columns([1.35, 1.0])
+                    if ac1.button("👀 Review / edit auto-generated taxonomy", use_container_width=True, key="sym_review_auto_taxonomy"):
+                        st.session_state["sym_wizard_step"] = 2
+                        st.session_state["_sym_wizard_force_step"] = 2
+                        st.rerun()
+                    rebuild_pressed = ac2.button("🔄 Rebuild taxonomy from scratch", use_container_width=True, key="sym_rebuild_taxonomy")
+                else:
+                    rebuild_pressed = st.button("🔄 Rebuild taxonomy from scratch", use_container_width=True, key="sym_rebuild_taxonomy")
+                if rebuild_pressed:
                     # Store old taxonomy counts for diff display in step 2
                     old_dets = list(st.session_state.get("sym_detractors") or [])
                     old_dels = list(st.session_state.get("sym_delighters") or [])
                     st.session_state["_sym_old_taxonomy"] = {"det_count": len(old_dets), "del_count": len(old_dels), "det_labels": old_dets[:30], "del_labels": old_dels[:30]}
                     st.session_state["sym_wizard_step"] = 1
                     st.session_state["_sym_wizard_force_step"] = 1
+                    st.session_state["_sym_taxonomy_auto_applied"] = False
                     st.session_state.pop("sym_ai_build_result", None)
                     st.rerun()
                 _sym_knowledge = _normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {})
@@ -10775,8 +11167,9 @@ The tagger reads more than the main review body — it may use pros, cons, comme
                 det_text = st.text_area("One per line or comma-separated", value="\n".join(product_specific_dets), height=200, key="sym_det_manual")
             save_manual = st.form_submit_button("💾 Save symptoms", use_container_width=True)
         if save_manual:
-            saved_dels, saved_dets = _canonical_symptom_catalog(_parse_manual_tag_entries(del_text), _parse_manual_tag_entries(det_text))
-            st.session_state.update(sym_delighters=saved_dels, sym_detractors=saved_dets, sym_aliases=_alias_map_for_catalog(saved_dels, saved_dets, existing_aliases=st.session_state.get("sym_aliases", {})), sym_symptoms_source="manual", sym_taxonomy_preview_items=[])
+            saved_dels, saved_dets = _prepare_active_taxonomy(del_text, det_text)
+            st.session_state.update(sym_delighters=saved_dels, sym_detractors=saved_dets, sym_aliases=_alias_map_for_catalog(saved_dels, saved_dets, existing_aliases=st.session_state.get("sym_aliases", {})), sym_symptoms_source="manual", sym_taxonomy_preview_items=[], _sym_taxonomy_auto_applied=False)
+            st.session_state.pop("sym_ai_build_result", None)
             st.session_state["sym_qa_user_edited"] = True
             st.success("Saved.")
             st.rerun()
@@ -10788,8 +11181,9 @@ The tagger reads more than the main review body — it may use pros, cons, comme
             st.session_state["_uploaded_raw_bytes"] = raw
             d, t, a = _get_symptom_whitelists(raw)
             if d or t:
-                loaded_dels, loaded_dets = _canonical_symptom_catalog(d, t)
-                st.session_state.update(sym_delighters=loaded_dels, sym_detractors=loaded_dets, sym_aliases=_alias_map_for_catalog(loaded_dels, loaded_dets, extra_aliases=a, existing_aliases=st.session_state.get("sym_aliases", {})), sym_symptoms_source="file", sym_taxonomy_preview_items=[], sym_taxonomy_category="general")
+                loaded_dels, loaded_dets = _prepare_active_taxonomy(d, t)
+                st.session_state.update(sym_delighters=loaded_dels, sym_detractors=loaded_dets, sym_aliases=_alias_map_for_catalog(loaded_dels, loaded_dets, extra_aliases=a, existing_aliases=st.session_state.get("sym_aliases", {})), sym_symptoms_source="file", sym_taxonomy_preview_items=[], sym_taxonomy_category="general", _sym_taxonomy_auto_applied=False)
+                st.session_state.pop("sym_ai_build_result", None)
                 st.session_state["sym_qa_user_edited"] = True
                 st.success(f"Loaded {len(loaded_dels)} delighters and {len(loaded_dets)} detractors.")
                 st.rerun()
@@ -12036,8 +12430,7 @@ def main():
                     if st.button("Build review workspace", type="primary", key="ws_build_url", use_container_width=True):
                         try:
                             nd = _load_product_reviews_dispatch(st.session_state.get("workspace_product_url", DEFAULT_PRODUCT_URL))
-                            _reset_review_filters()
-                            st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", sym_delighters=[], sym_detractors=[], sym_custom_universal_delighters=[], sym_custom_universal_detractors=[], sym_aliases={}, sym_taxonomy_preview_items=[], sym_taxonomy_category="general", sym_qa_baseline_map={}, sym_qa_accuracy={}, sym_qa_user_edited=False, sym_qa_row_ids=[], sym_qa_selected_row=None, sym_qa_notice=None, sym_product_profile_ai_note="", sym_product_knowledge={}, workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None, ai_include_references=False, ot_show_volume=False, _uploaded_raw_bytes=None, sym_export_bytes=None)
+                            _apply_workspace_dataset(nd)
                             with st.spinner("Auto-discovering product profile…"):
                                 _auto_discover_product(nd)
                             st.rerun()
@@ -12066,8 +12459,7 @@ def main():
                     if st.button("Build combined workspace", type="primary", key="ws_build_url_multi", use_container_width=True):
                         try:
                             nd = _load_multiple_product_reviews_dispatch(bulk_urls)
-                            _reset_review_filters()
-                            st.session_state.update(analysis_dataset=nd, chat_messages=[], master_export_bundle=None, prompt_run_artifacts=None, sym_processed_rows=[], sym_new_candidates={}, sym_symptoms_source="none", sym_delighters=[], sym_detractors=[], sym_custom_universal_delighters=[], sym_custom_universal_detractors=[], sym_aliases={}, sym_taxonomy_preview_items=[], sym_taxonomy_category="general", sym_qa_baseline_map={}, sym_qa_accuracy={}, sym_qa_user_edited=False, sym_qa_row_ids=[], sym_qa_selected_row=None, sym_qa_notice=None, sym_product_profile_ai_note="", sym_product_knowledge={}, workspace_active_tab=TAB_DASHBOARD, workspace_tab_request=None, ai_include_references=False, ot_show_volume=False, _uploaded_raw_bytes=None, sym_export_bytes=None)
+                            _apply_workspace_dataset(nd)
                             with st.spinner("Auto-discovering product profile…"):
                                 _auto_discover_product(nd)
                             st.rerun()
@@ -12094,53 +12486,78 @@ def main():
                     key="workspace_include_local_symptomization",
                     help="Preserves populated Symptom 1–20 / AI Symptom columns from uploaded files so the Dashboard, Review Explorer, filters, and Symptomizer can use them immediately.",
                 )
-                st.caption("Mapped columns include Event Id, Base SKU, Review Text, Rating, Opened date, Seeded Flag, and Retailer when available. Turn on local symptomization to keep existing Symptom 1–20 / AI Symptom tags and infer the symptom catalog automatically.")
-                if st.button("Build review workspace from file", type="primary", key="ws_build_file", use_container_width=True):
+                auto_prepare_uploaded_taxonomy = st.checkbox(
+                    "Auto-generate product knowledge + taxonomy after load",
+                    value=bool(st.session_state.get("workspace_auto_prepare_uploaded_taxonomy", True)),
+                    key="workspace_auto_prepare_uploaded_taxonomy",
+                    help="Drafts product knowledge and an AI taxonomy from the uploaded review sample so the Symptomizer needs far fewer clicks. Existing workbook taxonomies are preserved.",
+                )
+                auto_build_uploaded_files = st.checkbox(
+                    "Auto-load workbook as soon as it is selected",
+                    value=bool(st.session_state.get("workspace_auto_build_uploaded_files", True)),
+                    key="workspace_auto_build_uploaded_files",
+                    help="Builds the workspace immediately after you choose files so you can skip the extra build click.",
+                )
+                st.caption("Mapped columns include Event Id, Base SKU, Review Text, Rating, Opened date, Seeded Flag, and Retailer when available. Explicit Symptoms sheets are loaded automatically, and with auto-generate on the app will also draft product knowledge plus an AI taxonomy when no product-specific catalog is already present.")
+                uploaded_build_sig = _uploaded_file_build_signature(
+                    uploaded_files or [],
+                    include_local_symptomization=include_local_symptomization,
+                    auto_prepare_uploaded_taxonomy=auto_prepare_uploaded_taxonomy,
+                ) if uploaded_files else ""
+                last_uploaded_build_sig = str(st.session_state.get("_workspace_last_uploaded_build_sig") or "")
+                build_spinner_label = "Loading workbook and auto-preparing taxonomy…" if auto_prepare_uploaded_taxonomy else "Loading workbook…"
+                if uploaded_files and auto_build_uploaded_files:
+                    st.caption("Auto-load is on. Selecting a file builds the workspace immediately; use Reload if you want to force a fresh build.")
+                elif uploaded_files:
+                    st.caption("Auto-load is off. Choose files, then click Build when you're ready.")
+                last_upload_error = str(st.session_state.get("_workspace_last_uploaded_build_error") or "")
+                auto_build_pending = bool(auto_build_uploaded_files and uploaded_build_sig and uploaded_build_sig != last_uploaded_build_sig)
+                if auto_build_pending:
                     try:
-                        nd = _load_uploaded_files_dispatch(uploaded_files or [], include_local_symptomization=include_local_symptomization)
-                        _reset_review_filters()
-                        raw_bytes = None
-                        if uploaded_files and len(uploaded_files) == 1:
-                            fname = getattr(uploaded_files[0], "name", "")
-                            if fname.lower().endswith((".xlsx", ".xlsm")):
-                                raw_bytes = uploaded_files[0].getvalue()
-                        local_delighters, local_detractors = ([], [])
-                        if include_local_symptomization:
-                            local_delighters, local_detractors = _local_symptom_catalog(nd["reviews_df"])
-                        has_local_catalog = bool(local_delighters or local_detractors)
-                        st.session_state.update(
-                            analysis_dataset=nd,
-                            chat_messages=[],
-                            master_export_bundle=None,
-                            prompt_run_artifacts=None,
-                            sym_processed_rows=[],
-                            sym_new_candidates={},
-                            sym_symptoms_source=("local upload" if has_local_catalog else "none"),
-                            sym_delighters=(local_delighters if has_local_catalog else []),
-                            sym_detractors=(local_detractors if has_local_catalog else []),
-                            sym_aliases=_alias_map_for_catalog((local_delighters if has_local_catalog else []), (local_detractors if has_local_catalog else [])),
-                            sym_taxonomy_preview_items=[],
-                            sym_taxonomy_category="general",
-                            sym_qa_baseline_map={},
-                            sym_qa_accuracy={},
-                            sym_qa_user_edited=False,
-                            sym_qa_row_ids=[],
-                            sym_qa_selected_row=None,
-                            sym_qa_notice=None,
-                            sym_product_profile_ai_note="",
-                            sym_product_knowledge={},
-                            workspace_active_tab=TAB_DASHBOARD,
-                            workspace_tab_request=None,
-                            ai_include_references=False,
-                            ot_show_volume=False,
-                            _uploaded_raw_bytes=raw_bytes,
-                            sym_export_bytes=None,
-                        )
+                        with st.spinner(build_spinner_label):
+                            _build_workspace_from_uploaded_files(
+                                uploaded_files or [],
+                                include_local_symptomization=include_local_symptomization,
+                                auto_prepare_uploaded_taxonomy=auto_prepare_uploaded_taxonomy,
+                            )
+                        st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                        st.session_state["_workspace_last_uploaded_build_error"] = ""
                         st.rerun()
                     except ReviewDownloaderError as exc:
+                        st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                        st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
                         st.error(str(exc))
                     except Exception as exc:
+                        st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                        st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
                         st.exception(exc)
+
+                build_btn_label = "Reload selected workbook" if uploaded_files and auto_build_uploaded_files else "Build review workspace from file"
+                build_clicked = st.button(build_btn_label, type="primary", key="ws_build_file", use_container_width=True, disabled=not uploaded_files)
+                if build_clicked:
+                    try:
+                        with st.spinner(build_spinner_label):
+                            _build_workspace_from_uploaded_files(
+                                uploaded_files or [],
+                                include_local_symptomization=include_local_symptomization,
+                                auto_prepare_uploaded_taxonomy=auto_prepare_uploaded_taxonomy,
+                            )
+                        if uploaded_build_sig:
+                            st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                        st.session_state["_workspace_last_uploaded_build_error"] = ""
+                        st.rerun()
+                    except ReviewDownloaderError as exc:
+                        if uploaded_build_sig:
+                            st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                        st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
+                        st.error(str(exc))
+                    except Exception as exc:
+                        if uploaded_build_sig:
+                            st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                        st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
+                        st.exception(exc)
+                elif last_upload_error and uploaded_files and uploaded_build_sig == last_uploaded_build_sig:
+                    st.caption(f"Last load attempt: {last_upload_error}")
 
     dataset = st.session_state.get("analysis_dataset")
     settings = _render_sidebar(dataset["reviews_df"] if dataset else None)
