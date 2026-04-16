@@ -52,6 +52,13 @@ except Exception:
     _package_load_multiple_product_reviews = None
     _package_load_uploaded_files = None
 
+from review_analyst.api_key_ui import (
+    BUILDER_API_KEY_SUBTITLE as _BUILDER_API_KEY_SUBTITLE,
+    MANUAL_API_KEY_HELP as _MANUAL_API_KEY_HELP,
+    MISSING_API_KEY_GUIDANCE as _MISSING_API_KEY_GUIDANCE,
+    describe_api_key_ui as _describe_api_key_ui,
+)
+
 try:
     from review_analyst.tag_quality import (
         UNIVERSAL_DETRACTOR as _UNIVERSAL_DETRACTOR,
@@ -862,8 +869,12 @@ def _estimate_tokens(text):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  OPENAI
 # ═══════════════════════════════════════════════════════════════════════════════
+def _manual_api_key_value() -> str:
+    return (st.session_state.get("sidebar_manual_api_key") or "").strip()
+
+
 def _get_api_key():
-    """Resolve OpenAI API key: secrets → env → manual sidebar input."""
+    """Resolve OpenAI API key: secrets → env → manual session input."""
     try:
         if "OPENAI_API_KEY" in st.secrets:
             return str(st.secrets["OPENAI_API_KEY"])
@@ -874,19 +885,44 @@ def _get_api_key():
     env_key = os.getenv("OPENAI_API_KEY")
     if env_key:
         return env_key
-    manual = (st.session_state.get("sidebar_manual_api_key") or "").strip()
+    manual = _manual_api_key_value()
     return manual or None
 
 
 def _api_key_source() -> str:
     """Return where the API key was found: 'secrets', 'env', 'manual', or 'missing'."""
     try:
-        if "OPENAI_API_KEY" in st.secrets: return "secrets"
-        if "openai" in st.secrets and st.secrets["openai"].get("api_key"): return "secrets"
-    except Exception: pass
-    if os.getenv("OPENAI_API_KEY"): return "env"
-    if (st.session_state.get("sidebar_manual_api_key") or "").strip(): return "manual"
+        if "OPENAI_API_KEY" in st.secrets:
+            return "secrets"
+        if "openai" in st.secrets and st.secrets["openai"].get("api_key"):
+            return "secrets"
+    except Exception:
+        pass
+    if os.getenv("OPENAI_API_KEY"):
+        return "env"
+    if _manual_api_key_value():
+        return "manual"
     return "missing"
+
+
+def _sync_manual_api_key_from_widget(widget_key: str):
+    st.session_state["sidebar_manual_api_key"] = (st.session_state.get(widget_key) or "").strip()
+
+
+def _render_manual_api_key_input(widget_key: str, *, label: str = "OpenAI API key"):
+    current = _manual_api_key_value()
+    if st.session_state.get(widget_key) != current:
+        st.session_state[widget_key] = current
+    st.text_input(
+        label,
+        type="password",
+        placeholder="sk-proj-...",
+        key=widget_key,
+        help=_MANUAL_API_KEY_HELP,
+        on_change=_sync_manual_api_key_from_widget,
+        args=(widget_key,),
+    )
+    return _get_api_key()
 
 
 @st.cache_resource(show_spinner=False)
@@ -1052,7 +1088,7 @@ def _build_completion_token_kwargs(max_tokens):
 def _chat_complete(client, *, model, messages, temperature=0.0, response_format=None,
                    max_tokens=1200, reasoning_effort=None, _max_retries=3):
     if client is None:
-        raise RuntimeError("OpenAI client is not initialized. Check your API key in Settings → OpenAI API Key.")
+        raise RuntimeError("OpenAI client is not initialized. Add a key in Build or switch workspace, or set OPENAI_API_KEY in the environment / Streamlit secrets.")
 
     effort = _normalize_reasoning_effort_for_model(model, reasoning_effort)
     kwargs = dict(model=model, messages=_prepare_messages_for_model(model, messages))
@@ -9324,6 +9360,8 @@ def _init_state():
         _sym_recommended_setup_sig=None,
         _sym_recommended_setup_auto=True,
         sidebar_manual_api_key="",
+        sidebar_manual_api_key_input="",
+        workspace_manual_api_key_input="",
         workspace_name="",
         workspace_id=None,
         _ws_show_rename=False,
@@ -9620,15 +9658,15 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
                 st.session_state["shared_reasoning"] = cur_reasoning
             st.selectbox("Reasoning effort", options=effort_options, index=effort_options.index(cur_reasoning), key="shared_reasoning", help="Applied to GPT-5 family models. Raising this usually improves quality on nuanced and long-form analysis, but may be a bit slower.")
             key_source = _api_key_source()
+            key_ui = _describe_api_key_ui(key_source)
             if key_source in ("secrets", "env"):
                 st.markdown("<div class='helper-chip-row'><span class='helper-chip' style='background:rgba(5,150,105,.10);color:#059669;border-color:rgba(5,150,105,.25);'>✅ Key loaded</span><span class='helper-chip'>Higher reasoning = higher quality</span></div>", unsafe_allow_html=True)
             elif key_source == "manual":
-                st.markdown("<div class='helper-chip-row'><span class='helper-chip' style='background:rgba(217,119,6,.10);color:#d97706;border-color:rgba(217,119,6,.25);'>🔑 Using manual key</span></div>", unsafe_allow_html=True)
+                st.markdown("<div class='helper-chip-row'><span class='helper-chip' style='background:rgba(217,119,6,.10);color:#d97706;border-color:rgba(217,119,6,.25);'>🔑 Using manual key</span><span class='helper-chip'>You can update it here</span></div>", unsafe_allow_html=True)
             else:
-                st.warning("No API key detected. Paste one below or set OPENAI_API_KEY in secrets.")
-            if key_source in ("missing", "manual"):
-                st.text_input("OpenAI API key", type="password", placeholder="sk-proj-...", key="sidebar_manual_api_key", help="Paste your OpenAI API key. Only stored in your browser session.")
-                api_key = _get_api_key()
+                st.info(key_ui.status_message)
+            if key_ui.show_sidebar_entry:
+                api_key = _render_manual_api_key_input("sidebar_manual_api_key_input")
             st.markdown("<div style='height:.25rem'></div>", unsafe_allow_html=True)
             st.slider("Symptomizer batch size", 1, 12, key="sym_batch_size")
             st.slider("Symptomizer max evidence chars", 60, 200, step=10, key="sym_max_ev_chars")
@@ -11301,7 +11339,7 @@ The tagger reads more than the main review body — it may use pros, cons, comme
     sym_tabs = st.tabs(["🚀  Generate taxonomy", "✏️  Manual entry", "📄  Upload workbook"])
     with sym_tabs[0]:
         if not api_key:
-            st.warning("OpenAI API key required.")
+            st.warning("OpenAI API key required. Add it in Build or switch workspace.")
         else:
             # ── Unified 3-step wizard ─────────────────────────────────────
             wizard_step = st.session_state.get("sym_wizard_step", 1)
@@ -11357,7 +11395,7 @@ The tagger reads more than the main review body — it may use pros, cons, comme
                 # Verify client is initialized before showing generate button
                 _gen_blocked = False
                 if client is None:
-                    st.error("OpenAI client could not be initialized. Verify your API key is correct in Settings → OpenAI API Key.")
+                    st.error("OpenAI client could not be initialized. Verify the key you added in Build or switch workspace, or set OPENAI_API_KEY in the environment / Streamlit secrets.")
                     _gen_blocked = True
                 elif len(sample_reviews) == 0:
                     st.warning("No reviews available. Load reviews first, then generate the taxonomy.")
@@ -11724,7 +11762,7 @@ The tagger reads more than the main review body — it may use pros, cons, comme
             st.caption(f"Model: {_shared_model()} · Review set: {scope_choice}")
         run_disabled = (not api_key) or (len(target_df) == 0) or (active_taxonomy_count == 0)
         if run_disabled and not api_key:
-            st.warning("Add OPENAI_API_KEY to Streamlit secrets.")
+            st.warning(_MISSING_API_KEY_GUIDANCE)
         elif len(target_df) == 0:
             st.info("No reviews match the selected review set.")
         elif active_taxonomy_count == 0:
@@ -12890,6 +12928,15 @@ def main():
                         st.caption("No saved workspaces yet. Build one below and save it.")
                 st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
         st.markdown("<div class='builder-card'><div class='builder-kicker'>Get started</div><div class='builder-title'>Build a review workspace</div><div class='builder-sub'>Paste a supported product page or review API URL, or upload a review export file. Start with the Dashboard for an executive summary, then move into the other tabs for deeper work.</div><div class='helper-chip-row'><span class='helper-chip'>Shark/Ninja US</span><span class='helper-chip'>Shark/Ninja UK/EU</span><span class='helper-chip'>Costco</span><span class='helper-chip'>Sephora</span><span class='helper-chip'>Ulta</span><span class='helper-chip'>Hoka</span><span class='helper-chip'>CurrentBody</span><span class='helper-chip'>Okendo API</span><span class='helper-chip'>Bazaarvoice API</span><span class='helper-chip'>PowerReviews API</span></div></div>", unsafe_allow_html=True)
+        builder_key_ui = _describe_api_key_ui(_api_key_source())
+        if builder_key_ui.show_builder_entry:
+            with st.container(border=True):
+                st.markdown(
+                    "<div class='builder-kicker'>AI setup</div><div class='builder-title' style='font-size:16px;'>Add your OpenAI API key</div><div class='builder-sub' style='margin-bottom:.6rem;'>" + _esc(_BUILDER_API_KEY_SUBTITLE) + "</div><div class='helper-chip-row'><span class='helper-chip'>AI Analyst</span><span class='helper-chip'>Review Prompt</span><span class='helper-chip'>Taxonomy builder</span><span class='helper-chip'>Symptomizer</span></div>",
+                    unsafe_allow_html=True,
+                )
+                _render_manual_api_key_input("workspace_manual_api_key_input")
+                st.caption("Only shown when no key is detected automatically. For persistent setup, set OPENAI_API_KEY in the environment or Streamlit secrets.")
         with st.container(border=True):
             st.markdown(
                 "<div class='builder-kicker'>Source setup</div><div class='builder-title' style='font-size:16px;'>Choose how to load reviews</div><div class='builder-sub' style='margin-bottom:.7rem;'>Pick a link-based workspace or an uploaded file flow. The controls below stay grouped so the source choice, mode, and primary action feel like one connected setup.</div>",
@@ -13252,7 +13299,7 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
         client = _get_client()
         api_key = settings.get("api_key")
         if not client or not api_key:
-            st.error("OpenAI API key required. Add it in Settings -> OpenAI API Key.")
+            st.error("OpenAI API key required. Add it in Build or switch workspace, or set OPENAI_API_KEY in the environment / Streamlit secrets.")
             return
 
         persona_map = {
