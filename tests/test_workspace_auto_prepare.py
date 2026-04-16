@@ -256,3 +256,77 @@ def test_auto_prepare_workspace_taxonomy_preserves_uploaded_taxonomy_seed(app_mo
     assert "Hard To Clean" in app.st.session_state["sym_detractors"]
     assert app.st.session_state["sym_product_knowledge"]["workflow_steps"] == ["Cleanup"]
     assert app.st.session_state["sym_taxonomy_category"] == "home_appliance"
+
+
+def test_sync_symptom_wizard_editor_state_refreshes_stale_draft(app_module):
+    app = app_module
+    app.st.session_state.update(
+        sym_ai_del_edit="Old Delighter",
+        sym_ai_det_edit="Old Detractor",
+        _sym_ai_editor_sig="stale-signature",
+    )
+
+    payload = app._sync_symptom_wizard_editor_state(
+        {
+            "delighters": ["Easy Setup", "Versatile Cooking Modes"],
+            "detractors": ["Wrong Size"],
+        }
+    )
+
+    assert payload["source_dels"] == ["Easy Setup", "Versatile Cooking Modes"]
+    assert payload["source_dets"] == ["Wrong Size"]
+    assert app.st.session_state["sym_ai_del_edit"] == "Easy Setup\nVersatile Cooking Modes"
+    assert app.st.session_state["sym_ai_det_edit"] == "Wrong Size"
+    assert app.st.session_state["_sym_ai_editor_sig"] == payload["signature"]
+
+
+
+def test_taxonomy_editor_state_flags_manual_changes(app_module):
+    app = app_module
+
+    state = app._taxonomy_editor_state(
+        {
+            "delighters": ["Easy Setup", "Easy Cleanup"],
+            "detractors": ["Wrong Size"],
+        },
+        del_text="Easy Setup\nVersatile Cooking Modes",
+        det_text="Wrong Size",
+    )
+
+    assert state["edited"] is True
+    assert state["current_dels"] == ["Easy Setup", "Versatile Cooking Modes"]
+    assert state["current_dets"] == ["Wrong Size"]
+    assert state["added_count"] == 1
+    assert state["removed_count"] == 1
+    assert state["added_dels"] == ["Versatile Cooking Modes"]
+    assert state["removed_dels"] == ["Easy To Clean"]
+
+
+
+def test_activate_ai_taxonomy_result_clears_wizard_editor_state(app_module):
+    app = app_module
+    app.st.session_state.update(
+        sym_ai_del_edit="Old Delighter",
+        sym_ai_det_edit="Old Detractor",
+        _sym_ai_editor_sig="stale-signature",
+    )
+
+    activated = app._activate_ai_taxonomy_result(
+        {
+            "delighters": ["Easy Setup"],
+            "detractors": ["Wrong Size"],
+            "aliases": {"Wrong Size": ["Too Small"]},
+            "category": "kitchen",
+        },
+        source="ai",
+        preserve_draft=True,
+        auto_applied=True,
+    )
+
+    assert activated is True
+    assert app.st.session_state["sym_delighters"]
+    assert app.st.session_state["sym_detractors"]
+    assert app.st.session_state["sym_ai_build_result"]["category"] == "kitchen"
+    assert "sym_ai_del_edit" not in app.st.session_state
+    assert "sym_ai_det_edit" not in app.st.session_state
+    assert "_sym_ai_editor_sig" not in app.st.session_state

@@ -4354,76 +4354,6 @@ def _detect_symptom_state(df):
     return "none"
 
 
-def _symptom_presence_mask(df: Optional[pd.DataFrame]) -> pd.Series:
-    if df is None or getattr(df, "empty", True):
-        return pd.Series(dtype=bool)
-    det_cols, del_cols = _get_symptom_col_lists(df)
-    symptom_cols = [c for c in _dedupe_keep_order(det_cols + del_cols) if c in df.columns]
-    if not symptom_cols:
-        return pd.Series(False, index=df.index, dtype=bool)
-    mask = pd.Series(False, index=df.index, dtype=bool)
-    for col in symptom_cols:
-        s = df[col].astype("string").fillna("").str.strip()
-        valid = (s != "") & (~s.str.upper().isin(SYMPTOM_NON_VALUES)) & (~s.str.startswith("<"))
-        mask = mask | valid
-    return mask
-
-
-
-def _count_rows_with_any_symptom(df: Optional[pd.DataFrame]) -> int:
-    mask = _symptom_presence_mask(df)
-    return int(mask.sum()) if not mask.empty else 0
-
-
-
-def _product_specific_taxonomy_counts(
-    delighters: Optional[Sequence[str]] = None,
-    detractors: Optional[Sequence[str]] = None,
-) -> Tuple[int, int]:
-    del_list = _normalize_tag_list(list(delighters or []))
-    det_list = _normalize_tag_list(list(detractors or []))
-    universal_dels, universal_dets = _universal_neutral_catalog()
-    universal_del_set = set(universal_dels)
-    universal_det_set = set(universal_dets)
-    product_dels = [label for label in del_list if label not in universal_del_set]
-    product_dets = [label for label in det_list if label not in universal_det_set]
-    return len(product_dels), len(product_dets)
-
-
-
-def _workspace_status_chips(overall_df: pd.DataFrame, filtered_df: pd.DataFrame) -> List[Tuple[str, str]]:
-    chips: List[Tuple[str, str]] = []
-    all_delighters = list(st.session_state.get("sym_delighters") or [])
-    all_detractors = list(st.session_state.get("sym_detractors") or [])
-    product_del_count, product_det_count = _product_specific_taxonomy_counts(all_delighters, all_detractors)
-    total_catalog = len(_normalize_tag_list(all_delighters)) + len(_normalize_tag_list(all_detractors))
-    sym_source = str(st.session_state.get("sym_symptoms_source") or "none")
-    if product_del_count or product_det_count:
-        chips.append((f"Taxonomy ready · {product_det_count + product_del_count} product labels", "green"))
-    elif total_catalog:
-        source_label = "Universal-only catalog" if sym_source in {"none", "built-in", ""} else "Catalog loaded"
-        chips.append((f"{source_label} · {total_catalog} total labels", "blue"))
-    else:
-        chips.append(("Taxonomy not set", "yellow"))
-
-    view_total = int(len(filtered_df)) if isinstance(filtered_df, pd.DataFrame) else 0
-    if view_total > 0:
-        tagged_in_view = _count_rows_with_any_symptom(filtered_df)
-        coverage = tagged_in_view / float(max(view_total, 1))
-        coverage_label = f"Symptom coverage · {tagged_in_view:,}/{view_total:,} in view ({coverage * 100:.0f}%)"
-        coverage_color = "green" if coverage >= 0.6 else ("indigo" if coverage > 0 else "gray")
-        chips.append((coverage_label, coverage_color))
-
-    if st.session_state.get("sym_export_bytes"):
-        chips.append(("Export ready", "green"))
-    else:
-        chips.append(("Export auto-refreshes after runs", "gray"))
-
-    if isinstance(overall_df, pd.DataFrame) and isinstance(filtered_df, pd.DataFrame) and len(filtered_df) < len(overall_df):
-        chips.append((f"Filtered view · {len(filtered_df):,} of {len(overall_df):,}", "indigo"))
-    return chips
-
-
 def _empty_symptom_table():
     return pd.DataFrame(columns=["Item", "Avg Star", "Mentions", "% Tagged Reviews", "Avg Tags/Review"])
 
@@ -8022,16 +7952,20 @@ def _save_inline_symptom_edit(row_id, row, final_dets, final_dels, *, updated_re
         ev_det=ev_det,
         ev_del=ev_del,
     )
-    export_suffix = " Export will be ready after the next run."
-    original_bytes = st.session_state.get("_uploaded_raw_bytes")
-    summary_obj = dataset_edit.get("summary") or (st.session_state.get("analysis_dataset") or {}).get("summary")
-    st.session_state["sym_export_bytes"] = _prepare_symptom_export_bytes(
-        edited_reviews,
-        summary_obj=summary_obj,
-        original_bytes=original_bytes,
-    )
-    if st.session_state.get("sym_export_bytes") is not None:
-        export_suffix = " Export refreshed."
+    export_suffix = " Export will regenerate when you click Prepare export."
+    try:
+        original_bytes = st.session_state.get("_uploaded_raw_bytes")
+        summary_obj = dataset_edit.get("summary") or (st.session_state.get("analysis_dataset") or {}).get("summary")
+        if original_bytes:
+            st.session_state["sym_export_bytes"] = _gen_symptomized_workbook(original_bytes, edited_reviews)
+            export_suffix = " Export refreshed."
+        elif summary_obj is not None:
+            st.session_state["sym_export_bytes"] = _build_master_excel(summary_obj, edited_reviews)
+            export_suffix = " Export refreshed."
+        else:
+            st.session_state["sym_export_bytes"] = None
+    except Exception:
+        st.session_state["sym_export_bytes"] = None
     _queue_inline_editor_defaults(rid, dets=final_dets, dels=final_dels, new_det="", new_del="")
     st.session_state["sym_qa_user_edited"] = True
     metrics_now = _qa_accuracy_metrics(edited_reviews)
@@ -8870,19 +8804,6 @@ def _gen_symptomized_workbook(original_bytes, updated_df):
     return out.getvalue()
 
 
-
-def _prepare_symptom_export_bytes(updated_df: pd.DataFrame, *, summary_obj=None, original_bytes=None):
-    try:
-        if original_bytes:
-            return _gen_symptomized_workbook(original_bytes, updated_df)
-        if summary_obj is not None:
-            return _build_master_excel(summary_obj, updated_df)
-    except Exception as exc:
-        _log.warning("Could not prepare symptom export bytes: %s", exc)
-    return None
-
-
-
 def _dedup_candidates(raw):
     def _norm(s):
         s = s.strip().lower()
@@ -9321,8 +9242,6 @@ def _init_state():
         _sym_taxonomy_auto_applied=False,
         sym_v4_pipeline=True,
         sym_last_run_stats=None,
-        _sym_recommended_setup_sig=None,
-        _sym_recommended_setup_auto=True,
         sidebar_manual_api_key="",
         workspace_name="",
         workspace_id=None,
@@ -9374,11 +9293,6 @@ def _reset_workspace_state(*, reset_source=True):
     st.session_state["sym_qa_notice"] = None
     st.session_state["sym_product_profile_ai_note"] = ""
     st.session_state["sym_calibration_result"] = None
-    st.session_state["sym_scope_choice"] = "Missing both"
-    st.session_state["sym_n_to_process"] = 10
-    st.session_state.pop("sym_batch_size_run", None)
-    st.session_state["_sym_recommended_setup_sig"] = None
-    st.session_state["_sym_recommended_setup_auto"] = True
     st.session_state["sym_wizard_step"] = 1
     st.session_state["_sym_taxonomy_auto_applied"] = False
     st.session_state.pop("_sym_old_taxonomy", None)
@@ -9706,9 +9620,6 @@ def _render_workspace_header(summary, overall_df, filtered_df, prompt_artifacts,
         </div>
       </div>
     </div>""", unsafe_allow_html=True)
-    status_chips = _workspace_status_chips(overall_df, filtered_df)
-    if status_chips:
-        st.markdown(_chip_html(status_chips), unsafe_allow_html=True)
     a0, a1, a2 = st.columns([1.35, 1.15, 4])
     if bundle is not None:
         a0.download_button("⬇️ Download current view", data=bundle["excel_bytes"], file_name=bundle["excel_name"], mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
@@ -10949,18 +10860,10 @@ def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, fil
                 st.session_state["analysis_dataset"] = dataset
                 summary_df = _summarize_prompt_results(prd, prompt_defs, source_df=scope_df)
                 defsig = json.dumps([dict(col=p["column_name"], prompt=p["prompt"], labels=p["labels"]) for p in prompt_defs], sort_keys=True)
-                prompt_artifacts = dict(definitions=prompt_defs, summary_df=summary_df, scope_label=tagging_scope, scope_filter_description=filter_description, scope_review_ids=list(prd["review_id"].astype(str)), definition_signature=defsig, review_count=len(prd), generated_utc=pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"))
-                st.session_state["prompt_run_artifacts"] = prompt_artifacts
+                st.session_state["prompt_run_artifacts"] = dict(definitions=prompt_defs, summary_df=summary_df, scope_label=tagging_scope, scope_filter_description=filter_description, scope_review_ids=list(prd["review_id"].astype(str)), definition_signature=defsig, review_count=len(prd), generated_utc=pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"))
                 st.session_state["master_export_bundle"] = None
                 st.session_state["_prompt_bundle_ready"] = False
-                export_notice = ""
-                try:
-                    _get_master_bundle(summary, updated, prompt_artifacts)
-                    st.session_state["_prompt_bundle_ready"] = True
-                    export_notice = " Download is ready."
-                except Exception as export_exc:
-                    _log.warning("Prompt export bundle could not be auto-built: %s", export_exc)
-                st.session_state["prompt_run_notice"] = f"Finished tagging {len(prd):,} reviews.{export_notice}"
+                st.session_state["prompt_run_notice"] = f"Finished tagging {len(prd):,} reviews."
             except Exception as exc:
                 st.error(f"Review Prompt run failed: {exc}")
             finally:
@@ -10977,26 +10880,22 @@ def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, fil
     if cur_sig != pa.get("definition_signature"):
         st.info("Prompt definitions changed — re-run to refresh.")
     updated_overall = st.session_state["analysis_dataset"]["reviews_df"]
-    bundle = st.session_state.get("master_export_bundle")
-    dl_ready = bundle is not None
     hc = st.columns([1.4, 1.4, 4])
     hc[2].caption(f"Run: {pa.get('generated_utc')} · Scope: {pa.get('scope_label')} · Reviews: {pa.get('review_count'):,}")
-    prep_label = "🔄 Refresh download" if dl_ready else "🔄 Prepare download"
-    if hc[0].button(prep_label, use_container_width=True, key="prompt_prep_dl"):
+    if hc[0].button("🔄 Prepare download", use_container_width=True, key="prompt_prep_dl"):
         try:
             with st.spinner("Building export…"):
-                bundle = _get_master_bundle(summary, updated_overall, pa)
+                _get_master_bundle(summary, updated_overall, pa)
             st.session_state["_prompt_bundle_ready"] = True
-            dl_ready = bundle is not None
         except Exception as exc:
             st.session_state["_prompt_bundle_ready"] = False
             st.error(f"Could not build export: {exc}")
         st.rerun()
+    bundle = st.session_state.get("master_export_bundle")
+    dl_ready = bundle is not None
     hc[1].download_button("⬇️ Download tagged file", data=bundle["excel_bytes"] if dl_ready else b"", file_name=bundle["excel_name"] if dl_ready else "tagged.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", disabled=not dl_ready, key="prompt_dl_btn")
-    if dl_ready:
-        st.caption("Download is already prepared and refreshes when you rerun the prompt or click refresh.")
-    else:
-        st.caption("Prepare download if you want a fresh workbook right now.")
+    if not dl_ready:
+        st.caption("Click **Prepare download** first to build the export file.")
     plookup = {p["display_name"]: p for p in pa["definitions"]}
     pnames = list(plookup.keys())
     if not pnames:
@@ -11048,138 +10947,6 @@ def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, fil
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TAB: SYMPTOMIZER
 # ═══════════════════════════════════════════════════════════════════════════════
-SYMPTOMIZER_SCOPE_OPTIONS = [
-    "Current filtered missing",
-    "Missing both",
-    "Any missing",
-    "Current filtered reviews",
-    "All loaded reviews",
-]
-
-
-
-def _symptomizer_row_key_series(df: Optional[pd.DataFrame]) -> pd.Series:
-    if df is None or getattr(df, "empty", True):
-        return pd.Series(dtype=str)
-    if "review_id" in df.columns:
-        return df["review_id"].astype(str).fillna("").str.strip()
-    return pd.Series(df.index.astype(str), index=df.index, dtype="string")
-
-
-
-def _recommended_symptomizer_setup(work: pd.DataFrame, filtered_df: pd.DataFrame, overall_df: pd.DataFrame) -> Dict[str, Any]:
-    work_df = work.copy() if isinstance(work, pd.DataFrame) else pd.DataFrame()
-    overall_count = int(len(overall_df)) if isinstance(overall_df, pd.DataFrame) else int(len(work_df))
-    filtered_count = int(len(filtered_df)) if isinstance(filtered_df, pd.DataFrame) else 0
-    if work_df.empty:
-        return {
-            "scope": "Any missing",
-            "n_to_process": 0,
-            "batch_size": 8,
-            "in_scope": 0,
-            "note": "No reviews are loaded yet.",
-        }
-
-    needs_del = pd.Series(False, index=work_df.index, dtype=bool)
-    if "Needs_Delighters" in work_df.columns:
-        needs_del = work_df["Needs_Delighters"].fillna(False).astype(bool)
-    needs_det = pd.Series(False, index=work_df.index, dtype=bool)
-    if "Needs_Detractors" in work_df.columns:
-        needs_det = work_df["Needs_Detractors"].fillna(False).astype(bool)
-    missing_any_mask = needs_del | needs_det
-    missing_both_mask = needs_del & needs_det
-
-    filtered_mask = pd.Series(False, index=work_df.index, dtype=bool)
-    if isinstance(filtered_df, pd.DataFrame) and not filtered_df.empty:
-        filtered_keys = set(_symptomizer_row_key_series(filtered_df).tolist())
-        if filtered_keys:
-            filtered_mask = _symptomizer_row_key_series(work_df).isin(filtered_keys)
-
-    counts = {
-        "Current filtered missing": int((filtered_mask & missing_any_mask).sum()),
-        "Missing both": int(missing_both_mask.sum()),
-        "Any missing": int(missing_any_mask.sum()),
-        "Current filtered reviews": int(filtered_mask.sum()),
-        "All loaded reviews": int(len(work_df)),
-    }
-
-    if 0 < filtered_count < overall_count and counts["Current filtered missing"] > 0:
-        scope = "Current filtered missing"
-        note = "Focused on the current filtered view and skips rows that already have both sides tagged."
-    elif counts["Any missing"] > 0:
-        scope = "Any missing"
-        note = "Targets rows missing at least one side so you avoid re-processing fully tagged reviews."
-    elif 0 < filtered_count < overall_count and counts["Current filtered reviews"] > 0:
-        scope = "Current filtered reviews"
-        note = "No missing rows were detected, so the current filtered view is queued as the next best demo set."
-    else:
-        scope = "All loaded reviews"
-        note = "All loaded reviews are already tagged or no narrower view is active, so the full workspace is queued."
-
-    in_scope = int(counts.get(scope, 0))
-    if in_scope <= 25:
-        n_to_process = in_scope
-    elif in_scope <= 75:
-        n_to_process = min(50, in_scope)
-    else:
-        n_to_process = min(100, in_scope)
-
-    if scope == "Current filtered missing":
-        target_sample = work_df.loc[filtered_mask & missing_any_mask].copy()
-    elif scope == "Missing both":
-        target_sample = work_df.loc[missing_both_mask].copy()
-    elif scope == "Any missing":
-        target_sample = work_df.loc[missing_any_mask].copy()
-    elif scope == "Current filtered reviews":
-        target_sample = work_df.loc[filtered_mask].copy()
-    else:
-        target_sample = work_df.copy()
-    sample_words = pd.to_numeric(
-        target_sample.get(
-            "review_length_words",
-            target_sample.get("review_text", pd.Series("", index=target_sample.index)).fillna("").astype(str).str.split().str.len(),
-        ),
-        errors="coerce",
-    ).fillna(0)
-    avg_words = float(sample_words.mean()) if not sample_words.empty else 0.0
-    if avg_words <= 60:
-        batch_size = 12
-    elif avg_words <= 100:
-        batch_size = 10
-    else:
-        batch_size = 8
-    if in_scope > 0:
-        batch_size = max(1, min(batch_size, in_scope))
-
-    return {
-        "scope": scope,
-        "n_to_process": int(max(n_to_process, 0)),
-        "batch_size": int(max(batch_size, 1)),
-        "in_scope": in_scope,
-        "note": note,
-    }
-
-
-
-def _mark_symptomizer_setup_manual() -> None:
-    st.session_state["_sym_recommended_setup_auto"] = False
-
-
-
-def _maybe_apply_recommended_symptomizer_setup(recommended_setup: Dict[str, Any]) -> None:
-    rec = dict(recommended_setup or {})
-    rec_sig = json.dumps(rec, sort_keys=True, default=str)
-    prev_sig = st.session_state.get("_sym_recommended_setup_sig")
-    allow_auto = bool(st.session_state.get("_sym_recommended_setup_auto", True)) or prev_sig is None
-    if allow_auto and rec_sig != prev_sig:
-        st.session_state["sym_scope_choice"] = rec.get("scope") or "Any missing"
-        st.session_state["sym_n_to_process"] = int(rec.get("n_to_process") or 0) or 1
-        st.session_state["sym_batch_size_run"] = int(rec.get("batch_size") or st.session_state.get("sym_batch_size", 8) or 8)
-        st.session_state["_sym_recommended_setup_auto"] = True
-    st.session_state["_sym_recommended_setup_sig"] = rec_sig
-
-
-
 def _render_symptomizer_tab(*, settings, overall_df, filtered_df, summary, filter_description):
     _apply_pending_symptomizer_ui_state()
     st.markdown("<div class='section-title'>Symptomizer</div>", unsafe_allow_html=True)
@@ -11645,83 +11412,34 @@ The tagger reads more than the main review body — it may use pros, cons, comme
         unsafe_allow_html=True,
     )
     active_taxonomy_count = len(delighters) + len(detractors)
-    recommended_setup = _recommended_symptomizer_setup(work, filtered_df, overall_df)
-    _maybe_apply_recommended_symptomizer_setup(recommended_setup)
-    filtered_review_mask = pd.Series(False, index=work.index, dtype=bool)
-    filtered_review_keys = set(_symptomizer_row_key_series(filtered_df).tolist()) if isinstance(filtered_df, pd.DataFrame) and not filtered_df.empty else set()
-    if filtered_review_keys:
-        filtered_review_mask = _symptomizer_row_key_series(work).isin(filtered_review_keys)
-    needs_del_mask = work["Needs_Delighters"].fillna(False).astype(bool)
-    needs_det_mask = work["Needs_Detractors"].fillna(False).astype(bool)
     with st.container(border=True):
         st.markdown(
             "<div class='builder-kicker'>Run setup</div><div class='builder-title'>Choose what to tag</div><div class='builder-sub'>Pick the review set, how many reviews to process, and batch size. Counts update automatically as you change the controls.</div>",
             unsafe_allow_html=True,
         )
-        st.markdown(
-            _chip_html([
-                (f"Recommended · {recommended_setup.get('scope', 'Any missing')}", "green" if st.session_state.get("_sym_recommended_setup_auto", True) else "blue"),
-                (f"{int(recommended_setup.get('n_to_process', 0)):,} reviews", "indigo"),
-                (f"Batch {int(recommended_setup.get('batch_size', st.session_state.get('sym_batch_size', 8) or 8))}", "gray"),
-            ]),
-            unsafe_allow_html=True,
-        )
-        st.caption(str(recommended_setup.get("note") or ""))
-        cfg = st.columns([1.55, 1.0, 0.95, 0.85, 0.95])
-        scope_choice = cfg[0].selectbox(
-            "Review set",
-            SYMPTOMIZER_SCOPE_OPTIONS,
-            key="sym_scope_choice",
-            on_change=_mark_symptomizer_setup_manual,
-        )
-        if scope_choice == "Current filtered missing":
-            target_df = work[filtered_review_mask & (needs_del_mask | needs_det_mask)]
-        elif scope_choice == "Missing both":
-            target_df = work[needs_del_mask & needs_det_mask]
+        cfg = st.columns([1.45, 1.0, 0.95, 0.85, 0.95])
+        scope_choice = cfg[0].selectbox("Review set", ["Missing both", "Any missing", "Current filtered reviews", "All loaded reviews"], key="sym_scope_choice")
+        if scope_choice == "Missing both":
+            target_df = work[(work["Needs_Delighters"]) & (work["Needs_Detractors"])]
         elif scope_choice == "Any missing":
-            target_df = work[needs_del_mask | needs_det_mask]
+            target_df = work[(work["Needs_Delighters"]) | (work["Needs_Detractors"])]
         elif scope_choice == "Current filtered reviews":
-            target_df = work[filtered_review_mask]
+            fids = set(filtered_df["review_id"].astype(str))
+            target_df = work[work["review_id"].astype(str).isin(fids)]
         else:
             target_df = work
         max_reviews_in_scope = max(1, len(target_df))
-        default_n = int(st.session_state.get("sym_n_to_process", recommended_setup.get("n_to_process") or min(100, max_reviews_in_scope)))
+        default_n = int(st.session_state.get("sym_n_to_process", min(100, max_reviews_in_scope)))
         default_n = min(max(1, default_n), max_reviews_in_scope)
         st.session_state["sym_n_to_process"] = default_n
-        n_to_process = cfg[1].number_input(
-            "Reviews to process",
-            min_value=1,
-            max_value=max_reviews_in_scope,
-            value=default_n,
-            step=1,
-            key="sym_n_to_process",
-            on_change=_mark_symptomizer_setup_manual,
-        )
-        batch_size_default = int(st.session_state.get("sym_batch_size_run", recommended_setup.get("batch_size") or st.session_state.get("sym_batch_size", 8)) or 8)
+        n_to_process = cfg[1].number_input("Reviews to process", min_value=1, max_value=max_reviews_in_scope, value=default_n, step=1, key="sym_n_to_process")
+        batch_size_default = int(st.session_state.get("sym_batch_size_run", st.session_state.get("sym_batch_size", 8)) or 8)
         batch_size_default = min(20, max(1, batch_size_default))
-        batch_size = int(
-            cfg[2].number_input(
-                "Batch size",
-                min_value=1,
-                max_value=20,
-                value=batch_size_default,
-                step=1,
-                key="sym_batch_size_run",
-                on_change=_mark_symptomizer_setup_manual,
-            )
-        )
+        batch_size = int(cfg[2].number_input("Batch size", min_value=1, max_value=20, value=batch_size_default, step=1, key="sym_batch_size_run"))
         est_batches = max(1, math.ceil(int(n_to_process) / batch_size)) if n_to_process else 0
         cfg[3].metric("In scope", f"{len(target_df):,}")
         cfg[4].metric("Batches", f"{est_batches:,}")
-        using_recommended = (
-            scope_choice == recommended_setup.get("scope")
-            and int(n_to_process) == min(max(1, int(recommended_setup.get("n_to_process") or 1)), max_reviews_in_scope)
-            and int(batch_size) == int(recommended_setup.get("batch_size") or batch_size)
-        )
-        if using_recommended:
-            st.caption(f"Model: {_shared_model()} · Review set: {scope_choice} · Recommended setup loaded")
-        else:
-            st.caption(f"Model: {_shared_model()} · Review set: {scope_choice}")
+        st.caption(f"Model: {_shared_model()} · Review set: {scope_choice}")
         run_disabled = (not api_key) or (len(target_df) == 0) or (active_taxonomy_count == 0)
         if run_disabled and not api_key:
             st.warning("Add OPENAI_API_KEY to Streamlit secrets.")
@@ -12097,11 +11815,6 @@ The tagger reads more than the main review body — it may use pros, cons, comme
         qa_metrics = _compute_tag_edit_accuracy(qa_baseline_map, qa_baseline_map)
         final_label_count = sum(len(r.get("wrote_dets", [])) + len(r.get("wrote_dels", [])) for r in processed_local)
         elapsed_total = time.perf_counter() - t0
-        sym_export_bytes = _prepare_symptom_export_bytes(
-            updated_df,
-            summary_obj=dataset.get("summary"),
-            original_bytes=st.session_state.get("_uploaded_raw_bytes"),
-        )
         st.session_state.update(
             analysis_dataset=dataset,
             sym_processed_rows=processed_local,
@@ -12112,7 +11825,7 @@ The tagger reads more than the main review body — it may use pros, cons, comme
             sym_qa_accuracy=qa_metrics,
             sym_qa_user_edited=False,
             sym_qa_notice=None,
-            sym_export_bytes=sym_export_bytes,
+            sym_export_bytes=None,
         )
         st.session_state["sym_last_run_stats"] = {
             "reviews": done,
@@ -12151,11 +11864,9 @@ The tagger reads more than the main review body — it may use pros, cons, comme
             "<div class='status-note'>Finished. Results below are already synced to the Dashboard and Review Explorer.</div>",
             unsafe_allow_html=True,
         )
-        export_ready_suffix = " Export is ready." if sym_export_bytes is not None else ""
         status.success(
             f"✅ Symptomized {done:,} reviews — {final_label_count} labels written ({final_label_count / max(done, 1):.1f} avg/review)."
             + (f" Focused follow-up recovered {retry_recovered} review(s)." if retry_recovered else "")
-            + export_ready_suffix
         )
         _log.info(
             "Symptomized %d reviews — %d labels written (%.1f avg)",
@@ -12691,32 +12402,21 @@ Keep it concise — each bullet should be 1-2 sentences max."""
         _render_symptomizer_taxonomy_housekeeping(taxonomy_meta)
         st.divider()
 
-    sym_bytes = st.session_state.get("sym_export_bytes")
     ec1, ec2 = st.columns([1.5, 3])
-    refresh_label = "🔄 Refresh export file" if sym_bytes is not None else "🧾 Prepare export"
-    if ec1.button(refresh_label, use_container_width=True, key="sym_prep_export"):
+    if ec1.button("🧾 Prepare export", use_container_width=True, key="sym_prep_export"):
         upd = st.session_state["analysis_dataset"]["reviews_df"]
-        st.session_state["sym_export_bytes"] = _prepare_symptom_export_bytes(
-            upd,
-            summary_obj=summary,
-            original_bytes=st.session_state.get("_uploaded_raw_bytes"),
-        )
-        sym_bytes = st.session_state.get("sym_export_bytes")
-        if sym_bytes is not None:
-            st.success("Export refreshed.")
-        else:
-            st.warning("Export could not be prepared for this workspace yet.")
+        orig = st.session_state.get("_uploaded_raw_bytes")
+        sym_bytes = _gen_symptomized_workbook(orig, upd) if orig else _build_master_excel(summary, upd)
+        st.session_state["sym_export_bytes"] = sym_bytes
+        st.success("Export prepared.")
+    sym_bytes = st.session_state.get("sym_export_bytes")
     sym_export_name = f"{_safe_summary_product_slug(summary, updated_reviews, default='symptomized_reviews')}_Symptomized.xlsx"
     ec1.download_button("⬇️ Download symptomized file", data=sym_bytes or b"", file_name=sym_export_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", disabled=(sym_bytes is None), key="sym_dl")
     qa_export_metrics = st.session_state.get("sym_qa_accuracy") or {}
-    base_caption = "Writes the final AI symptom tags (including QA edits) plus AI Safety · Reliability · Sessions into existing AI columns when present, otherwise it appends safe new columns without overwriting local symptomization."
     if qa_export_metrics:
-        base_caption += f" Current QA accuracy: {float(qa_export_metrics.get('accuracy_pct', 100.0) or 0):.1f}%."
-    if sym_bytes is not None:
-        base_caption += " Export is already prepared and auto-refreshes after new runs and inline QA edits."
+        ec2.caption(f"Writes the final AI symptom tags (including QA edits) plus AI Safety · Reliability · Sessions into existing AI columns when present, otherwise it appends safe new columns without overwriting local symptomization. Current QA accuracy: {float(qa_export_metrics.get('accuracy_pct', 100.0) or 0):.1f}%.")
     else:
-        base_caption += " Prepare or refresh the export here if you want a fresh download right now."
-    ec2.caption(base_caption)
+        ec2.caption("Writes AI Symptom Detractor / Delighter columns plus AI Safety · Reliability · Sessions into existing AI columns when present, otherwise it appends safe new columns without overwriting local symptomization.")
 
 # ── Social Listening (extracted to review_analyst/social_listening.py) ────
 if not _HAS_SOCIAL_PKG:
