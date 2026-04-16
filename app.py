@@ -570,8 +570,14 @@ WORKSPACE_TABS = [
     TAB_REVIEW_EXPLORER,
     TAB_REVIEW_PROMPT,
     TAB_SYMPTOMIZER,
-    TAB_SOCIAL_LISTENING,
 ]
+WORKSPACE_NAV_META = {
+    TAB_DASHBOARD: {"label": "Dashboard", "hint": "Executive snapshot"},
+    TAB_REVIEW_EXPLORER: {"label": "Review Explorer", "hint": "Rows, filters, evidence"},
+    TAB_REVIEW_PROMPT: {"label": "Review Prompt", "hint": "AI row tagging"},
+    TAB_SYMPTOMIZER: {"label": "Symptomizer", "hint": "Theme taxonomy + runs"},
+    TAB_SOCIAL_LISTENING: {"label": "Social Listening Beta", "hint": "Sidebar only"},
+}
 
 MODEL_OPTIONS = [
     "gpt-5.4-mini",
@@ -2806,15 +2812,21 @@ def _use_package_connectors() -> bool:
     return callable(_package_load_product_reviews)
 
 
-def _load_product_reviews_dispatch(product_url: str):
+def _load_product_reviews_dispatch(product_url: str, *, progress_ui=None):
     if _use_package_connectors() and callable(_package_load_product_reviews):
-        return _package_load_product_reviews(product_url)
+        try:
+            return _package_load_product_reviews(product_url, progress_ui=progress_ui)
+        except TypeError:
+            return _package_load_product_reviews(product_url)
     return _load_product_reviews(product_url)
 
 
-def _load_multiple_product_reviews_dispatch(urls):
+def _load_multiple_product_reviews_dispatch(urls, *, progress_ui=None):
     if _use_package_connectors() and callable(_package_load_multiple_product_reviews):
-        return _package_load_multiple_product_reviews(urls)
+        try:
+            return _package_load_multiple_product_reviews(urls, progress_ui=progress_ui)
+        except TypeError:
+            return _package_load_multiple_product_reviews(urls)
     return _load_multiple_product_reviews(urls)
 
 
@@ -2859,27 +2871,36 @@ def _compute_metrics_direct(df):
             recommend_rate=None,
             median_review_words=None,
             non_incentivized_count=0,
+            incentivized_count=0,
+            rated_count=0,
+            organic_rated_count=0,
             low_star_count=0,
         )
-    ni = df[~df["incentivized_review"].fillna(False)]
-    rb = df[df["is_recommended"].notna()]
+    incentivized = df["incentivized_review"].fillna(False).astype(bool) if "incentivized_review" in df.columns else pd.Series(False, index=df.index)
+    ni = df.loc[~incentivized].copy()
+    rating_series = pd.to_numeric(df.get("rating", pd.Series(dtype=float)), errors="coerce")
+    ni_rating_series = pd.to_numeric(ni.get("rating", pd.Series(dtype=float)), errors="coerce")
+    rb = df[df["is_recommended"].notna()] if "is_recommended" in df.columns else pd.DataFrame()
     rr = _safe_pct(int(rb["is_recommended"].astype(bool).sum()), len(rb)) if not rb.empty else None
     mw = float(df["review_length_words"].median()) if "review_length_words" in df.columns and not df["review_length_words"].dropna().empty else None
-    low = df["rating"].isin([1, 2])
+    low = rating_series.isin([1, 2]) if not rating_series.empty else pd.Series(False, index=df.index)
     return dict(
         review_count=n,
-        avg_rating=_safe_mean(df["rating"]),
-        avg_rating_non_incentivized=_safe_mean(ni["rating"]),
+        avg_rating=_safe_mean(rating_series),
+        avg_rating_non_incentivized=_safe_mean(ni_rating_series),
         pct_low_star=_safe_pct(int(low.sum()), n),
-        pct_one_star=_safe_pct(int((df["rating"] == 1).sum()), n),
-        pct_two_star=_safe_pct(int((df["rating"] == 2).sum()), n),
-        pct_five_star=_safe_pct(int((df["rating"] == 5).sum()), n),
-        pct_incentivized=_safe_pct(int(df["incentivized_review"].fillna(False).sum()), n),
-        pct_with_photos=_safe_pct(int(df["has_photos"].fillna(False).sum()), n),
-        pct_syndicated=_safe_pct(int(df["is_syndicated"].fillna(False).sum()), n),
+        pct_one_star=_safe_pct(int((rating_series == 1).sum()), n),
+        pct_two_star=_safe_pct(int((rating_series == 2).sum()), n),
+        pct_five_star=_safe_pct(int((rating_series == 5).sum()), n),
+        pct_incentivized=_safe_pct(int(incentivized.sum()), n),
+        pct_with_photos=_safe_pct(int(df["has_photos"].fillna(False).sum()), n) if "has_photos" in df.columns else 0.0,
+        pct_syndicated=_safe_pct(int(df["is_syndicated"].fillna(False).sum()), n) if "is_syndicated" in df.columns else 0.0,
         recommend_rate=rr,
         median_review_words=mw,
-        non_incentivized_count=len(ni),
+        non_incentivized_count=int((~incentivized).sum()),
+        incentivized_count=int(incentivized.sum()),
+        rated_count=int(rating_series.notna().sum()),
+        organic_rated_count=int(ni_rating_series.notna().sum()),
         low_star_count=int(low.sum()),
     )
 
@@ -5663,15 +5684,23 @@ def _render_active_filter_summary(filter_state: Dict[str, Any], overall_df: pd.D
 def _render_workspace_nav() -> str:
     current = st.session_state.get("workspace_active_tab", TAB_DASHBOARD)
     nav_items = WORKSPACE_TABS
+    st.markdown(
+        "<div class='workspace-nav-card'><div class='builder-kicker'>Workspace sections</div><div class='builder-title' style='font-size:16px;'>Move between the key workflows</div><div class='workspace-nav-sub'>Start on the Dashboard for the executive readout, then move into Review Explorer, Review Prompt, or Symptomizer for deeper work. Social Listening Beta now lives only in the sidebar.</div></div>",
+        unsafe_allow_html=True,
+    )
     cols = st.columns(len(nav_items))
     for i, (col, label) in enumerate(zip(cols, nav_items)):
+        meta = WORKSPACE_NAV_META.get(label) or {}
+        display_label = meta.get("label") or (label.split("  ", 1)[1].strip() if "  " in label else re.sub(r"^[^\w]+", "", str(label)).strip())
         kwargs = {"use_container_width": True, "key": f"wnav_{i}_{_slugify(label, fallback='tab')}"}
         if current == label:
             kwargs["type"] = "primary"
-        display_label = label.split("  ", 1)[1].strip() if "  " in label else re.sub(r"^[^\w]+", "", str(label)).strip()
         if col.button(display_label or str(label).strip(), **kwargs):
             current = label
             st.session_state["workspace_active_tab"] = label
+        hint = _safe_text(meta.get("hint"))
+        if hint:
+            col.caption(hint)
     st.markdown("<div style='height:.25rem'></div>", unsafe_allow_html=True)
     return current
 
@@ -6186,6 +6215,21 @@ def _run_review_prompt_tagging(*, client, source_df, prompt_defs, chunk_size):
     else:
         status.success(f"Finished tagging {len(source_df):,} reviews.")
     return pd.concat(outputs, ignore_index=True).drop_duplicates(subset=["review_id"], keep="last")
+
+
+def _sample_review_prompt_scope(source_df, sample_size):
+    if source_df is None or source_df.empty:
+        return pd.DataFrame(columns=list(getattr(source_df, "columns", [])))
+    total = len(source_df)
+    n = max(1, min(int(sample_size or 0), total))
+    if n >= total:
+        return source_df.copy()
+    try:
+        prioritized = _prioritize_for_symptomization(source_df.copy())
+        return prioritized.head(n).copy()
+    except Exception:
+        return source_df.head(n).copy()
+
 
 
 def _merge_prompt_results(overall_df, prompt_results_df, prompt_defs):
@@ -9314,9 +9358,15 @@ def _init_state():
         workspace_file_uploader_nonce=0,
         workspace_include_local_symptomization=True,
         workspace_auto_prepare_uploaded_taxonomy=True,
+        workspace_auto_prepare_url_taxonomy=True,
         workspace_auto_build_uploaded_files=True,
         _workspace_last_uploaded_build_sig=None,
         _workspace_last_uploaded_build_error="",
+        _workspace_loaded_source_signature="",
+        _workspace_loaded_source_mode="",
+        _workspace_loaded_source_label="",
+        prompt_sample_enabled=False,
+        prompt_sample_size=150,
         workspace_active_tab=TAB_DASHBOARD,
         workspace_tab_request=None,
         ai_scroll_to_top=False,
@@ -9437,6 +9487,9 @@ def _reset_workspace_state(*, reset_source=True):
         st.session_state["workspace_file_uploader_nonce"] = int(st.session_state.get("workspace_file_uploader_nonce", 0)) + 1
         st.session_state["_workspace_last_uploaded_build_sig"] = None
         st.session_state["_workspace_last_uploaded_build_error"] = ""
+    st.session_state["_workspace_loaded_source_signature"] = ""
+    st.session_state["_workspace_loaded_source_mode"] = ""
+    st.session_state["_workspace_loaded_source_label"] = ""
 
 
 def _apply_workspace_dataset(dataset, *, raw_bytes=None, symptom_seed=None):
@@ -9498,7 +9551,284 @@ def _uploaded_file_build_signature(uploaded_files, *, include_local_symptomizati
     return digest.hexdigest()
 
 
-def _build_workspace_from_uploaded_files(uploaded_files, *, include_local_symptomization=False, auto_prepare_uploaded_taxonomy=True):
+def _default_workspace_name_for_dataset(dataset):
+    if not isinstance(dataset, dict):
+        return ""
+    summary = dataset.get("summary")
+    reviews_df = dataset.get("reviews_df", pd.DataFrame()) if isinstance(dataset.get("reviews_df"), pd.DataFrame) else pd.DataFrame()
+    candidates = []
+    try:
+        product_label = _safe_text(_product_name(summary, reviews_df)).strip()
+        if product_label and product_label.lower() not in {"review workspace", "reviews"}:
+            candidates.append(product_label)
+    except Exception:
+        pass
+    candidates.extend(
+        [
+            _safe_text(dataset.get("source_label")).strip(),
+            _safe_text(_summary_attr(summary, "product_id", "")).strip(),
+        ]
+    )
+    for raw in candidates:
+        cleaned = re.sub(r"\s+", " ", str(raw or "").strip())
+        if cleaned:
+            return cleaned[:80]
+    return ""
+
+
+
+def _uploaded_file_source_signature(uploaded_files):
+    files = list(uploaded_files or [])
+    if not files:
+        return ""
+    digest = hashlib.sha1()
+    for uploaded in files:
+        name = str(getattr(uploaded, "name", "") or "")
+        size = str(getattr(uploaded, "size", "") or "")
+        digest.update(name.encode("utf-8", errors="ignore"))
+        digest.update(size.encode("utf-8", errors="ignore"))
+        try:
+            payload = uploaded.getvalue()
+        except Exception:
+            payload = b""
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8", errors="ignore")
+        elif payload is None:
+            payload = b""
+        digest.update(hashlib.sha1(bytes(payload)).digest())
+    return f"file::{digest.hexdigest()}"
+
+
+
+def _url_source_signature(product_url="", *, bulk_urls=None):
+    values = []
+    if bulk_urls is not None:
+        if isinstance(bulk_urls, str):
+            raw_values = _parse_bulk_product_urls(bulk_urls)
+        else:
+            raw_values = [str(url or "").strip() for url in list(bulk_urls or [])]
+    else:
+        raw_values = [product_url]
+    for raw in raw_values:
+        raw = str(raw or "").strip()
+        if not raw:
+            continue
+        try:
+            normalized = _normalize_input_url(raw)
+        except Exception:
+            normalized = raw
+        if normalized:
+            values.append(normalized)
+    if not values:
+        return ""
+    digest = hashlib.sha1("\n".join(values).encode("utf-8", errors="ignore")).hexdigest()
+    return f"url::{digest}"
+
+
+
+def _workspace_source_context_from_dataset(dataset):
+    if not isinstance(dataset, dict):
+        return {"source_mode": "", "source_signature": "", "source_label": ""}
+    source_type = _safe_text(dataset.get("source_type")).strip().lower()
+    summary = dataset.get("summary")
+    source_label = _safe_text(dataset.get("source_label")).strip()
+    if source_type == "multi-url":
+        source_urls = list(dataset.get("source_urls") or [])
+        return {
+            "source_mode": SOURCE_MODE_URL,
+            "source_signature": _url_source_signature(bulk_urls=source_urls),
+            "source_label": source_label or _default_workspace_name_for_dataset(dataset),
+        }
+    if source_type == "uploaded":
+        fallback = source_label or _default_workspace_name_for_dataset(dataset) or "uploaded-workspace"
+        return {
+            "source_mode": SOURCE_MODE_FILE,
+            "source_signature": f"file-saved::{_slugify(fallback, fallback='uploaded-workspace')}",
+            "source_label": fallback,
+        }
+    product_url = _safe_text(_summary_attr(summary, "product_url", "")).strip()
+    return {
+        "source_mode": SOURCE_MODE_URL,
+        "source_signature": _url_source_signature(product_url=product_url or source_label),
+        "source_label": source_label or _default_workspace_name_for_dataset(dataset) or product_url,
+    }
+
+
+
+def _remember_loaded_workspace_source(*, dataset=None, source_mode="", source_signature="", source_label=""):
+    context = _workspace_source_context_from_dataset(dataset) if isinstance(dataset, dict) else {}
+    final_mode = _safe_text(source_mode).strip() or _safe_text(context.get("source_mode")).strip()
+    final_signature = _safe_text(source_signature).strip() or _safe_text(context.get("source_signature")).strip()
+    final_label = _safe_text(source_label).strip() or _safe_text(context.get("source_label")).strip() or _default_workspace_name_for_dataset(dataset)
+    st.session_state["_workspace_loaded_source_mode"] = final_mode
+    st.session_state["_workspace_loaded_source_signature"] = final_signature
+    st.session_state["_workspace_loaded_source_label"] = final_label
+    return {"source_mode": final_mode, "source_signature": final_signature, "source_label": final_label}
+
+
+
+def _workspace_source_change_needs_confirmation(source_signature, *, source_mode=""):
+    dataset = st.session_state.get("analysis_dataset")
+    signature = _safe_text(source_signature).strip()
+    if not dataset or not signature:
+        return False
+    loaded_signature = _safe_text(st.session_state.get("_workspace_loaded_source_signature")).strip()
+    loaded_mode = _safe_text(st.session_state.get("_workspace_loaded_source_mode")).strip()
+    if not loaded_signature:
+        loaded_signature = _workspace_source_context_from_dataset(dataset).get("source_signature") or ""
+    if source_mode and loaded_mode and source_mode != loaded_mode:
+        return True
+    return bool(loaded_signature and signature != loaded_signature)
+
+
+
+def _activate_workspace_dataset(dataset, *, raw_bytes=None, symptom_seed=None, replace_current=False, source_mode="", source_signature="", source_label=""):
+    previous_name = _safe_text(st.session_state.get("workspace_name")).strip()
+    previous_id = st.session_state.get("workspace_id")
+    seed_result = _apply_workspace_dataset(dataset, raw_bytes=raw_bytes, symptom_seed=symptom_seed)
+    if replace_current:
+        st.session_state["workspace_name"] = previous_name
+        st.session_state["workspace_id"] = previous_id
+    else:
+        default_name = _default_workspace_name_for_dataset(dataset)
+        if default_name:
+            st.session_state["workspace_name"] = default_name
+        st.session_state["workspace_id"] = None
+    _remember_loaded_workspace_source(dataset=dataset, source_mode=source_mode, source_signature=source_signature, source_label=source_label)
+    return seed_result
+
+
+
+def _make_workspace_progress_reporter(title="Building review workspace"):
+    container = st.container(border=True)
+    container.markdown(
+        f"<div class='builder-kicker'>Live progress</div><div class='builder-title' style='font-size:15px;'>{_esc(title)}</div><div class='status-note'>This updates as pages are fetched, review feeds are matched, and the workspace is prepared.</div>",
+        unsafe_allow_html=True,
+    )
+    status_slot = container.empty()
+    detail_slot = container.empty()
+    progress_bar = container.progress(0.0)
+    history = []
+
+    def _report(*, progress=None, title="", detail=""):
+        if title:
+            status_slot.markdown(f"**{_safe_text(title).strip()}**")
+        if progress is not None:
+            try:
+                value = max(0.0, min(1.0, float(progress)))
+            except Exception:
+                value = 0.0
+            try:
+                progress_bar.progress(value)
+            except TypeError:
+                progress_bar.progress(int(round(value * 100)))
+        detail_text = _safe_text(detail).strip()
+        if detail_text:
+            if not history or history[-1] != detail_text:
+                history.append(detail_text)
+            recent = history[-4:]
+            detail_slot.markdown(
+                "<div class='status-note'>" + "<br>".join(f"• {_esc(item)}" for item in recent) + "</div>",
+                unsafe_allow_html=True,
+            )
+
+    return _report
+
+
+
+def _scale_workspace_progress(progress_ui, *, start=0.0, end=1.0, prefix=""):
+    if not callable(progress_ui):
+        return None
+    start_f = float(start or 0.0)
+    end_f = float(end or 0.0)
+
+    def _child(*, progress=None, title="", detail=""):
+        mapped = None
+        if progress is not None:
+            try:
+                base = max(0.0, min(1.0, float(progress)))
+            except Exception:
+                base = 0.0
+            mapped = start_f + (end_f - start_f) * base
+        title_text = _safe_text(title).strip()
+        if prefix and title_text:
+            title_text = f"{prefix} · {title_text}"
+        elif prefix:
+            title_text = prefix
+        progress_ui(progress=mapped, title=title_text, detail=detail)
+
+    return _child
+
+
+
+def _workspace_ai_prep_notice(prep=None, *, source_label="review workspace"):
+    prep = dict(prep or {})
+    base = f"Loaded the {source_label}"
+    if prep and prep.get("status") == "ok":
+        if prep.get("taxonomy_generated") and prep.get("auto_applied"):
+            return base + " and auto-generated product knowledge plus an AI taxonomy. The Symptomizer is ready to run immediately, and you can still review or edit the taxonomy in Step 1."
+        if prep.get("description_generated") or prep.get("knowledge_generated"):
+            return base + " and auto-generated product knowledge from the review sample."
+    return ""
+
+
+
+def _run_workspace_ai_preparation(dataset, *, auto_prepare_taxonomy=True, progress_ui=None, context_label="workspace build", notice_source="review workspace"):
+    prep = None
+    if auto_prepare_taxonomy:
+        if callable(progress_ui):
+            progress_ui(progress=0.82, title="Generating product knowledge", detail="Drafting the product profile and taxonomy from the review sample.")
+        prep = _auto_prepare_workspace_taxonomy(
+            dataset,
+            max_sample=40,
+            preserve_existing_taxonomy=True,
+            auto_activate=True,
+            context_label=context_label,
+        )
+        notice = _workspace_ai_prep_notice(prep, source_label=notice_source)
+    else:
+        if callable(progress_ui):
+            progress_ui(progress=0.82, title="Generating product knowledge", detail="Drafting the product profile from the review sample.")
+        _auto_discover_product(dataset)
+        knowledge = _normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {})
+        notice = ""
+        if _safe_text(st.session_state.get("sym_product_profile")).strip() or _has_visible_product_knowledge(knowledge):
+            notice = f"Loaded the {notice_source} and auto-generated product knowledge from the review sample."
+    if notice:
+        st.session_state["sym_run_notice"] = notice
+    if callable(progress_ui):
+        progress_ui(progress=0.96, title="Finalizing workspace", detail="Refreshing the Dashboard, Review Prompt, and Symptomizer with the new workspace.")
+    return prep
+
+
+
+def _build_workspace_from_url_source(product_url, *, auto_prepare_taxonomy=True, replace_current=False, source_signature=""):
+    progress_ui = _make_workspace_progress_reporter("Building review workspace")
+    progress_ui(progress=0.02, title="Validating source", detail="Checking the link and preparing the review loader.")
+    dataset = _load_product_reviews_dispatch(product_url, progress_ui=_scale_workspace_progress(progress_ui, start=0.05, end=0.74))
+    progress_ui(progress=0.78, title="Review workspace loaded", detail=f"{len(dataset.get('reviews_df', pd.DataFrame())):,} reviews are ready for analysis.")
+    seed_result = _activate_workspace_dataset(dataset, replace_current=replace_current, source_mode=SOURCE_MODE_URL, source_signature=source_signature, source_label=_safe_text(dataset.get('source_label')).strip())
+    prep = _run_workspace_ai_preparation(dataset, auto_prepare_taxonomy=auto_prepare_taxonomy, progress_ui=progress_ui, context_label="url workspace build", notice_source="review workspace")
+    progress_ui(progress=1.0, title="Workspace ready", detail="Dashboard, Review Prompt, and Symptomizer are now in sync with the new source.")
+    return {"dataset": dataset, "seed_result": seed_result, "prep": prep}
+
+
+
+def _build_workspace_from_bulk_urls(urls, *, auto_prepare_taxonomy=True, replace_current=False, source_signature=""):
+    progress_ui = _make_workspace_progress_reporter("Building combined review workspace")
+    progress_ui(progress=0.02, title="Validating source list", detail="Checking the queued links and preparing the batch loader.")
+    dataset = _load_multiple_product_reviews_dispatch(urls, progress_ui=_scale_workspace_progress(progress_ui, start=0.05, end=0.74))
+    progress_ui(progress=0.78, title="Combined review workspace loaded", detail=f"{len(dataset.get('reviews_df', pd.DataFrame())):,} reviews are ready across {len(dataset.get('source_urls') or []) or 1} source link(s).")
+    seed_result = _activate_workspace_dataset(dataset, replace_current=replace_current, source_mode=SOURCE_MODE_URL, source_signature=source_signature, source_label=_safe_text(dataset.get('source_label')).strip())
+    prep = _run_workspace_ai_preparation(dataset, auto_prepare_taxonomy=auto_prepare_taxonomy, progress_ui=progress_ui, context_label="multi-url workspace build", notice_source="combined review workspace")
+    progress_ui(progress=1.0, title="Workspace ready", detail="Dashboard, Review Prompt, and Symptomizer are now in sync with the combined source set.")
+    return {"dataset": dataset, "seed_result": seed_result, "prep": prep}
+
+
+
+def _build_workspace_from_uploaded_files(uploaded_files, *, include_local_symptomization=False, auto_prepare_uploaded_taxonomy=True, replace_current=False, source_signature=""):
+    progress_ui = _make_workspace_progress_reporter("Building workspace from uploaded files")
+    progress_ui(progress=0.04, title="Reading files", detail="Parsing the uploaded workbook and mapping review columns into the workspace schema.")
     files = list(uploaded_files or [])
     nd = _load_uploaded_files_dispatch(files, include_local_symptomization=include_local_symptomization)
     raw_bytes = None
@@ -9506,12 +9836,22 @@ def _build_workspace_from_uploaded_files(uploaded_files, *, include_local_sympto
         fname = str(getattr(files[0], "name", "") or "")
         if fname.lower().endswith((".xlsx", ".xlsm")):
             raw_bytes = files[0].getvalue()
+    progress_ui(progress=0.42, title="Preparing taxonomy seed", detail="Checking the uploaded workbook for an existing local taxonomy or symptom columns.")
     seed = _uploaded_workspace_catalog_seed(
         nd,
         raw_bytes=raw_bytes,
         include_local_symptomization=include_local_symptomization,
     )
-    seed_result = _apply_workspace_dataset(nd, raw_bytes=raw_bytes, symptom_seed=seed)
+    seed_result = _activate_workspace_dataset(
+        nd,
+        raw_bytes=raw_bytes,
+        symptom_seed=seed,
+        replace_current=replace_current,
+        source_mode=SOURCE_MODE_FILE,
+        source_signature=source_signature,
+        source_label=_safe_text(nd.get("source_label")).strip(),
+    )
+    progress_ui(progress=0.68, title="Workbook loaded", detail=f"{len(nd.get('reviews_df', pd.DataFrame())):,} reviews are ready for analysis.")
     prep = None
     if auto_prepare_uploaded_taxonomy:
         prep = _auto_prepare_workspace_taxonomy(
@@ -9524,6 +9864,7 @@ def _build_workspace_from_uploaded_files(uploaded_files, *, include_local_sympto
     notice = _workspace_auto_prepare_notice(prep, seed_result)
     if notice:
         st.session_state["sym_run_notice"] = notice
+    progress_ui(progress=1.0, title="Workspace ready", detail="Dashboard, Review Prompt, and Symptomizer are now in sync with the uploaded workbook.")
     return {"dataset": nd, "seed_result": seed_result, "prep": prep, "notice": notice, "raw_bytes": raw_bytes}
 
 
@@ -9763,15 +10104,13 @@ def _render_workspace_header(summary, overall_df, filtered_df, prompt_artifacts,
 
 def _render_top_metrics(overall_df, filtered_df):
     m = _get_metrics(filtered_df)
-    recommend_value = _fmt_pct(m.get("recommend_rate")) if m.get("recommend_rate") is not None else "n/a"
-    recommend_sub = "Share of reviews with recommendation data" if m.get("recommend_rate") is not None else "No recommendation field available"
     organic_share = max(0.0, 1.0 - float(m.get("pct_incentivized") or 0.0))
     cards = [
-        ("Reviews in view", f"{m['review_count']:,}", f"of {len(overall_df):,} loaded", False),
-        ("Avg rating", _fmt_num(m["avg_rating"]), f"Organic avg {_fmt_num(m['avg_rating_non_incentivized'])}", False),
-        ("Recommend rate", recommend_value, recommend_sub, False),
-        ("% 1-2 star", _fmt_pct(m["pct_low_star"]), f"{m['low_star_count']:,} low-star reviews", True),
-        ("% organic", _fmt_pct(organic_share), f"{m['non_incentivized_count']:,} organic reviews", False),
+        ("Reviews in view", f"{m['review_count']:,}", f"{len(filtered_df):,} in scope · {len(overall_df):,} loaded", False),
+        ("Avg rating", _fmt_num(m.get("avg_rating")), f"{m.get('rated_count', 0):,} rated reviews", False),
+        ("% 1-2 star", _fmt_pct(m.get("pct_low_star")), f"{m.get('low_star_count', 0):,} low-star out of {m.get('rated_count', 0):,} rated", True),
+        ("Avg organic rating", _fmt_num(m.get("avg_rating_non_incentivized")), f"{m.get('organic_rated_count', 0):,} organic rated reviews", False),
+        ("% organic", _fmt_pct(organic_share), f"{m.get('non_incentivized_count', 0):,} organic · {m.get('incentivized_count', 0):,} incentivized", False),
     ]
     cols = st.columns(len(cards))
     for col, (label, value, sub, acc) in zip(cols, cards):
@@ -10577,8 +10916,6 @@ def _render_dashboard_snapshot(chart_df, overall_df=None):
     det_cols, del_cols = _get_symptom_col_lists(od)
     top_det, det_mentions = _top_theme_summary(scope_df, det_cols, kind="detractors")
     top_del, del_mentions = _top_theme_summary(scope_df, del_cols, kind="delighters")
-    recommend_txt = _fmt_pct(m.get("recommend_rate")) if m.get("recommend_rate") is not None else "n/a"
-    recommend_sub = "Reviews with recommendation signal" if m.get("recommend_rate") is not None else "No recommendation field available"
     organic_share = max(0.0, 1.0 - float(m.get("pct_incentivized") or 0.0))
     st.markdown(
         f"""
@@ -10588,12 +10925,12 @@ def _render_dashboard_snapshot(chart_df, overall_df=None):
     <div class="summary-item">
       <div class="label">Current scope</div>
       <div class="value">{len(scope_df):,} reviews</div>
-      <div class="sub">{int((~scope_df['incentivized_review'].fillna(False)).sum()):,} organic in the current view.</div>
+      <div class="sub">{m.get('non_incentivized_count', 0):,} organic and {m.get('incentivized_count', 0):,} incentivized reviews in the current view.</div>
     </div>
     <div class="summary-item">
       <div class="label">Satisfaction</div>
       <div class="value">{_fmt_num(m.get('avg_rating'))} ★</div>
-      <div class="sub">Recommend rate {recommend_txt}. {recommend_sub}.</div>
+      <div class="sub">Organic avg {_fmt_num(m.get('avg_rating_non_incentivized'))} ★ across {m.get('organic_rated_count', 0):,} organic rated reviews.</div>
     </div>
     <div class="summary-item">
       <div class="label">Biggest risk</div>
@@ -10615,6 +10952,30 @@ def _render_dashboard_snapshot(chart_df, overall_df=None):
 def _render_dashboard(filtered_df, overall_df=None):
     od = overall_df if overall_df is not None else filtered_df
     st.markdown("<div class='section-title'>Dashboard</div>", unsafe_allow_html=True)
+    dashboard_profile = _safe_text(st.session_state.get("sym_product_profile")).strip()
+    dashboard_profile_note = _safe_text(st.session_state.get("sym_product_profile_ai_note")).strip()
+    dashboard_knowledge = _normalize_product_knowledge(st.session_state.get("sym_product_knowledge") or {})
+    active_det_count = len(st.session_state.get("sym_detractors") or [])
+    active_del_count = len(st.session_state.get("sym_delighters") or [])
+    if dashboard_profile or _has_visible_product_knowledge(dashboard_knowledge) or active_det_count or active_del_count:
+        with st.expander("🧠 Generated product knowledge", expanded=False):
+            if dashboard_profile:
+                st.markdown("**AI product profile**")
+                st.write(dashboard_profile)
+            status_bits = []
+            if active_det_count or active_del_count:
+                status_bits.extend([
+                    (f"{active_det_count} detractors", "red"),
+                    (f"{active_del_count} delighters", "green"),
+                ])
+            if _safe_text(st.session_state.get("sym_symptoms_source")).strip() and _safe_text(st.session_state.get("sym_symptoms_source")).strip() != "none":
+                status_bits.append((f"Source: {_safe_text(st.session_state.get('sym_symptoms_source')).strip().title()}", "indigo"))
+            if status_bits:
+                st.markdown(_chip_html(status_bits), unsafe_allow_html=True)
+            if dashboard_profile_note:
+                st.caption(dashboard_profile_note)
+            if _has_visible_product_knowledge(dashboard_knowledge):
+                _render_product_knowledge_panel(dashboard_knowledge)
     # ── Auto-generated key insights (no AI needed) ───────────────────────
     try:
         n_reviews = len(filtered_df)
@@ -10968,26 +11329,67 @@ def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, fil
     api_key = settings.get("api_key")
     client = _get_client()
     with st.container(border=True):
-        sc = st.columns([1.25, 1, 1, 2.45])
-        tagging_scope = sc[0].selectbox("Scope", ["Current filtered reviews", "All loaded reviews"], index=0, key="prompt_tagging_scope")
+        ctl = st.columns([1.15, 0.9, 0.95, 1.0, 2.2])
+        tagging_scope = ctl[0].selectbox("Scope", ["Current filtered reviews", "All loaded reviews"], index=0, key="prompt_tagging_scope")
         scope_df = filtered_df if tagging_scope == "Current filtered reviews" else overall_df
+        prompt_sample_enabled = ctl[1].checkbox(
+            "Use sample",
+            value=bool(st.session_state.get("prompt_sample_enabled", False)),
+            key="prompt_sample_enabled",
+            help="Limit the run to a smaller, highest-signal set of reviews so you can test prompts faster before tagging the full scope.",
+        )
+        max_scope_reviews = max(len(scope_df), 1)
+        default_sample = min(int(st.session_state.get("prompt_sample_size", 150) or 150), max_scope_reviews)
+        requested_sample = int(
+            ctl[2].number_input(
+                "Sample size",
+                min_value=1,
+                max_value=max_scope_reviews,
+                value=max(default_sample, 1),
+                step=10,
+                key="prompt_sample_size",
+                disabled=not prompt_sample_enabled,
+            )
+        )
+        run_scope_df = _sample_review_prompt_scope(scope_df, requested_sample) if prompt_sample_enabled else scope_df.copy()
         batch_size = int(st.session_state.get("sym_batch_size", 8))
-        est = math.ceil(len(scope_df) / max(1, batch_size)) if len(scope_df) else 0
-        sc[1].metric("Reviews", f"{len(scope_df):,}")
-        sc[2].metric("Requests", f"{est:,}")
-        sc[3].caption(f"Scope: {tagging_scope.lower()} · {filter_description}")
-        run_disabled = (not api_key) or (not prompt_defs) or len(scope_df) == 0
+        est = math.ceil(len(run_scope_df) / max(1, batch_size)) if len(run_scope_df) else 0
+        ctl[3].metric("Requests", f"{est:,}")
+        scope_note = f"Scope: {tagging_scope.lower()} · {filter_description}"
+        if prompt_sample_enabled and len(scope_df) > len(run_scope_df):
+            scope_note += f" · sampling {len(run_scope_df):,} of {len(scope_df):,} reviews"
+        ctl[4].caption(scope_note)
+        stats_cols = st.columns(3)
+        stats_cols[0].metric("Reviews in scope", f"{len(scope_df):,}")
+        stats_cols[1].metric("Tagged this run", f"{len(run_scope_df):,}")
+        stats_cols[2].metric("Excluded", f"{max(len(scope_df) - len(run_scope_df), 0):,}")
+        st.caption("Sampling uses the highest-signal reviews first so the preview tables and graphs stay representative while you iterate faster.")
+        run_disabled = (not api_key) or (not prompt_defs) or len(run_scope_df) == 0
         if st.button("▶️ Run Review Prompt", type="primary", use_container_width=True, disabled=run_disabled, key="prompt_run_btn"):
             overlay = _show_thinking("Classifying each review…")
             try:
-                prd = _run_review_prompt_tagging(client=client, source_df=scope_df.reset_index(drop=True), prompt_defs=prompt_defs, chunk_size=batch_size)
+                run_input_df = run_scope_df.reset_index(drop=True)
+                prd = _run_review_prompt_tagging(client=client, source_df=run_input_df, prompt_defs=prompt_defs, chunk_size=batch_size)
                 updated = _merge_prompt_results(overall_df, prd, prompt_defs)
                 dataset = dict(st.session_state["analysis_dataset"])
                 dataset["reviews_df"] = updated
                 st.session_state["analysis_dataset"] = dataset
-                summary_df = _summarize_prompt_results(prd, prompt_defs, source_df=scope_df)
+                summary_df = _summarize_prompt_results(prd, prompt_defs, source_df=run_input_df)
                 defsig = json.dumps([dict(col=p["column_name"], prompt=p["prompt"], labels=p["labels"]) for p in prompt_defs], sort_keys=True)
-                prompt_artifacts = dict(definitions=prompt_defs, summary_df=summary_df, scope_label=tagging_scope, scope_filter_description=filter_description, scope_review_ids=list(prd["review_id"].astype(str)), definition_signature=defsig, review_count=len(prd), generated_utc=pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"))
+                prompt_artifacts = dict(
+                    definitions=prompt_defs,
+                    summary_df=summary_df,
+                    scope_label=tagging_scope,
+                    scope_filter_description=filter_description,
+                    scope_review_ids=list(prd["review_id"].astype(str)),
+                    definition_signature=defsig,
+                    review_count=len(prd),
+                    scope_total_reviews=len(scope_df),
+                    sample_enabled=bool(prompt_sample_enabled),
+                    sample_size=len(run_input_df),
+                    requested_review_count=int(requested_sample),
+                    generated_utc=pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                )
                 st.session_state["prompt_run_artifacts"] = prompt_artifacts
                 st.session_state["master_export_bundle"] = None
                 st.session_state["_prompt_bundle_ready"] = False
@@ -10998,7 +11400,10 @@ def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, fil
                     export_notice = " Download is ready."
                 except Exception as export_exc:
                     _log.warning("Prompt export bundle could not be auto-built: %s", export_exc)
-                st.session_state["prompt_run_notice"] = f"Finished tagging {len(prd):,} reviews.{export_notice}"
+                if prompt_sample_enabled and len(scope_df) > len(run_input_df):
+                    st.session_state["prompt_run_notice"] = f"Finished tagging {len(prd):,} reviews from a {len(scope_df):,}-review scope.{export_notice}"
+                else:
+                    st.session_state["prompt_run_notice"] = f"Finished tagging {len(prd):,} reviews.{export_notice}"
             except Exception as exc:
                 st.error(f"Review Prompt run failed: {exc}")
             finally:
@@ -11018,7 +11423,11 @@ def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, fil
     bundle = st.session_state.get("master_export_bundle")
     dl_ready = bundle is not None
     hc = st.columns([1.4, 1.4, 4])
-    hc[2].caption(f"Run: {pa.get('generated_utc')} · Scope: {pa.get('scope_label')} · Reviews: {pa.get('review_count'):,}")
+    scope_total_reviews = int(pa.get("scope_total_reviews") or pa.get("review_count") or 0)
+    scope_caption = f"Run: {pa.get('generated_utc')} · Scope: {pa.get('scope_label')} · Tagged: {int(pa.get('review_count') or 0):,} of {scope_total_reviews:,}"
+    if bool(pa.get("sample_enabled")) and scope_total_reviews > int(pa.get("review_count") or 0):
+        scope_caption += f" (sampled {int(pa.get('review_count') or 0):,})"
+    hc[2].caption(scope_caption)
     prep_label = "🔄 Refresh download" if dl_ready else "🔄 Prepare download"
     if hc[0].button(prep_label, use_container_width=True, key="prompt_prep_dl"):
         try:
@@ -11047,6 +11456,8 @@ def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, fil
     pc_col = prompt["column_name"]
     rids = set(str(x) for x in pa.get("scope_review_ids", []))
     result_scope = updated_overall.loc[updated_overall["review_id"].astype(str).isin(rids)] if rids else updated_overall.iloc[0:0]
+    result_scope_count = int(len(result_scope))
+    st.caption(f"All charts, pie slices, and tables below are out of the tagged reviews from this run (n = {result_scope_count:,}).")
     lopts = [str(l) for l in pa["summary_df"][pa["summary_df"]["column_name"] == pc_col]["label"].tolist()]
     sel_labels = st.multiselect("Labels", options=lopts, default=lopts, key=f"plabels_{pc_col}")
     if pc_col in result_scope.columns and not result_scope.empty:
@@ -11064,6 +11475,7 @@ def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, fil
     cc, tc_col = st.columns([1.45, 1.05])
     with cc:
         with st.container(border=True):
+            st.caption(f"Label distribution out of {result_scope_count:,} tagged reviews.")
             if ps.empty or ps["review_count"].sum() == 0:
                 st.info("No tagged reviews match current filters.")
             else:
@@ -11078,9 +11490,10 @@ def _render_review_prompt_tab(*, settings, overall_df, filtered_df, summary, fil
                 ds = ps.copy()
                 ds["avg_rating"] = ds["avg_rating"].map(lambda x: f"{x:.2f}★" if pd.notna(x) and x is not None else "—")
                 ds["share"] = ds["share"].map(_fmt_pct)
-                st.dataframe(ds[["label", "review_count", "avg_rating", "share"]], use_container_width=True, hide_index=True, height=240)
+                ds = ds.rename(columns={"review_count": "tagged_reviews", "share": "share_of_tagged_reviews"})
+                st.dataframe(ds[["label", "tagged_reviews", "avg_rating", "share_of_tagged_reviews"]], use_container_width=True, hide_index=True, height=240)
     prevcols = [c for c in ["review_id", "rating", "incentivized_review", "submission_time", "content_locale", "title", "review_text", pc_col] if c in _view.columns]
-    st.markdown("**Tagged review preview**")
+    st.markdown(f"**Tagged review preview** · {len(_view):,} tagged review(s) match the selected labels")
     st.dataframe(_view[prevcols].head(50), use_container_width=True, hide_index=True, height=300)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -11382,6 +11795,35 @@ The tagger reads more than the main review body — it may use pros, cons, comme
                     height=80,
                     key="sym_pdesc",
                 )
+                model_controls = st.columns([1.15, 0.95, 2.1])
+                current_model = st.session_state.get("shared_model", DEFAULT_MODEL)
+                if current_model not in MODEL_OPTIONS:
+                    current_model = DEFAULT_MODEL
+                    st.session_state["shared_model"] = current_model
+                inline_model = model_controls[0].selectbox(
+                    "Taxonomy model",
+                    options=MODEL_OPTIONS,
+                    index=MODEL_OPTIONS.index(current_model),
+                    key="sym_inline_model",
+                    help="Use a different model here if you want the taxonomy generator to take another pass.",
+                )
+                if inline_model != st.session_state.get("shared_model"):
+                    st.session_state["shared_model"] = inline_model
+                inline_reasoning_options = _reasoning_options_for_model(st.session_state.get("shared_model", DEFAULT_MODEL))
+                current_reasoning = _safe_text(st.session_state.get("shared_reasoning", DEFAULT_REASONING)).lower() or DEFAULT_REASONING
+                if current_reasoning not in inline_reasoning_options:
+                    current_reasoning = "none" if "none" in inline_reasoning_options else inline_reasoning_options[0]
+                    st.session_state["shared_reasoning"] = current_reasoning
+                inline_reasoning = model_controls[1].selectbox(
+                    "Reasoning",
+                    options=inline_reasoning_options,
+                    index=inline_reasoning_options.index(current_reasoning),
+                    key="sym_inline_reasoning",
+                    help="Higher reasoning can improve nuanced taxonomy generation, though it may be a bit slower.",
+                )
+                if inline_reasoning != st.session_state.get("shared_reasoning"):
+                    st.session_state["shared_reasoning"] = inline_reasoning
+                model_controls[2].caption("Don’t like the generated taxonomy? Change the model or reasoning here, then regenerate for a different take before you run the Symptomizer.")
                 if not overall_df.empty and "review_text" in overall_df.columns:
                     max_samples = min(250, max(5, len(overall_df)))
                     sample_n = st.slider("Sample reviews for taxonomy generation", min_value=5, max_value=max_samples, value=min(50, max_samples), step=5, key="sym_sample_n")
@@ -12791,13 +13233,15 @@ def main():
               <div class='app-title'>StarWalk Review Analyst</div>
               <span class='beta-chip'>Beta</span>
             </div>
-            <div class='app-subtitle'>Single-file Streamlit workspace for executive review, deep-dive exploration, Review Prompt, Symptomizer, and a placeholder Social Listening Beta route that works even before reviews exist.</div>
+            <div class='app-subtitle'>Enterprise review workspace for executive readouts, review exploration, prompt-based AI tagging, and taxonomy-driven symptom analysis. Social Listening Beta stays available from the sidebar whenever you want it.</div>
           </div>
         </div>
       </div>
     </div>""", unsafe_allow_html=True)
 
     dataset = st.session_state.get("analysis_dataset")
+    if dataset and not _safe_text(st.session_state.get("_workspace_loaded_source_signature")).strip():
+        _remember_loaded_workspace_source(dataset=dataset)
     if dataset:
         bc = st.columns([2.5, 1.05, 1.1, 0.55, 0.55])
         # Workspace name (editable)
@@ -12908,6 +13352,7 @@ def main():
                                     st.session_state["analysis_dataset"] = restored_dataset
                                     st.session_state["workspace_id"] = ws["workspace_id"]
                                     st.session_state["workspace_name"] = ws.get("workspace_name", "Untitled")
+                                    _remember_loaded_workspace_source(dataset=restored_dataset)
                                     # Restore symptomizer state
                                     for k, v in (loaded.get("state_payload") or {}).items():
                                         if k.startswith("sym_"):
@@ -12965,6 +13410,13 @@ def main():
                         key="workspace_url_entry_mode",
                         label_visibility="collapsed",
                     )
+                auto_prepare_url_taxonomy = st.checkbox(
+                    "Auto-generate product knowledge + taxonomy after load",
+                    value=bool(st.session_state.get("workspace_auto_prepare_url_taxonomy", True)),
+                    key="workspace_auto_prepare_url_taxonomy",
+                    help="Drafts product knowledge and an AI taxonomy right after the link-based workspace loads so the Symptomizer is ready with fewer clicks.",
+                )
+                loaded_workspace_label = _safe_text(st.session_state.get("workspace_name")).strip() or _safe_text(st.session_state.get("_workspace_loaded_source_label")).strip() or "your current workspace"
                 if url_mode == "Single link":
                     st.text_input(
                         "Product or review URL",
@@ -12973,12 +13425,27 @@ def main():
                         label_visibility="collapsed",
                     )
                     st.caption("Fastest path: paste a retailer product page or a direct Bazaarvoice / PowerReviews / Okendo review endpoint.")
-                    if st.button("Build review workspace", type="primary", key="ws_build_url", use_container_width=True):
+                    single_url = st.session_state.get("workspace_product_url", DEFAULT_PRODUCT_URL)
+                    single_source_sig = _url_source_signature(product_url=single_url)
+                    needs_confirmation = _workspace_source_change_needs_confirmation(single_source_sig, source_mode=SOURCE_MODE_URL)
+                    create_new = False
+                    replace_existing = False
+                    if needs_confirmation:
+                        st.warning(f"A workspace is already loaded ({loaded_workspace_label}). This link is different, so choose whether to create a new workspace or replace the current one.")
+                        confirm_cols = st.columns([1.15, 1.15, 2.7])
+                        create_new = confirm_cols[0].button("Create new workspace", type="primary", key="ws_build_url_new", use_container_width=True)
+                        replace_existing = confirm_cols[1].button("Replace current workspace", key="ws_build_url_replace", use_container_width=True)
+                        confirm_cols[2].caption("Create new starts a fresh workspace. Replace keeps the current workspace name and save target while swapping in this source.")
+                    else:
+                        create_new = st.button("Build review workspace", type="primary", key="ws_build_url", use_container_width=True)
+                    if create_new or replace_existing:
                         try:
-                            nd = _load_product_reviews_dispatch(st.session_state.get("workspace_product_url", DEFAULT_PRODUCT_URL))
-                            _apply_workspace_dataset(nd)
-                            with st.spinner("Auto-discovering product profile…"):
-                                _auto_discover_product(nd)
+                            _build_workspace_from_url_source(
+                                single_url,
+                                auto_prepare_taxonomy=auto_prepare_url_taxonomy,
+                                replace_current=bool(replace_existing or st.session_state.get("analysis_dataset")),
+                                source_signature=single_source_sig,
+                            )
                             st.rerun()
                         except requests.HTTPError as exc:
                             st.error(f"HTTP error: {exc}")
@@ -12995,6 +13462,7 @@ def main():
                         label_visibility="collapsed",
                     )
                     bulk_urls = _parse_bulk_product_urls(st.session_state.get("workspace_product_urls_bulk", ""))
+                    multi_source_sig = _url_source_signature(bulk_urls=bulk_urls)
                     if bulk_urls:
                         preview = ", ".join((_strip_www(urlparse(u).netloc) or u) for u in bulk_urls[:4])
                         if len(bulk_urls) > 4:
@@ -13002,12 +13470,25 @@ def main():
                         st.caption(f"Ready to load {len(bulk_urls)} link(s) · {preview}")
                     else:
                         st.caption("Paste one product page or direct review endpoint per line to build a combined workspace.")
-                    if st.button("Build combined workspace", type="primary", key="ws_build_url_multi", use_container_width=True):
+                    needs_confirmation = _workspace_source_change_needs_confirmation(multi_source_sig, source_mode=SOURCE_MODE_URL)
+                    create_new = False
+                    replace_existing = False
+                    if needs_confirmation and bulk_urls:
+                        st.warning(f"A workspace is already loaded ({loaded_workspace_label}). This source list is different, so choose whether to create a new workspace or replace the current one.")
+                        confirm_cols = st.columns([1.15, 1.15, 2.7])
+                        create_new = confirm_cols[0].button("Create new workspace", type="primary", key="ws_build_url_multi_new", use_container_width=True)
+                        replace_existing = confirm_cols[1].button("Replace current workspace", key="ws_build_url_multi_replace", use_container_width=True)
+                        confirm_cols[2].caption("Create new starts a fresh combined workspace. Replace keeps the current workspace name and save target while swapping in these links.")
+                    else:
+                        create_new = st.button("Build combined workspace", type="primary", key="ws_build_url_multi", use_container_width=True)
+                    if create_new or replace_existing:
                         try:
-                            nd = _load_multiple_product_reviews_dispatch(bulk_urls)
-                            _apply_workspace_dataset(nd)
-                            with st.spinner("Auto-discovering product profile…"):
-                                _auto_discover_product(nd)
+                            _build_workspace_from_bulk_urls(
+                                bulk_urls,
+                                auto_prepare_taxonomy=auto_prepare_url_taxonomy,
+                                replace_current=bool(replace_existing or st.session_state.get("analysis_dataset")),
+                                source_signature=multi_source_sig,
+                            )
                             st.rerun()
                         except requests.HTTPError as exc:
                             st.error(f"HTTP error: {exc}")
@@ -13050,60 +13531,96 @@ def main():
                     include_local_symptomization=include_local_symptomization,
                     auto_prepare_uploaded_taxonomy=auto_prepare_uploaded_taxonomy,
                 ) if uploaded_files else ""
+                uploaded_source_sig = _uploaded_file_source_signature(uploaded_files or []) if uploaded_files else ""
                 last_uploaded_build_sig = str(st.session_state.get("_workspace_last_uploaded_build_sig") or "")
-                build_spinner_label = "Loading workbook and auto-preparing taxonomy…" if auto_prepare_uploaded_taxonomy else "Loading workbook…"
+                loaded_workspace_label = _safe_text(st.session_state.get("workspace_name")).strip() or _safe_text(st.session_state.get("_workspace_loaded_source_label")).strip() or "your current workspace"
                 if uploaded_files and auto_build_uploaded_files:
-                    st.caption("Auto-load is on. Selecting a file builds the workspace immediately; use Reload if you want to force a fresh build.")
+                    st.caption("Auto-load is on. Selecting a file builds the workspace immediately unless a different workspace is already open and needs confirmation.")
                 elif uploaded_files:
                     st.caption("Auto-load is off. Choose files, then click Build when you're ready.")
                 last_upload_error = str(st.session_state.get("_workspace_last_uploaded_build_error") or "")
                 auto_build_pending = bool(auto_build_uploaded_files and uploaded_build_sig and uploaded_build_sig != last_uploaded_build_sig)
-                if auto_build_pending:
-                    try:
-                        with st.spinner(build_spinner_label):
+                needs_confirmation = _workspace_source_change_needs_confirmation(uploaded_source_sig, source_mode=SOURCE_MODE_FILE)
+                if needs_confirmation and uploaded_files:
+                    st.warning(f"A workspace is already loaded ({loaded_workspace_label}). These files are different, so choose whether to create a new workspace or replace the current one.")
+                    confirm_cols = st.columns([1.15, 1.15, 2.7])
+                    build_new = confirm_cols[0].button("Create new workspace", type="primary", key="ws_build_file_new", use_container_width=True)
+                    replace_existing = confirm_cols[1].button("Replace current workspace", key="ws_build_file_replace", use_container_width=True)
+                    confirm_cols[2].caption("Create new starts a fresh workspace. Replace keeps the current workspace name and save target while swapping in these files.")
+                    if auto_build_pending:
+                        st.caption("Auto-load is paused until you choose whether to create a new workspace or replace the current one.")
+                    if build_new or replace_existing:
+                        try:
                             _build_workspace_from_uploaded_files(
                                 uploaded_files or [],
                                 include_local_symptomization=include_local_symptomization,
                                 auto_prepare_uploaded_taxonomy=auto_prepare_uploaded_taxonomy,
+                                replace_current=bool(replace_existing),
+                                source_signature=uploaded_source_sig,
                             )
-                        st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
-                        st.session_state["_workspace_last_uploaded_build_error"] = ""
-                        st.rerun()
-                    except ReviewDownloaderError as exc:
-                        st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
-                        st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
-                        st.error(str(exc))
-                    except Exception as exc:
-                        st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
-                        st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
-                        st.exception(exc)
+                            if uploaded_build_sig:
+                                st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                            st.session_state["_workspace_last_uploaded_build_error"] = ""
+                            st.rerun()
+                        except ReviewDownloaderError as exc:
+                            if uploaded_build_sig:
+                                st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                            st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
+                            st.error(str(exc))
+                        except Exception as exc:
+                            if uploaded_build_sig:
+                                st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                            st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
+                            st.exception(exc)
+                else:
+                    if auto_build_pending:
+                        try:
+                            _build_workspace_from_uploaded_files(
+                                uploaded_files or [],
+                                include_local_symptomization=include_local_symptomization,
+                                auto_prepare_uploaded_taxonomy=auto_prepare_uploaded_taxonomy,
+                                replace_current=bool(st.session_state.get("analysis_dataset")),
+                                source_signature=uploaded_source_sig,
+                            )
+                            st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                            st.session_state["_workspace_last_uploaded_build_error"] = ""
+                            st.rerun()
+                        except ReviewDownloaderError as exc:
+                            st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                            st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
+                            st.error(str(exc))
+                        except Exception as exc:
+                            st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                            st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
+                            st.exception(exc)
 
-                build_btn_label = "Reload selected workbook" if uploaded_files and auto_build_uploaded_files else "Build review workspace from file"
-                build_clicked = st.button(build_btn_label, type="primary", key="ws_build_file", use_container_width=True, disabled=not uploaded_files)
-                if build_clicked:
-                    try:
-                        with st.spinner(build_spinner_label):
+                    build_btn_label = "Reload selected workbook" if uploaded_files and auto_build_uploaded_files else "Build review workspace from file"
+                    build_clicked = st.button(build_btn_label, type="primary", key="ws_build_file", use_container_width=True, disabled=not uploaded_files)
+                    if build_clicked:
+                        try:
                             _build_workspace_from_uploaded_files(
                                 uploaded_files or [],
                                 include_local_symptomization=include_local_symptomization,
                                 auto_prepare_uploaded_taxonomy=auto_prepare_uploaded_taxonomy,
+                                replace_current=bool(st.session_state.get("analysis_dataset")),
+                                source_signature=uploaded_source_sig,
                             )
-                        if uploaded_build_sig:
-                            st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
-                        st.session_state["_workspace_last_uploaded_build_error"] = ""
-                        st.rerun()
-                    except ReviewDownloaderError as exc:
-                        if uploaded_build_sig:
-                            st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
-                        st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
-                        st.error(str(exc))
-                    except Exception as exc:
-                        if uploaded_build_sig:
-                            st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
-                        st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
-                        st.exception(exc)
-                elif last_upload_error and uploaded_files and uploaded_build_sig == last_uploaded_build_sig:
-                    st.caption(f"Last load attempt: {last_upload_error}")
+                            if uploaded_build_sig:
+                                st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                            st.session_state["_workspace_last_uploaded_build_error"] = ""
+                            st.rerun()
+                        except ReviewDownloaderError as exc:
+                            if uploaded_build_sig:
+                                st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                            st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
+                            st.error(str(exc))
+                        except Exception as exc:
+                            if uploaded_build_sig:
+                                st.session_state["_workspace_last_uploaded_build_sig"] = uploaded_build_sig
+                            st.session_state["_workspace_last_uploaded_build_error"] = str(exc)
+                            st.exception(exc)
+                    elif last_upload_error and uploaded_files and uploaded_build_sig == last_uploaded_build_sig:
+                        st.caption(f"Last load attempt: {last_upload_error}")
 
     dataset = st.session_state.get("analysis_dataset")
     settings = _render_sidebar(dataset["reviews_df"] if dataset else None)
@@ -13118,11 +13635,8 @@ def main():
         st.markdown("""<div class='empty-state-card'>
           <div style="font-size:2.5rem;margin-bottom:.75rem;">📊</div>
           <div class='empty-state-title' style="font-size:16px;">No workspace loaded</div>
-          <div class='empty-state-sub'>Build a workspace above to unlock the Dashboard, Review Explorer, AI Analyst, Review Prompt, and Symptomizer. Or skip reviews entirely and open <b>Social Listening Beta</b> from the sidebar to explore the placeholder Meltwater + AI social workflow.</div>
+          <div class='empty-state-sub'>Build a workspace above to unlock the Dashboard, Review Explorer, Review Prompt, and Symptomizer. Social Listening Beta stays available from the sidebar when you want the social-only placeholder workflow.</div>
         </div>""", unsafe_allow_html=True)
-        if st.button("📣 Open Social Listening Beta", type="primary", key="empty_state_open_social"):
-            st.session_state["workspace_active_tab"] = TAB_SOCIAL_LISTENING
-            st.rerun()
         return
 
     summary = dataset["summary"]
