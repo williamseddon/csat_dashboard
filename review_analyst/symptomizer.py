@@ -739,12 +739,17 @@ _NEGATION_PREFIX = re.compile(
 _NEG_CONTEXT = re.compile(r"\b(not|no|never|don't|doesn't|won't|can't|isn't|wasn't|without|hardly|barely|nor)\s+", re.I)
 _SARCASM_MARKERS = re.compile(r"(yeah right|sure|great[.!,]|wonderful[.!,]|fantastic[.!,]).*\b(broke|fail|terrible|awful|worst)", re.I)
 
-# Try to import the sophisticated fragment-level NegationDetector from tag_quality
+# Try to import the sophisticated fragment-level NegationDetector and
+# label-evidence coherence helper from tag_quality.
 try:
-    from review_analyst.tag_quality import NegationDetector as _NegDetector
+    from review_analyst.tag_quality import (
+        NegationDetector as _NegDetector,
+        evidence_supports_label as _evidence_supports_label,
+    )
     _HAS_NEG_DETECTOR = True
 except Exception:
     _HAS_NEG_DETECTOR = False
+    _evidence_supports_label = None
 
 def validate_evidence(
     evidence_list: Sequence[str],
@@ -1926,13 +1931,19 @@ def _extract_side_with_confidence(
         raw_evs = [str(e) for e in (obj.get("evidence") or []) if isinstance(e, str)]
         validated = validate_evidence(raw_evs, review_text, max_ev_chars, label=lbl)
         if not validated:
-            validated = [str(e).strip()[:max_ev_chars] for e in raw_evs if str(e).strip()][:1]
-        # Semantic coherence: soft signal, not hard gate
-        # Tags with weak coherence survive but get a confidence penalty downstream
-        is_coherent = _evidence_coherent_with_label(lbl, validated, review_text=review_text)
+            continue
+
+        alias_vals = ((aliases or {}).get(lbl) or []) if isinstance(aliases, Mapping) else []
+        if _evidence_supports_label:
+            is_coherent = any(
+                _evidence_supports_label(lbl, ev, side=side, aliases=alias_vals)
+                for ev in validated
+            )
+        else:
+            is_coherent = _evidence_coherent_with_label(lbl, validated, review_text=review_text)
         coherence_flags[lbl] = is_coherent
-        # Only hard-drop if NO evidence at all AND no coherence
-        if not validated and not is_coherent:
+        if not is_coherent:
+            logger.info("Coherence audit: '%s' evidence does not support %s side — skipping", lbl, side)
             continue
         labels.append(lbl)
         ev_map[lbl] = validated[:3]

@@ -92,7 +92,7 @@ def _canonicalize_tag_label(text: Any) -> str:
 
 CONCEPT_SYNONYMS: Dict[str, Dict[str, Tuple[str, ...]]] = {
     "overall_sentiment": {
-        "positive": ("overall satisfaction","works great","it works great","it's great","love it","love this","amazing","excellent","awesome","perfect","fantastic","highly recommend","would recommend","happy","satisfied","very happy","best purchase","bought another","buy again","met expectations","worth buying"),
+        "positive": ("overall satisfaction","works great","it works great","it's great","love it","love this","amazing","excellent","awesome","perfect","fantastic","highly recommend","would recommend","happy","satisfied","very happy","best purchase","bought another","buy again","met expectations","worth buying","enjoying it","really enjoying","so far so good","pleased so far"),
         "negative": ("overall dissatisfaction","terrible","awful","hate it","disappointed","very disappointed","bad","poor","not good","doesn't work","does not work","would not recommend","wouldn't recommend","not worth it","regret buying","returned it","returning it","fell short"),
         "keywords": ("overall satisfaction","satisfaction","satisfied","happy","overall dissatisfaction","dissatisfaction","dissatisfied","disappointed","recommend","expectations"),
     },
@@ -277,6 +277,7 @@ EXPLICIT_LABEL_CONCEPTS: Dict[str, str] = {
     "High Quality": "quality",                         "Poor Quality": "quality",
     "Easy To Use": "ease_of_use",                      "Difficult To Use": "ease_of_use",
     "Reliable": "reliability",                         "Unreliable": "reliability",
+    "Poor Durability": "reliability",                  "Durable": "reliability",
     "Easy To Clean": "cleaning",                       "Hard To Clean": "cleaning",
     "Saves Time": "time_efficiency",                   "Time Consuming": "time_efficiency",
     "Quiet": "noise",                                  "Loud": "noise",
@@ -322,7 +323,7 @@ STEM_EQUIVS: Dict[str, str] = {
     "simple":"easy","easily":"easy","straightforward":"easy","intuitive":"easy",
     "difficult":"hard","confusing":"hard","complicated":"hard",
     "pricey":"price","expensive":"price","overpriced":"price","affordable":"value","worth":"value",
-    "durable":"reliable","sturdy":"reliable","reliability":"reliable","reliable":"reliable",
+    "durable":"reliable","durability":"reliable","sturdy":"reliable","reliability":"reliable","reliable":"reliable",
     "broke":"break","broken":"break","breaks":"break","breaking":"break","lightweight":"light",
     "burned":"burn","burnt":"burn","overheats":"overheat",
     "performance":"perform","performs":"perform","performed":"perform",
@@ -805,6 +806,112 @@ def _effective_label_tokens(label: str, concept: Optional[str]) -> List[str]:
     return filtered or tokens
 
 
+_GENERIC_POSITIVE_SENTIMENT_RE = re.compile(
+    r"\b(?:enjoy(?:ed|ing)?|happy|pleased|satisfied|so\s+far\s+so\s+good|works?\s+great|working\s+great|"
+    r"lov(?:e|ed)|recommend|awesome|amazing|fantastic|excellent)\b",
+    flags=re.IGNORECASE,
+)
+
+_GENERIC_NEGATIVE_SENTIMENT_RE = re.compile(
+    r"\b(?:disappointed|unhappy|frustrated|hate|regret|return(?:ed|ing)?|terrible|awful|"
+    r"doesn'?t\s+work|does\s+not\s+work|not\s+worth)\b",
+    flags=re.IGNORECASE,
+)
+
+_MISSING_COMPONENT_RE = re.compile(
+    r"\b(?:missing|not\s+included|didn'?t\s+come\s+with|did\s+not\s+come\s+with|"
+    r"left\s+out|wasn'?t\s+included|without\s+the|without\s+any)\b",
+    flags=re.IGNORECASE,
+)
+
+
+
+def _supports_variety_label(label: str, evidence_text: str) -> bool:
+    label_norm = _canon(label)
+    ev_norm = _canon(evidence_text)
+    if not label_norm or not ev_norm:
+        return False
+    if not re.search(r"\b(?:versatile|multiple|multi|variety|different)\b", label_norm):
+        return False
+    if not re.search(r"\b(?:made|make|making|cook(?:ed|ing)?|bake(?:d|ing)?|fry(?:ing)?|use(?:d|ing)?|works?\s+for|great\s+for|good\s+for)\b", ev_norm):
+        return False
+    separators = ev_norm.count(",") + len(re.findall(r"\band\b", ev_norm))
+    content_words = [w for w in re.findall(r"[a-z]+", ev_norm) if len(w) > 3 and w not in STOPWORDS]
+    return separators >= 2 and len(set(content_words)) >= 4
+
+
+
+def evidence_supports_label(
+    label: str,
+    evidence_text: str,
+    *,
+    concept: Optional[str] = None,
+    side: str = "delighter",
+    aliases: Optional[Sequence[str]] = None,
+) -> bool:
+    """Return whether a piece of evidence genuinely supports a label.
+
+    This is intentionally stricter than plain verbatim matching. A quoted span
+    from the review only counts when it is semantically related to the label,
+    its aliases, or the label's concept keywords. This blocks the common
+    hallucination failure mode where the model picks a label and then attaches
+    an unrelated sentence just because it is verbatim.
+    """
+    cleaned_label = _canonicalize_tag_label(label)
+    evidence_raw = re.sub(r"\s+", " ", str(evidence_text or "").strip())
+    if not cleaned_label or not evidence_raw:
+        return False
+
+    alias_vals = [_canonicalize_tag_label(a) for a in (aliases or []) if _canonicalize_tag_label(a)]
+    inferred_concept = concept or _concept_lib.infer(cleaned_label, alias_vals)
+    evidence_tokens = set(_tokenize(evidence_raw))
+
+    # 1) Direct label or alias phrase / token overlap.
+    label_phrases = [cleaned_label] + alias_vals
+    if any(_phrase_in_text(phrase, evidence_raw) for phrase in label_phrases if phrase):
+        return True
+
+    label_tokens: set[str] = set()
+    for phrase in label_phrases:
+        label_tokens.update(
+            token
+            for token in _effective_label_tokens(phrase, inferred_concept)
+            if token and token not in GENERIC_LABEL_TOKENS
+        )
+    if label_tokens and (label_tokens & evidence_tokens):
+        return True
+
+    # 2) Concept-aware support: exact cue phrases or concept keywords.
+    if inferred_concept:
+        concept_keywords = _concept_lib.concept_keywords(inferred_concept)
+        if any(_phrase_in_text(keyword, evidence_raw) for keyword in concept_keywords if keyword):
+            return True
+        keyword_tokens = {token for keyword in concept_keywords for token in _tokenize(keyword)}
+        if keyword_tokens and (keyword_tokens & evidence_tokens):
+            return True
+
+        polarity = "positive" if side == "delighter" else "negative"
+        concept_phrases = CONCEPT_SYNONYMS.get(inferred_concept, {}).get(polarity, ())
+        for phrase in concept_phrases:
+            matched = _phrase_in_text(phrase, evidence_raw)
+            if matched and not NegationDetector.is_negated(phrase, evidence_raw):
+                return True
+
+        if inferred_concept == "overall_sentiment":
+            if side == "delighter" and (_STRONG_POSITIVE_RE.search(evidence_raw) or _GENERIC_POSITIVE_SENTIMENT_RE.search(evidence_raw)):
+                return True
+            if side == "detractor" and (_STRONG_NEGATIVE_RE.search(evidence_raw) or _GENERIC_NEGATIVE_SENTIMENT_RE.search(evidence_raw)):
+                return True
+
+    # 3) Special-case labels that rely on structural evidence rather than token overlap.
+    if re.search(r"\bmissing\b", cleaned_label.lower()) and _MISSING_COMPONENT_RE.search(evidence_raw):
+        return True
+    if _supports_variety_label(cleaned_label, evidence_raw):
+        return True
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # phrase-in-text (word-boundary aware)
 # ---------------------------------------------------------------------------
@@ -858,6 +965,8 @@ class FragmentScorer:
         concept: Optional[str],
         side: str,
         provided_evidence: Sequence[str] = (),
+        label: str = "",
+        aliases: Sequence[str] = (),
     ) -> ScoredTag:
         cfg = self.cfg
         fragment_tokens = set(_tokenize(fragment))
@@ -865,9 +974,19 @@ class FragmentScorer:
 
         # ── Evidence validation ────────────────────────────────────────────
         valid_evidence: List[TagEvidence] = []
+        cleaned_label = _canonicalize_tag_label(label or (cues[0] if cues else ""))
+        alias_vals = [_canonicalize_tag_label(a) for a in (aliases or []) if _canonicalize_tag_label(a)]
         for ev_text in provided_evidence:
             matched = _phrase_in_text(str(ev_text).strip(), fragment)
-            if matched:
+            if not matched:
+                continue
+            if evidence_supports_label(
+                cleaned_label,
+                matched,
+                concept=concept,
+                side=side,
+                aliases=alias_vals,
+            ):
                 valid_evidence.append(TagEvidence(text=matched, source_cue="provided", confidence=1.0))
 
         # ── Cue matching ───────────────────────────────────────────────────
@@ -1056,6 +1175,8 @@ class TagScorer:
                 frag, cues=cues, label_tokens=label_tokens,
                 concept=concept, side=side,
                 provided_evidence=provided_evidence or [],
+                label=label,
+                aliases=aliases or [],
             )
             candidates.append(scored)
 

@@ -359,3 +359,21 @@ def test_uploaded_normalization_preserves_original_headers_for_filter_builder(ap
     assert "Case ID" in extra_candidates
     assert app_module._infer_extra_filter_kind(normalized, "Reviewer Notes") in {"text", "categorical"}
     assert app_module._infer_extra_filter_kind(normalized, "Case ID") in {"text", "categorical"}
+
+
+def test_retailer_watch_is_wrapped_in_closed_expander(app_module, monkeypatch):
+    calls = []
+
+    class _Ctx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(app_module.st, "expander", lambda label, expanded=False, **kwargs: calls.append((label, expanded)) or _Ctx())
+    monkeypatch.setattr(app_module.st, "container", lambda *args, **kwargs: _Ctx())
+
+    app_module._render_source_rating_watch(pd.DataFrame())
+
+    assert calls[0] == ("🏪 Retailer rating watch", False)

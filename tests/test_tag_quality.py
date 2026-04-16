@@ -5,6 +5,7 @@ from review_analyst.tag_quality import (
     UNIVERSAL_NEUTRAL_DELIGHTERS,
     compute_tag_edit_accuracy,
     ensure_universal_taxonomy,
+    evidence_supports_label,
     normalize_tag_list,
     is_universal_neutral_label,
     refine_tag_assignment,
@@ -315,3 +316,46 @@ def test_normalize_tag_list_collapses_overlap_variants():
     ])
 
     assert labels == ["Loud", "Difficult To Use", "Easy To Clean"]
+
+
+def test_evidence_supports_label_allows_variety_but_rejects_unrelated_issue_labels():
+    recipe_span = "Made salmon, chicken, potatoes and will try frozen appetizers soon."
+
+    assert evidence_supports_label("Versatile Cooking Modes", recipe_span, side="delighter")
+    assert not evidence_supports_label("Wrong Size", recipe_span, side="detractor")
+    assert not evidence_supports_label("Unreliable", "Treated myself for Xmas.", side="detractor")
+
+
+def test_refine_tag_assignment_drops_hallucinated_issue_tags_from_recipe_review():
+    review = (
+        "Treated myself for Xmas. Really enjoying this so far. Made salmon, chicken, potatoes "
+        "and will try frozen appetizers soon. Pinterest has some wonderful air fryer recipes "
+        "I’m looking forward to trying also."
+    )
+
+    refined = refine_tag_assignment(
+        review,
+        detractors=["Unreliable", "Wrong Size", "Missing Setup Materials"],
+        delighters=["Versatile Cooking Modes", "Easy To Use", "Overall Satisfaction", "Saves Time", "Performs Well"],
+        allowed_detractors=["Unreliable", "Wrong Size", "Missing Setup Materials"],
+        allowed_delighters=["Versatile Cooking Modes", "Easy To Use", "Overall Satisfaction", "Saves Time", "Performs Well"],
+        evidence_det={
+            "Unreliable": ["Treated myself for Xmas"],
+            "Wrong Size": ["Made salmon, chicken, potatoes and will try frozen appetizers soon"],
+            "Missing Setup Materials": ["Pinterest has some wonderful air fryer recipes"],
+        },
+        evidence_del={
+            "Versatile Cooking Modes": ["Made salmon, chicken, potatoes and will try frozen appetizers soon"],
+            "Easy To Use": ["Really enjoying this so far"],
+            "Overall Satisfaction": ["Really enjoying this so far"],
+            "Saves Time": ["Really enjoying this so far"],
+            "Performs Well": ["Made salmon, chicken, potatoes and will try frozen appetizers soon"],
+        },
+        rating=5,
+    )
+
+    assert refined["dets"] == []
+    assert refined["dels"] == ["Versatile Cooking Modes"]
+    assert "Easy To Use" not in refined["dels"]
+    assert "Saves Time" not in refined["dels"]
+    assert "Performs Well" not in refined["dels"]

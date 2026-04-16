@@ -456,3 +456,36 @@ def test_tag_review_batch_v4_routes_short_and_long_reviews(monkeypatch: pytest.M
     assert out[2]["dets"] == ["Hard To Clean", "Single Pass Label"]
     assert out[2]["ev_det"]["Hard To Clean"] == ["cleanup takes forever"]
     assert out[2]["ev_det"]["Single Pass Label"] == ["single-pass evidence"]
+
+
+def test_tag_review_batch_drops_incoherent_issue_labels_from_positive_recipe_review() -> None:
+    review = (
+        "Treated myself for Xmas. Really enjoying this so far. Made salmon, chicken, potatoes "
+        "and will try frozen appetizers soon. Pinterest has some wonderful air fryer recipes "
+        "I’m looking forward to trying also."
+    )
+
+    result = _run_single_pass_case(
+        review_text=review,
+        rating=5,
+        allowed_detractors=["Unreliable", "Wrong Size", "Missing Setup Materials"],
+        allowed_delighters=["Versatile Cooking Modes", "Easy To Use", "Overall Satisfaction", "Saves Time", "Performs Well"],
+        detractors=[
+            {"label": "Unreliable", "evidence": ["Treated myself for Xmas"]},
+            {"label": "Wrong Size", "evidence": ["Made salmon, chicken, potatoes and will try frozen appetizers soon"]},
+            {"label": "Missing Setup Materials", "evidence": ["Pinterest has some wonderful air fryer recipes"]},
+        ],
+        delighters=[
+            {"label": "Versatile Cooking Modes", "evidence": ["Made salmon, chicken, potatoes and will try frozen appetizers soon"]},
+            {"label": "Easy To Use", "evidence": ["Really enjoying this so far"]},
+            {"label": "Overall Satisfaction", "evidence": ["Really enjoying this so far"]},
+            {"label": "Saves Time", "evidence": ["Really enjoying this so far"]},
+            {"label": "Performs Well", "evidence": ["Made salmon, chicken, potatoes and will try frozen appetizers soon"]},
+        ],
+    )
+
+    assert result["dets"] == []
+    assert result["dels"] == ["Versatile Cooking Modes"]
+    assert result["ev_del"] == {
+        "Versatile Cooking Modes": ["Made salmon, chicken, potatoes and will try frozen appetizers soon"]
+    }
