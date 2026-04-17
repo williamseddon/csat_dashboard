@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -398,7 +399,28 @@ def finalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df["review_id"] = df["review_id"].fillna("").astype(str).str.strip()
     missing = df["review_id"].eq("") | df["review_id"].str.lower().isin({"nan", "none", "null"})
     if missing.any():
-        df.loc[missing, "review_id"] = [f"review_{index + 1}" for index in range(int(missing.sum()))]
+        source_series = df.get("source_file", pd.Series(pd.NA, index=df.index)).fillna("").astype(str)
+        product_series = df.get("product_id", pd.Series(pd.NA, index=df.index)).fillna("").astype(str)
+        base_series = df.get("base_sku", pd.Series(pd.NA, index=df.index)).fillna("").astype(str)
+        submitted_series = df.get("submission_time", pd.Series(pd.NA, index=df.index)).fillna("").astype(str)
+        title_series = df.get("title", pd.Series(pd.NA, index=df.index)).fillna("").astype(str)
+        text_series = df.get("review_text", pd.Series(pd.NA, index=df.index)).fillna("").astype(str)
+        generated_ids = []
+        for row_position, row_index in enumerate(df.index[missing]):
+            payload = "|".join(
+                [
+                    source_series.loc[row_index],
+                    product_series.loc[row_index],
+                    base_series.loc[row_index],
+                    submitted_series.loc[row_index],
+                    title_series.loc[row_index],
+                    text_series.loc[row_index],
+                    str(row_position),
+                ]
+            )
+            digest = hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()[:16]
+            generated_ids.append(f"review_{digest}")
+        df.loc[missing, "review_id"] = generated_ids
 
     if "context_data_json" in df.columns:
         df["age_group"] = df["age_group"].fillna(df["context_data_json"].map(extract_age_group))
@@ -672,7 +694,7 @@ def normalize_uploaded_df(raw_df: pd.DataFrame, *, source_name: str = "", includ
     normalized["moderation_status"] = _series_alias(working, ["Moderation Status", "ModerationStatus", "Status"])
     normalized["brand_raw"] = _series_alias(working, ["Brand"])
     normalized["category_hierarchy"] = _series_alias(working, ["Category Hierarchy"])
-    normalized["verified_purchaser"] = _series_alias(working, ["VerifiedPurchaser (CDV)", "Verified Purchaser", "Verified"])
+    normalized["verified_purchaser"] = _series_alias(working, ["VerifiedPurchaser (CDV)", "Verified Purchaser", "Verified", "verification", "Verification"])
 
     seeded = _series_alias(working, ["Seeded Flag", "Seeded", "Incentivized", "IncentivizedReview (CDV)", "Incentivized Review", "IncentivizedReview", "Gifted", "Gifted Flag"])
     normalized["incentivized_review"] = seeded.map(

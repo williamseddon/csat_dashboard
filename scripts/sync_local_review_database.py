@@ -21,7 +21,7 @@ def _progress_callback(**kwargs):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sync the local central review database from the incoming review and SKU mapping folders.")
+    parser = argparse.ArgumentParser(description="Sync the local central review database from the incoming review and SKU mapping folders, including optional Dyson review/mapping subfolders.")
     parser.add_argument("--root", default="", help="Optional local database root. Defaults to the app's standard local database folder.")
     parser.add_argument("--force", action="store_true", help="Rebuild even when the current database already matches the latest input files.")
     parser.add_argument("--chunk-size", type=int, default=50000, help="Review rows per import chunk. Default: 50000")

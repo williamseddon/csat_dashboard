@@ -35,6 +35,10 @@ _DEFAULT_CHUNK_SIZE = 50000
 _WORKSPACE_CACHE_SUBDIR = "workspace_cache"
 _MAX_WORKSPACE_CACHE_FILES = 24
 _SEARCH_RESULT_SCAN_LIMIT = 15000
+_REQUIRED_READY_TABLES = {"reviews_enriched", "sku_catalog", "base_model_directory", "product_directory"}
+_WORKSPACE_EXCLUDED_COLUMNS = {"raw_json", "context_data_json", "badges"}
+_SUPPORTED_TABULAR_SUFFIXES = {".csv", ".xlsx", ".xls", ".xlsm"}
+_DYSON_SUBDIR = "dyson"
 
 _MANIFEST_SQL = """
 CREATE TABLE IF NOT EXISTS import_manifest (
@@ -139,6 +143,43 @@ def _safe_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _dedupe_preserve_order(values: Iterable[str]) -> List[str]:
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for raw in values:
+        text = _safe_text(raw)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+    return ordered
+
+
+def _normalize_selection_values(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        text = _safe_text(value)
+        items = [text] if text else []
+    return _dedupe_preserve_order(_safe_text(item) for item in items)
+
+
+def _selection_payload(value: Any) -> Any:
+    normalized = _normalize_selection_values(value)
+    if not normalized:
+        return []
+    if len(normalized) == 1:
+        return normalized[0]
+    return normalized
+
+
+def _primary_selection_value(value: Any) -> str:
+    normalized = _normalize_selection_values(value)
+    return normalized[0] if normalized else ""
+
+
 def _normalize_key(value: Any) -> str:
     return _safe_text(value).upper()
 
@@ -147,19 +188,28 @@ def _normalize_series(series: pd.Series) -> pd.Series:
     return series.fillna("").astype(str).str.strip().str.upper()
 
 
-def _file_info(path: Optional[Path]) -> Dict[str, Any]:
+def _file_info(path: Optional[Path], *, relative_to: Optional[Path] = None) -> Dict[str, Any]:
     if path is None or not Path(path).exists():
         return {
             "path": "",
             "name": "",
+            "relative_path": "",
             "size": 0,
             "mtime": 0.0,
             "modified_at": "",
         }
-    stat = Path(path).stat()
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    relative_path = ""
+    if relative_to is not None:
+        try:
+            relative_path = str(resolved.relative_to(Path(relative_to).resolve()))
+        except Exception:
+            relative_path = resolved.name
     return {
-        "path": str(Path(path).resolve()),
-        "name": Path(path).name,
+        "path": str(resolved),
+        "name": resolved.name,
+        "relative_path": relative_path,
         "size": int(stat.st_size),
         "mtime": float(stat.st_mtime),
         "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).replace(microsecond=0).isoformat(),
@@ -181,16 +231,20 @@ def ensure_local_review_db_dirs(root: Optional[str] = None) -> Dict[str, str]:
     incoming_path = root_path / "incoming"
     reviews_path = incoming_path / "reviews"
     mapping_path = incoming_path / "sku_mapping"
+    dyson_reviews_path = reviews_path / _DYSON_SUBDIR
+    dyson_mapping_path = mapping_path / _DYSON_SUBDIR
     exports_path = root_path / "exports"
     cache_path = root_path / "cache"
     workspace_cache_path = cache_path / _WORKSPACE_CACHE_SUBDIR
-    for path in [root_path, incoming_path, reviews_path, mapping_path, exports_path, cache_path, workspace_cache_path]:
+    for path in [root_path, incoming_path, reviews_path, mapping_path, dyson_reviews_path, dyson_mapping_path, exports_path, cache_path, workspace_cache_path]:
         path.mkdir(parents=True, exist_ok=True)
     return {
         "root": str(root_path),
         "incoming_dir": str(incoming_path),
         "reviews_dir": str(reviews_path),
         "mapping_dir": str(mapping_path),
+        "dyson_reviews_dir": str(dyson_reviews_path),
+        "dyson_mapping_dir": str(dyson_mapping_path),
         "exports_dir": str(exports_path),
         "cache_dir": str(cache_path),
         "workspace_cache_dir": str(workspace_cache_path),
@@ -199,23 +253,99 @@ def ensure_local_review_db_dirs(root: Optional[str] = None) -> Dict[str, str]:
     }
 
 
-def _candidate_files(folder: Path) -> List[Path]:
-    allowed = {".csv", ".xlsx", ".xls", ".xlsm"}
-    candidates = [path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in allowed]
+def _candidate_files(folder: Path, *, recursive: bool = False) -> List[Path]:
+    if not folder.exists():
+        return []
+    iterator = folder.rglob("*") if recursive else folder.iterdir()
+    candidates = [path for path in iterator if path.is_file() and path.suffix.lower() in _SUPPORTED_TABULAR_SUFFIXES]
     return sorted(candidates, key=lambda p: (p.stat().st_mtime, p.name.lower()), reverse=True)
+
+
+def _dedupe_paths(paths: Iterable[Path]) -> List[Path]:
+    seen: set[str] = set()
+    ordered: List[Path] = []
+    for raw_path in paths:
+        try:
+            resolved = Path(raw_path).resolve()
+        except Exception:
+            resolved = Path(raw_path)
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(resolved)
+    return ordered
+
+
+def _source_file_infos(paths: Sequence[Path], *, relative_to: Path) -> List[Dict[str, Any]]:
+    return [_file_info(path, relative_to=relative_to) for path in paths if path is not None and Path(path).exists()]
+
+
+def _source_signature(file_infos: Sequence[Dict[str, Any]]) -> str:
+    payload = [
+        {
+            "relative_path": _safe_text(info.get("relative_path")),
+            "name": _safe_text(info.get("name")),
+            "size": int(info.get("size") or 0),
+            "mtime": float(info.get("mtime") or 0.0),
+        }
+        for info in file_infos
+    ]
+    payload.sort(key=lambda item: (item.get("relative_path", ""), item.get("name", "")))
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _primary_standard_files(folder: Path) -> List[Path]:
+    files = []
+    for path in _candidate_files(folder):
+        lower_name = path.name.lower()
+        if lower_name.startswith(f"{_DYSON_SUBDIR}__") or _DYSON_SUBDIR in lower_name:
+            continue
+        files.append(path)
+    return files
+
+
+def _dyson_source_files(folder: Path) -> List[Path]:
+    dyson_dir = folder / _DYSON_SUBDIR
+    nested = _candidate_files(dyson_dir, recursive=True)
+    root_matches = [
+        path
+        for path in _candidate_files(folder)
+        if path.name.lower().startswith(f"{_DYSON_SUBDIR}__") or _DYSON_SUBDIR in path.name.lower()
+    ]
+    return _dedupe_paths([*nested, *root_matches])
 
 
 def discover_latest_local_sources(root: Optional[str] = None) -> Dict[str, Any]:
     dirs = ensure_local_review_db_dirs(root)
     reviews_dir = Path(dirs["reviews_dir"])
     mapping_dir = Path(dirs["mapping_dir"])
-    review_file = _candidate_files(reviews_dir)[0] if _candidate_files(reviews_dir) else None
-    mapping_file = _candidate_files(mapping_dir)[0] if _candidate_files(mapping_dir) else None
+    primary_review_candidates = _primary_standard_files(reviews_dir)
+    primary_mapping_candidates = _primary_standard_files(mapping_dir)
+    dyson_review_paths = _dyson_source_files(reviews_dir)
+    dyson_mapping_paths = _dyson_source_files(mapping_dir)
+    review_paths = _dedupe_paths([*(primary_review_candidates[:1]), *dyson_review_paths])
+    mapping_paths = _dedupe_paths([*(primary_mapping_candidates[:1]), *dyson_mapping_paths])
+    review_file = primary_review_candidates[0] if primary_review_candidates else (review_paths[0] if review_paths else None)
+    mapping_file = primary_mapping_candidates[0] if primary_mapping_candidates else (mapping_paths[0] if mapping_paths else None)
+    review_files = _source_file_infos(review_paths, relative_to=Path(dirs["incoming_dir"]))
+    mapping_files = _source_file_infos(mapping_paths, relative_to=Path(dirs["incoming_dir"]))
+    dyson_review_files = _source_file_infos(dyson_review_paths, relative_to=Path(dirs["incoming_dir"]))
+    dyson_mapping_files = _source_file_infos(dyson_mapping_paths, relative_to=Path(dirs["incoming_dir"]))
     return {
         **dirs,
-        "review_file": _file_info(review_file),
-        "mapping_file": _file_info(mapping_file),
-        "has_inputs": bool(review_file and mapping_file),
+        "review_file": _file_info(review_file, relative_to=Path(dirs["incoming_dir"])),
+        "mapping_file": _file_info(mapping_file, relative_to=Path(dirs["incoming_dir"])),
+        "review_files": review_files,
+        "mapping_files": mapping_files,
+        "dyson_review_files": dyson_review_files,
+        "dyson_mapping_files": dyson_mapping_files,
+        "review_source_count": len(review_files),
+        "mapping_source_count": len(mapping_files),
+        "dyson_review_count": len(dyson_review_files),
+        "dyson_mapping_count": len(dyson_mapping_files),
+        "source_signature": _source_signature([*review_files, *mapping_files]),
+        "has_inputs": bool(review_paths and mapping_paths),
     }
 
 
@@ -225,9 +355,11 @@ def _connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA cache_size=-65536")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
+    conn.execute("PRAGMA cache_size=-131072")
+    conn.execute("PRAGMA cache_spill=FALSE")
     try:
-        conn.execute("PRAGMA mmap_size=268435456")
+        conn.execute("PRAGMA mmap_size=1073741824")
     except Exception:
         pass
     conn.execute(_MANIFEST_SQL)
@@ -253,6 +385,13 @@ def _latest_manifest(conn: sqlite3.Connection) -> Dict[str, Any]:
 def _manifest_matches_sources(manifest: Dict[str, Any], sources: Dict[str, Any]) -> bool:
     if not manifest:
         return False
+    notes = dict(manifest.get("notes") or {})
+    manifest_signature = _safe_text(notes.get("source_signature"))
+    source_signature = _safe_text(sources.get("source_signature"))
+    if manifest_signature and source_signature:
+        return manifest_signature == source_signature
+    if source_signature and (int(sources.get("review_source_count") or 0) > 1 or int(sources.get("mapping_source_count") or 0) > 1):
+        return False
     review = sources.get("review_file") or {}
     mapping = sources.get("mapping_file") or {}
     return all(
@@ -277,13 +416,14 @@ def get_local_review_db_status(root: Optional[str] = None) -> Dict[str, Any]:
             manifest = _latest_manifest(conn)
             tables = [str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
     status = dict(sources)
+    ready_tables = _REQUIRED_READY_TABLES.issubset(set(tables or []))
     status.update(
         {
             "db_exists": Path(db_path).exists(),
             "manifest": manifest,
             "tables": tables,
-            "needs_sync": bool(sources.get("has_inputs")) and (not manifest or not _manifest_matches_sources(manifest, sources)),
-            "is_ready": bool(Path(db_path).exists()) and bool(manifest),
+            "needs_sync": bool(sources.get("has_inputs")) and (not manifest or not ready_tables or not _manifest_matches_sources(manifest, sources)),
+            "is_ready": bool(Path(db_path).exists()) and bool(manifest) and ready_tables,
         }
     )
     return status
@@ -311,13 +451,19 @@ def _iter_csv_chunks(path: Path, *, chunk_size: int = _DEFAULT_CHUNK_SIZE) -> It
             with open(path, "r", newline="", encoding=encoding) as handle:
                 reader = csv.DictReader(handle)
                 rows: List[Dict[str, Any]] = []
+                rows_seen = 0
                 for row in reader:
                     rows.append(row)
                     if len(rows) >= chunk_size:
-                        yield pd.DataFrame(rows)
+                        chunk = pd.DataFrame(rows)
+                        chunk.attrs["chunk_row_offset"] = rows_seen
+                        yield chunk
+                        rows_seen += len(rows)
                         rows = []
                 if rows:
-                    yield pd.DataFrame(rows)
+                    chunk = pd.DataFrame(rows)
+                    chunk.attrs["chunk_row_offset"] = rows_seen
+                    yield chunk
             return
         except UnicodeDecodeError as exc:
             last_error = exc
@@ -336,15 +482,21 @@ def _iter_excel_chunks(path: Path, *, chunk_size: int = _DEFAULT_CHUNK_SIZE) -> 
         return
     headers = [str(value).strip() if value is not None else "" for value in header_row]
     batch: List[Dict[str, Any]] = []
+    rows_seen = 0
     for raw_row in row_iter:
         values = list(raw_row)
         payload = {headers[idx]: values[idx] if idx < len(values) else None for idx in range(len(headers))}
         batch.append(payload)
         if len(batch) >= chunk_size:
-            yield pd.DataFrame(batch)
+            chunk = pd.DataFrame(batch)
+            chunk.attrs["chunk_row_offset"] = rows_seen
+            yield chunk
+            rows_seen += len(batch)
             batch = []
     if batch:
-        yield pd.DataFrame(batch)
+        chunk = pd.DataFrame(batch)
+        chunk.attrs["chunk_row_offset"] = rows_seen
+        yield chunk
 
 
 def _iter_tabular_chunks(path: str, *, chunk_size: int = _DEFAULT_CHUNK_SIZE) -> Iterator[pd.DataFrame]:
@@ -361,13 +513,47 @@ def _iter_tabular_chunks(path: str, *, chunk_size: int = _DEFAULT_CHUNK_SIZE) ->
         if raw.empty:
             return
         for start in range(0, len(raw), chunk_size):
-            yield raw.iloc[start:start + chunk_size].copy()
+            chunk = raw.iloc[start:start + chunk_size].copy()
+            chunk.attrs["chunk_row_offset"] = start
+            yield chunk
         return
     raise ValueError(f"Unsupported review file type: {file_path.name}")
 
 
+def _read_tabular_file(path: str) -> pd.DataFrame:
+    file_path = Path(path)
+    suffix = file_path.suffix.lower()
+    if suffix == ".csv":
+        last_error: Optional[Exception] = None
+        for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+            try:
+                return pd.read_csv(file_path, encoding=encoding)
+            except UnicodeDecodeError as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise last_error
+        return pd.DataFrame()
+    if suffix in {".xlsx", ".xlsm"}:
+        sheet_name = _select_best_excel_sheet(file_path)
+        return pd.read_excel(file_path, sheet_name=sheet_name)
+    if suffix == ".xls":
+        return pd.read_excel(file_path)
+    raise ValueError(f"Unsupported tabular file type: {file_path.name}")
+
+
+def _read_mapping_file(path: str) -> pd.DataFrame:
+    file_path = Path(path)
+    suffix = file_path.suffix.lower()
+    if suffix == ".csv":
+        return _read_tabular_file(path)
+    if suffix in {".xlsx", ".xlsm", ".xls"}:
+        return pd.read_excel(file_path)
+    raise ValueError(f"Unsupported mapping file type: {file_path.name}")
+
+
 def load_master_sku_catalog(path: str) -> pd.DataFrame:
-    raw = pd.read_excel(path)
+    raw = _read_mapping_file(path)
     raw.columns = [str(col).strip() for col in raw.columns]
     catalog = pd.DataFrame()
     catalog["sku"] = raw.get("SKU", pd.Series(dtype="object")).astype("string").fillna("").str.strip()
@@ -391,6 +577,117 @@ def load_master_sku_catalog(path: str) -> pd.DataFrame:
     catalog = catalog[_CATALOG_COLUMNS].copy()
     catalog = catalog[(catalog["sku_key"].ne("")) | (catalog["master_item_key"].ne(""))].reset_index(drop=True)
     return catalog
+
+
+def load_dyson_product_catalog(path: str) -> pd.DataFrame:
+    raw = _read_mapping_file(path)
+    raw.columns = [str(col).strip() for col in raw.columns]
+    catalog = pd.DataFrame()
+    catalog["sku"] = raw.get("PID", raw.get("Product ID", pd.Series(dtype="object"))).astype("string").fillna("").str.strip()
+    catalog["sku_key"] = catalog["sku"].str.upper()
+    catalog["master_item"] = raw.get("Model Code", raw.get("Master Item", pd.Series(dtype="object"))).astype("string").fillna("").str.strip()
+    catalog["master_item_key"] = catalog["master_item"].str.upper()
+    catalog["base_model_number"] = catalog["master_item"].where(catalog["master_item"].ne(""), catalog["sku"])
+    catalog["mapped_brand"] = raw.get("Brand", pd.Series(["Dyson"] * len(raw), index=raw.index)).astype("string").fillna("Dyson").str.strip().replace({"": "Dyson"})
+    catalog["mapped_category"] = raw.get("Category", pd.Series(dtype="object")).astype("string").fillna("").str.strip().replace({"": pd.NA})
+    catalog["mapped_subcategory"] = raw.get("Sub-Category", raw.get("SubCategory", pd.Series(dtype="object"))).astype("string").fillna("").str.strip().replace({"": pd.NA})
+    catalog["mapped_subsub_category"] = raw.get("SubsubCategory", pd.Series(dtype="object")).astype("string").fillna("").str.strip().replace({"": pd.NA})
+    catalog["mapped_region"] = raw.get("Region", raw.get("REGION", pd.Series(dtype="object"))).astype("string").fillna("").str.strip().replace({"": pd.NA})
+    catalog["item_status"] = raw.get("Item Status", pd.Series(dtype="object")).astype("string").fillna("").str.strip().replace({"": pd.NA})
+    catalog["lifecycle_phase"] = raw.get("Lifecycle Phase", raw.get("Lifecyle Phase", pd.Series(dtype="object"))).astype("string").fillna("").str.strip().replace({"": pd.NA})
+    product_name = raw.get("Product Name", pd.Series(dtype="object")).astype("string").fillna("").str.strip()
+    color_variant = raw.get("Color Variant", pd.Series(dtype="object")).astype("string").fillna("").str.strip()
+    notes = raw.get("Notes", pd.Series(dtype="object")).astype("string").fillna("").str.strip()
+    catalog["description"] = product_name.replace({"": pd.NA})
+    catalog["user_item_type"] = raw.get("Product Type", pd.Series(dtype="object")).astype("string").fillna("").str.strip().replace({"": pd.NA})
+    catalog["item_class"] = raw.get("Sub-Category", raw.get("SubCategory", pd.Series(dtype="object"))).astype("string").fillna("").str.strip().replace({"": pd.NA})
+    detail_series = product_name.where(product_name.ne(""), catalog["base_model_number"].astype("string"))
+    detail_series = detail_series.astype("string").fillna("").str.strip()
+    detail_series = detail_series.where(color_variant.eq(""), detail_series + " · " + color_variant)
+    detail_series = detail_series.where(notes.eq(""), detail_series + " · " + notes)
+    catalog["item_long_description"] = detail_series.replace({"": pd.NA})
+    catalog["ean"] = raw.get("EAN", pd.Series(dtype="object")).astype("string").fillna("").str.strip().replace({"": pd.NA})
+    catalog["upc"] = raw.get("UPC", pd.Series(dtype="object")).astype("string").fillna("").str.strip().replace({"": pd.NA})
+    catalog = catalog[_CATALOG_COLUMNS].copy()
+    catalog = catalog[(catalog["sku_key"].ne("")) | (catalog["master_item_key"].ne(""))].reset_index(drop=True)
+    return catalog
+
+
+def _combine_catalog_frames(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    valid_frames = [frame.copy() for frame in frames if isinstance(frame, pd.DataFrame) and not frame.empty]
+    if not valid_frames:
+        return pd.DataFrame(columns=_CATALOG_COLUMNS)
+    combined = pd.concat(valid_frames, ignore_index=True)
+    for col in _CATALOG_COLUMNS:
+        if col not in combined.columns:
+            combined[col] = pd.NA
+    combined = combined[_CATALOG_COLUMNS].copy()
+    combined["sku_key"] = combined["sku_key"].astype("string").fillna("").str.strip().str.upper()
+    combined["master_item_key"] = combined["master_item_key"].astype("string").fillna("").str.strip().str.upper()
+    combined = combined.drop_duplicates(subset=["sku_key", "master_item_key", "mapped_brand", "mapped_category", "mapped_subcategory"], keep="first")
+    combined = combined.reset_index(drop=True)
+    return combined
+
+
+def _dyson_pid_from_filename(path: Path) -> str:
+    stem = path.stem.strip()
+    lower = stem.lower()
+    if lower.startswith(f"{_DYSON_SUBDIR}__"):
+        return stem.split("__", 1)[1].strip().lower()
+    return stem.strip().lower()
+
+
+def _dyson_catalog_by_pid(catalog_df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    if catalog_df.empty:
+        return {}
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for _, row in catalog_df.iterrows():
+        pid = _safe_text(row.get("sku")).lower()
+        if not pid or pid in lookup:
+            continue
+        lookup[pid] = row.to_dict()
+    return lookup
+
+
+def normalize_dyson_review_chunk(raw_chunk: pd.DataFrame, *, source_path: Path, catalog_row: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    working = raw_chunk.copy()
+    working.columns = [str(col).strip() for col in working.columns]
+    pid = _dyson_pid_from_filename(source_path)
+    catalog_row = dict(catalog_row or {})
+    base_model = _safe_text(catalog_row.get("base_model_number") or catalog_row.get("master_item") or pid)
+    product_name = _safe_text(catalog_row.get("description") or catalog_row.get("item_long_description") or pid)
+    brand = _safe_text(catalog_row.get("mapped_brand") or "Dyson") or "Dyson"
+    review_offset = 0
+    if not working.empty:
+        review_offset = int(getattr(raw_chunk, "attrs", {}).get("chunk_row_offset", 0) or 0)
+    if "Product ID" not in working.columns:
+        working["Product ID"] = pid
+    if "Base SKU" not in working.columns:
+        working["Base SKU"] = base_model
+    if "SKU Item" not in working.columns:
+        working["SKU Item"] = pid
+    if "Product Name" not in working.columns:
+        working["Product Name"] = product_name
+    if "Brand" not in working.columns:
+        working["Brand"] = brand
+    if "Retailer" not in working.columns:
+        working["Retailer"] = "Dyson"
+    if "Source" not in working.columns:
+        working["Source"] = "Dyson"
+    if "Moderation Status" not in working.columns:
+        working["Moderation Status"] = "APPROVED"
+    if "Review ID" not in working.columns:
+        working["Review ID"] = [f"dyson__{pid}__{review_offset + idx + 1}" for idx in range(len(working))]
+    normalized = normalize_uploaded_df(working, source_name=source_path.name, include_local_symptomization=False)
+    normalized["product_id"] = normalized["product_id"].astype("string").fillna("").str.strip().replace({"": pid})
+    normalized["base_sku"] = normalized["base_sku"].astype("string").fillna("").str.strip().replace({"": base_model})
+    normalized["sku_item"] = normalized["sku_item"].astype("string").fillna("").str.strip().replace({"": pid})
+    normalized["original_product_name"] = normalized["original_product_name"].astype("string").fillna("").str.strip().replace({"": product_name})
+    normalized["brand_raw"] = normalized.get("brand_raw", pd.Series(pd.NA, index=normalized.index)).astype("string").fillna("").str.strip().replace({"": brand})
+    normalized["retailer"] = normalized["retailer"].astype("string").fillna("").str.strip().replace({"": "Dyson"})
+    normalized["source_system"] = "Dyson Uploaded File"
+    normalized["source_file"] = source_path.name
+    return finalize_df(normalized)
 
 
 def _lookup_frame(catalog: pd.DataFrame, key_col: str) -> pd.DataFrame:
@@ -486,6 +783,37 @@ def _sanitize_sql_label(value: str) -> str:
     return '"' + str(value).replace('"', '""') + '"'
 
 
+def _ensure_table_has_columns(conn: sqlite3.Connection, table_name: str, columns: Sequence[str]) -> None:
+    existing = set(_table_columns(conn, table_name))
+    for column in columns:
+        label = str(column)
+        if label in existing:
+            continue
+        conn.execute(f"ALTER TABLE {_sanitize_sql_label(table_name)} ADD COLUMN {_sanitize_sql_label(label)}")
+        existing.add(label)
+
+
+def _append_value_filter(where_parts: List[str], params: Dict[str, Any], column: str, values: Any, *, param_prefix: str) -> None:
+    normalized = _normalize_selection_values(values)
+    if not normalized:
+        return
+    placeholders: List[str] = []
+    for idx, value in enumerate(normalized):
+        key = f"{param_prefix}_{idx}"
+        params[key] = value
+        placeholders.append(f":{key}")
+    if len(placeholders) == 1:
+        where_parts.append(f"{column} = {placeholders[0]}")
+    else:
+        where_parts.append(f"{column} IN ({', '.join(placeholders)})")
+
+
+def _workspace_projection_columns(conn: sqlite3.Connection) -> List[str]:
+    columns = _table_columns(conn, "reviews_enriched")
+    projected = [col for col in columns if col not in _WORKSPACE_EXCLUDED_COLUMNS]
+    return projected or columns
+
+
 def _create_indexes(conn: sqlite3.Connection) -> None:
     index_sql = [
         "CREATE INDEX IF NOT EXISTS idx_reviews_review_id ON reviews_enriched(review_id)",
@@ -499,14 +827,19 @@ def _create_indexes(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_reviews_base_model_time ON reviews_enriched(base_model_number, submission_time DESC)",
         "CREATE INDEX IF NOT EXISTS idx_reviews_product_time ON reviews_enriched(product_id, submission_time DESC)",
         "CREATE INDEX IF NOT EXISTS idx_reviews_brand_category_time ON reviews_enriched(mapped_brand, mapped_category, mapped_subcategory, submission_time DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_reviews_selection_combo_time ON reviews_enriched(mapped_brand, mapped_category, mapped_subcategory, base_model_number, product_id, submission_time DESC)",
         "CREATE INDEX IF NOT EXISTS idx_reviews_brand_country_time ON reviews_enriched(mapped_brand, country, submission_time DESC)",
         "CREATE INDEX IF NOT EXISTS idx_reviews_moderation_bucket ON reviews_enriched(moderation_bucket)",
+        "CREATE INDEX IF NOT EXISTS idx_reviews_moderation_incent_time ON reviews_enriched(moderation_bucket, incentivized_review, submission_time DESC)",
         "CREATE INDEX IF NOT EXISTS idx_reviews_review_origin_group ON reviews_enriched(review_origin_group)",
         "CREATE INDEX IF NOT EXISTS idx_reviews_country ON reviews_enriched(country)",
         "CREATE INDEX IF NOT EXISTS idx_catalog_sku_key ON sku_catalog(sku_key)",
         "CREATE INDEX IF NOT EXISTS idx_catalog_master_key ON sku_catalog(master_item_key)",
         "CREATE INDEX IF NOT EXISTS idx_base_model_directory_base_model ON base_model_directory(base_model_number)",
+        "CREATE INDEX IF NOT EXISTS idx_base_model_directory_filters ON base_model_directory(mapped_brand, mapped_category, mapped_subcategory, base_model_number)",
         "CREATE INDEX IF NOT EXISTS idx_product_directory_base_model ON product_directory(base_model_number)",
+        "CREATE INDEX IF NOT EXISTS idx_product_directory_product_id ON product_directory(product_id)",
+        "CREATE INDEX IF NOT EXISTS idx_product_directory_filters ON product_directory(mapped_brand, mapped_category, mapped_subcategory, base_model_number, product_id)",
         "CREATE INDEX IF NOT EXISTS idx_product_directory_name ON product_directory(original_product_name)",
     ]
     for sql in index_sql:
@@ -569,18 +902,26 @@ def _rebuild_directory_tables(conn: sqlite3.Connection) -> None:
     )
 
 
-def _selection_label(*, base_model_number: str = "", mapped_brand: str = "", mapped_category: str = "", mapped_subcategory: str = "", product_id: str = "") -> str:
+def _selection_label(*, base_model_number: Any = None, mapped_brand: Any = None, mapped_category: Any = None, mapped_subcategory: Any = None, product_id: Any = None) -> str:
+    def _label(values: Any) -> str:
+        normalized = _normalize_selection_values(values)
+        if not normalized:
+            return ""
+        if len(normalized) <= 2:
+            return ", ".join(normalized)
+        return f"{normalized[0]} +{len(normalized) - 1} more"
+
     parts = []
-    if base_model_number:
-        parts.append(base_model_number)
-    if product_id:
-        parts.append(product_id)
-    if mapped_brand:
-        parts.append(mapped_brand)
-    if mapped_category:
-        parts.append(mapped_category)
-    if mapped_subcategory:
-        parts.append(mapped_subcategory)
+    if _label(base_model_number):
+        parts.append(_label(base_model_number))
+    if _label(product_id):
+        parts.append(_label(product_id))
+    if _label(mapped_brand):
+        parts.append(_label(mapped_brand))
+    if _label(mapped_category):
+        parts.append(_label(mapped_category))
+    if _label(mapped_subcategory):
+        parts.append(_label(mapped_subcategory))
     return " · ".join(parts) if parts else "Central review database"
 
 
@@ -604,21 +945,21 @@ def _manifest_token(status: Dict[str, Any]) -> str:
 def _workspace_cache_key(
     *,
     status: Dict[str, Any],
-    base_model_number: str = "",
-    mapped_brand: str = "",
-    mapped_category: str = "",
-    mapped_subcategory: str = "",
-    product_id: str = "",
+    base_model_number: Any = None,
+    mapped_brand: Any = None,
+    mapped_category: Any = None,
+    mapped_subcategory: Any = None,
+    product_id: Any = None,
     limit_rows: Optional[int] = None,
 ) -> str:
     payload = {
         "manifest_token": _manifest_token(status),
         "selection": {
-            "base_model_number": _safe_text(base_model_number),
-            "mapped_brand": _safe_text(mapped_brand),
-            "mapped_category": _safe_text(mapped_category),
-            "mapped_subcategory": _safe_text(mapped_subcategory),
-            "product_id": _safe_text(product_id),
+            "base_model_number": _selection_payload(base_model_number),
+            "mapped_brand": _selection_payload(mapped_brand),
+            "mapped_category": _selection_payload(mapped_category),
+            "mapped_subcategory": _selection_payload(mapped_subcategory),
+            "product_id": _selection_payload(product_id),
             "limit_rows": int(limit_rows) if limit_rows is not None else None,
         },
     }
@@ -629,11 +970,11 @@ def _workspace_cache_key(
 def _workspace_cache_path(
     status: Dict[str, Any],
     *,
-    base_model_number: str = "",
-    mapped_brand: str = "",
-    mapped_category: str = "",
-    mapped_subcategory: str = "",
-    product_id: str = "",
+    base_model_number: Any = None,
+    mapped_brand: Any = None,
+    mapped_category: Any = None,
+    mapped_subcategory: Any = None,
+    product_id: Any = None,
     limit_rows: Optional[int] = None,
 ) -> Path:
     dirs = ensure_local_review_db_dirs(status.get("root") or None)
@@ -783,6 +1124,29 @@ def _rank_entity_search_results(rows: Sequence[Dict[str, Any]], *, query: str, l
     return ranked[: max(1, int(limit or 25))]
 
 
+def _status_paths(items: Sequence[Dict[str, Any]]) -> List[Path]:
+    paths: List[Path] = []
+    for item in items or []:
+        path_text = _safe_text((item or {}).get("path"))
+        if not path_text:
+            continue
+        path = Path(path_text)
+        if path.exists():
+            paths.append(path)
+    return _dedupe_paths(paths)
+
+
+def _is_dyson_source_file(path: Path, *, relative_path: str = "") -> bool:
+    rel = _safe_text(relative_path).replace("\\", "/").lower()
+    name = path.name.lower()
+    parts = {part.lower() for part in path.parts}
+    if f"/{_DYSON_SUBDIR}/" in rel or rel.startswith(f"{_DYSON_SUBDIR}/"):
+        return True
+    if name.startswith(f"{_DYSON_SUBDIR}__") or _DYSON_SUBDIR in name:
+        return True
+    return _DYSON_SUBDIR in parts
+
+
 def sync_local_review_database(
     root: Optional[str] = None,
     *,
@@ -792,10 +1156,16 @@ def sync_local_review_database(
     export_snapshot: bool = False,
 ) -> Dict[str, Any]:
     status = discover_latest_local_sources(root)
-    review_file = Path(status["review_file"]["path"]) if status["review_file"].get("path") else None
-    mapping_file = Path(status["mapping_file"]["path"]) if status["mapping_file"].get("path") else None
-    if review_file is None or mapping_file is None:
-        raise ValueError("Add the latest review file into incoming/reviews and the latest master SKU file into incoming/sku_mapping first.")
+    review_infos = list(status.get("review_files") or [])
+    mapping_infos = list(status.get("mapping_files") or [])
+    review_paths = _status_paths(review_infos)
+    mapping_paths = _status_paths(mapping_infos)
+    dyson_review_paths = _status_paths(status.get("dyson_review_files") or [])
+    dyson_mapping_paths = _status_paths(status.get("dyson_mapping_files") or [])
+    if not review_paths or not mapping_paths:
+        raise ValueError("Add at least one review export into incoming/reviews and at least one SKU mapping workbook into incoming/sku_mapping first.")
+    if dyson_review_paths and not dyson_mapping_paths:
+        raise ValueError("Dyson review files were detected. Add the Dyson product mapping workbook into incoming/sku_mapping/dyson before syncing.")
 
     db_path = status["db_path"]
     with _connect(db_path) as conn:
@@ -806,8 +1176,26 @@ def sync_local_review_database(
             result["message"] = "The local review database is already in sync with the latest files."
             return result
 
-    _maybe_report(progress_callback, progress=0.05, title="Reading master SKU mapping", detail=f"Loading {mapping_file.name} and preparing the product catalog.")
-    catalog_df = load_master_sku_catalog(str(mapping_file))
+    standard_catalog_frames: List[pd.DataFrame] = []
+    dyson_catalog_frames: List[pd.DataFrame] = []
+    total_mapping_sources = max(len(mapping_infos), 1)
+    for mapping_index, info in enumerate(mapping_infos, start=1):
+        mapping_path = Path(info.get("path") or "")
+        if not mapping_path.exists():
+            continue
+        is_dyson = _is_dyson_source_file(mapping_path, relative_path=_safe_text(info.get("relative_path")))
+        progress = 0.03 + (0.09 * (mapping_index / total_mapping_sources))
+        title = "Reading Dyson mapping" if is_dyson else "Reading master SKU mapping"
+        detail = f"Loading {mapping_path.name} ({mapping_index}/{total_mapping_sources}) and preparing the product catalog."
+        _maybe_report(progress_callback, progress=progress, title=title, detail=detail)
+        frame = load_dyson_product_catalog(str(mapping_path)) if is_dyson else load_master_sku_catalog(str(mapping_path))
+        if is_dyson:
+            dyson_catalog_frames.append(frame)
+        else:
+            standard_catalog_frames.append(frame)
+
+    catalog_df = _combine_catalog_frames([*standard_catalog_frames, *dyson_catalog_frames])
+    dyson_catalog_lookup = _dyson_catalog_by_pid(_combine_catalog_frames(dyson_catalog_frames))
 
     with _connect(db_path) as conn:
         conn.execute("DROP TABLE IF EXISTS sku_catalog")
@@ -819,20 +1207,40 @@ def sync_local_review_database(
         total_reviews = 0
         mapped_reviews = 0
         first_chunk = True
-        source_name = review_file.name
-        _maybe_report(progress_callback, progress=0.12, title="Ingesting reviews", detail=f"Streaming {review_file.name} into the local SQLite database.")
-        for chunk_index, raw_chunk in enumerate(_iter_tabular_chunks(str(review_file), chunk_size=chunk_size), start=1):
-            normalized = normalize_uploaded_df(raw_chunk, source_name=source_name, include_local_symptomization=True)
-            enriched = enrich_reviews_with_catalog(normalized, catalog_df)
-            total_reviews += len(enriched)
-            mapped_reviews += int(enriched["catalog_match_type"].notna().sum()) if "catalog_match_type" in enriched.columns else 0
-            enriched.to_sql("reviews_enriched", conn, if_exists="replace" if first_chunk else "append", index=False, chunksize=5000)
-            first_chunk = False
-            if total_reviews:
-                progress = 0.12 + min(0.58, 0.58 * (chunk_index / max(chunk_index + 2, 1)))
-            else:
-                progress = 0.12
-            _maybe_report(progress_callback, progress=progress, title="Ingesting reviews", detail=f"Loaded {total_reviews:,} review rows so far across {chunk_index:,} chunk(s).")
+        total_review_sources = max(len(review_infos), 1)
+        total_chunks_loaded = 0
+        for source_index, info in enumerate(review_infos, start=1):
+            review_path = Path(info.get("path") or "")
+            if not review_path.exists():
+                continue
+            is_dyson = _is_dyson_source_file(review_path, relative_path=_safe_text(info.get("relative_path")))
+            source_label = review_path.name
+            source_window_start = 0.12 + 0.58 * ((source_index - 1) / total_review_sources)
+            source_window_end = 0.12 + 0.58 * (source_index / total_review_sources)
+            ingest_label = "Ingesting Dyson reviews" if is_dyson else "Ingesting reviews"
+            _maybe_report(progress_callback, progress=source_window_start, title=ingest_label, detail=f"Streaming {source_label} ({source_index}/{total_review_sources}) into the local SQLite database.")
+            dyson_catalog_row = dyson_catalog_lookup.get(_dyson_pid_from_filename(review_path), {}) if is_dyson else {}
+            for source_chunk_index, raw_chunk in enumerate(_iter_tabular_chunks(str(review_path), chunk_size=chunk_size), start=1):
+                if is_dyson:
+                    normalized = normalize_dyson_review_chunk(raw_chunk, source_path=review_path, catalog_row=dyson_catalog_row)
+                else:
+                    normalized = normalize_uploaded_df(raw_chunk, source_name=source_label, include_local_symptomization=True)
+                enriched = enrich_reviews_with_catalog(normalized, catalog_df)
+                total_reviews += len(enriched)
+                mapped_reviews += int(enriched["catalog_match_type"].notna().sum()) if "catalog_match_type" in enriched.columns else 0
+                if not first_chunk:
+                    _ensure_table_has_columns(conn, "reviews_enriched", list(enriched.columns))
+                enriched.to_sql("reviews_enriched", conn, if_exists="replace" if first_chunk else "append", index=False, chunksize=20000)
+                first_chunk = False
+                total_chunks_loaded += 1
+                chunk_fraction = source_chunk_index / max(source_chunk_index + 1, 1)
+                progress = source_window_start + ((source_window_end - source_window_start) * min(chunk_fraction, 0.92))
+                _maybe_report(
+                    progress_callback,
+                    progress=progress,
+                    title=ingest_label,
+                    detail=f"Loaded {total_reviews:,} review rows so far across {total_chunks_loaded:,} chunk(s). Current source: {source_label}.",
+                )
 
         if first_chunk:
             empty = finalize_df(pd.DataFrame())
@@ -891,6 +1299,29 @@ def sync_local_review_database(
                 json.dumps({
                     "catalog_rows": int(len(catalog_df)),
                     "chunk_size": int(chunk_size),
+                    "source_signature": _safe_text(status.get("source_signature")),
+                    "review_source_count": int(status.get("review_source_count") or 0),
+                    "mapping_source_count": int(status.get("mapping_source_count") or 0),
+                    "dyson_review_count": int(status.get("dyson_review_count") or 0),
+                    "dyson_mapping_count": int(status.get("dyson_mapping_count") or 0),
+                    "review_files": [
+                        {
+                            "name": _safe_text(item.get("name")),
+                            "relative_path": _safe_text(item.get("relative_path")),
+                            "size": int(item.get("size") or 0),
+                            "mtime": float(item.get("mtime") or 0.0),
+                        }
+                        for item in review_infos
+                    ],
+                    "mapping_files": [
+                        {
+                            "name": _safe_text(item.get("name")),
+                            "relative_path": _safe_text(item.get("relative_path")),
+                            "size": int(item.get("size") or 0),
+                            "mtime": float(item.get("mtime") or 0.0),
+                        }
+                        for item in mapping_infos
+                    ],
                 }, ensure_ascii=False, sort_keys=True),
             ),
         )
@@ -901,106 +1332,141 @@ def sync_local_review_database(
         except Exception:
             pass
 
-    _maybe_report(progress_callback, progress=1.0, title="Local database ready", detail=f"Synced {review_count:,} reviews across {base_model_count:,} base models.")
+    source_suffix = ""
+    if int(status.get("dyson_review_count") or 0) > 0:
+        source_suffix = f" including {int(status.get('dyson_review_count') or 0):,} Dyson review file(s)"
+    _maybe_report(progress_callback, progress=1.0, title="Local database ready", detail=f"Synced {review_count:,} reviews across {base_model_count:,} base models{source_suffix}.")
     result = get_local_review_db_status(root)
-    result["message"] = f"Synced {review_count:,} reviews into the local review database."
+    result["message"] = f"Synced {review_count:,} reviews into the local review database{source_suffix}."
     result["skipped"] = False
     return result
 
 
 def _selection_sql(
     *,
-    base_model_number: str = "",
-    mapped_brand: str = "",
-    mapped_category: str = "",
-    mapped_subcategory: str = "",
-    product_id: str = "",
+    base_model_number: Any = None,
+    mapped_brand: Any = None,
+    mapped_category: Any = None,
+    mapped_subcategory: Any = None,
+    product_id: Any = None,
 ) -> Tuple[str, Dict[str, Any]]:
     where_parts: List[str] = []
     params: Dict[str, Any] = {}
-    if _safe_text(base_model_number):
-        where_parts.append("base_model_number = :base_model_number")
-        params["base_model_number"] = _safe_text(base_model_number)
-    if _safe_text(mapped_brand):
-        where_parts.append("mapped_brand = :mapped_brand")
-        params["mapped_brand"] = _safe_text(mapped_brand)
-    if _safe_text(mapped_category):
-        where_parts.append("mapped_category = :mapped_category")
-        params["mapped_category"] = _safe_text(mapped_category)
-    if _safe_text(mapped_subcategory):
-        where_parts.append("mapped_subcategory = :mapped_subcategory")
-        params["mapped_subcategory"] = _safe_text(mapped_subcategory)
-    if _safe_text(product_id):
-        where_parts.append("product_id = :product_id")
-        params["product_id"] = _safe_text(product_id)
+    _append_value_filter(where_parts, params, "base_model_number", base_model_number, param_prefix="base_model_number")
+    _append_value_filter(where_parts, params, "mapped_brand", mapped_brand, param_prefix="mapped_brand")
+    _append_value_filter(where_parts, params, "mapped_category", mapped_category, param_prefix="mapped_category")
+    _append_value_filter(where_parts, params, "mapped_subcategory", mapped_subcategory, param_prefix="mapped_subcategory")
+    _append_value_filter(where_parts, params, "product_id", product_id, param_prefix="product_id")
     where_sql = " AND ".join(where_parts)
     return where_sql, params
+
+
+def _directory_option_values(
+    conn: sqlite3.Connection,
+    *,
+    column: str,
+    mapped_brand: Any = None,
+    mapped_category: Any = None,
+    mapped_subcategory: Any = None,
+    base_model_number: Any = None,
+    product_id: Any = None,
+    exclude_field: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> List[str]:
+    where_parts = [f"{column} IS NOT NULL", f"TRIM({column}) <> ''"]
+    params: Dict[str, Any] = {}
+    filter_items = [
+        ("mapped_brand", mapped_brand),
+        ("mapped_category", mapped_category),
+        ("mapped_subcategory", mapped_subcategory),
+        ("base_model_number", base_model_number),
+        ("product_id", product_id),
+    ]
+    for field_name, values in filter_items:
+        if field_name == exclude_field:
+            continue
+        _append_value_filter(where_parts, params, field_name, values, param_prefix=field_name)
+    sql = f"SELECT {column} AS option_value, SUM(review_count) AS total_reviews FROM product_directory"
+    if where_parts:
+        sql += " WHERE " + " AND ".join(where_parts)
+    sql += f" GROUP BY {column} ORDER BY total_reviews DESC, {column}"
+    if limit is not None and int(limit) > 0:
+        sql += f" LIMIT {int(limit)}"
+    return [str(row[0]) for row in conn.execute(sql, params).fetchall()]
 
 
 def get_local_review_db_filter_options(
     root: Optional[str] = None,
     *,
-    mapped_brand: str = "",
-    mapped_category: str = "",
-    mapped_subcategory: str = "",
-    base_model_number: str = "",
+    mapped_brand: Any = None,
+    mapped_category: Any = None,
+    mapped_subcategory: Any = None,
+    base_model_number: Any = None,
+    product_id: Any = None,
 ) -> Dict[str, List[str]]:
     status = get_local_review_db_status(root)
     if not status.get("is_ready"):
         return {"mapped_brand": [], "mapped_category": [], "mapped_subcategory": [], "base_model_number": [], "product_id": []}
     db_path = status["db_path"]
     with _connect(db_path) as conn:
-        brands = [str(row[0]) for row in conn.execute("SELECT DISTINCT mapped_brand FROM base_model_directory WHERE mapped_brand IS NOT NULL AND TRIM(mapped_brand) <> '' ORDER BY mapped_brand").fetchall()]
-        if _safe_text(mapped_brand):
-            categories = [
-                str(row[0]) for row in conn.execute(
-                    "SELECT DISTINCT mapped_category FROM base_model_directory WHERE mapped_brand = ? AND mapped_category IS NOT NULL AND TRIM(mapped_category) <> '' ORDER BY mapped_category",
-                    (_safe_text(mapped_brand),),
-                ).fetchall()
-            ]
-        else:
-            categories = [str(row[0]) for row in conn.execute("SELECT DISTINCT mapped_category FROM base_model_directory WHERE mapped_category IS NOT NULL AND TRIM(mapped_category) <> '' ORDER BY mapped_category").fetchall()]
-        subcat_sql = "SELECT DISTINCT mapped_subcategory FROM base_model_directory WHERE mapped_subcategory IS NOT NULL AND TRIM(mapped_subcategory) <> ''"
-        subcat_params: List[Any] = []
-        if _safe_text(mapped_brand):
-            subcat_sql += " AND mapped_brand = ?"
-            subcat_params.append(_safe_text(mapped_brand))
-        if _safe_text(mapped_category):
-            subcat_sql += " AND mapped_category = ?"
-            subcat_params.append(_safe_text(mapped_category))
-        subcat_sql += " ORDER BY mapped_subcategory"
-        subcategories = [str(row[0]) for row in conn.execute(subcat_sql, tuple(subcat_params)).fetchall()]
-
-        base_sql = "SELECT base_model_number FROM base_model_directory WHERE base_model_number IS NOT NULL AND TRIM(base_model_number) <> ''"
-        base_params: List[Any] = []
-        if _safe_text(mapped_brand):
-            base_sql += " AND mapped_brand = ?"
-            base_params.append(_safe_text(mapped_brand))
-        if _safe_text(mapped_category):
-            base_sql += " AND mapped_category = ?"
-            base_params.append(_safe_text(mapped_category))
-        if _safe_text(mapped_subcategory):
-            base_sql += " AND mapped_subcategory = ?"
-            base_params.append(_safe_text(mapped_subcategory))
-        base_sql += " GROUP BY base_model_number ORDER BY SUM(review_count) DESC, base_model_number LIMIT 5000"
-        base_models = [str(row[0]) for row in conn.execute(base_sql, tuple(base_params)).fetchall()]
-
-        product_sql = "SELECT product_id FROM product_directory WHERE product_id IS NOT NULL AND TRIM(product_id) <> ''"
-        product_params: List[Any] = []
-        if _safe_text(base_model_number):
-            product_sql += " AND base_model_number = ?"
-            product_params.append(_safe_text(base_model_number))
-        if _safe_text(mapped_brand):
-            product_sql += " AND mapped_brand = ?"
-            product_params.append(_safe_text(mapped_brand))
-        if _safe_text(mapped_category):
-            product_sql += " AND mapped_category = ?"
-            product_params.append(_safe_text(mapped_category))
-        if _safe_text(mapped_subcategory):
-            product_sql += " AND mapped_subcategory = ?"
-            product_params.append(_safe_text(mapped_subcategory))
-        product_sql += " GROUP BY product_id ORDER BY SUM(review_count) DESC, product_id LIMIT 5000"
-        products = [str(row[0]) for row in conn.execute(product_sql, tuple(product_params)).fetchall()]
+        try:
+            brands = _directory_option_values(
+                conn,
+                column="mapped_brand",
+                mapped_brand=mapped_brand,
+                mapped_category=mapped_category,
+                mapped_subcategory=mapped_subcategory,
+                base_model_number=base_model_number,
+                product_id=product_id,
+                exclude_field="mapped_brand",
+                limit=5000,
+            )
+            categories = _directory_option_values(
+                conn,
+                column="mapped_category",
+                mapped_brand=mapped_brand,
+                mapped_category=mapped_category,
+                mapped_subcategory=mapped_subcategory,
+                base_model_number=base_model_number,
+                product_id=product_id,
+                exclude_field="mapped_category",
+                limit=5000,
+            )
+            subcategories = _directory_option_values(
+                conn,
+                column="mapped_subcategory",
+                mapped_brand=mapped_brand,
+                mapped_category=mapped_category,
+                mapped_subcategory=mapped_subcategory,
+                base_model_number=base_model_number,
+                product_id=product_id,
+                exclude_field="mapped_subcategory",
+                limit=5000,
+            )
+            base_models = _directory_option_values(
+                conn,
+                column="base_model_number",
+                mapped_brand=mapped_brand,
+                mapped_category=mapped_category,
+                mapped_subcategory=mapped_subcategory,
+                base_model_number=base_model_number,
+                product_id=product_id,
+                exclude_field="base_model_number",
+                limit=5000,
+            )
+            products = _directory_option_values(
+                conn,
+                column="product_id",
+                mapped_brand=mapped_brand,
+                mapped_category=mapped_category,
+                mapped_subcategory=mapped_subcategory,
+                base_model_number=base_model_number,
+                product_id=product_id,
+                exclude_field="product_id",
+                limit=5000,
+            )
+        except sqlite3.OperationalError:
+            return {"mapped_brand": [], "mapped_category": [], "mapped_subcategory": [], "base_model_number": [], "product_id": []}
     return {
         "mapped_brand": brands,
         "mapped_category": categories,
@@ -1013,11 +1479,11 @@ def get_local_review_db_filter_options(
 def count_local_review_db_selection(
     root: Optional[str] = None,
     *,
-    base_model_number: str = "",
-    mapped_brand: str = "",
-    mapped_category: str = "",
-    mapped_subcategory: str = "",
-    product_id: str = "",
+    base_model_number: Any = None,
+    mapped_brand: Any = None,
+    mapped_category: Any = None,
+    mapped_subcategory: Any = None,
+    product_id: Any = None,
 ) -> int:
     status = get_local_review_db_status(root)
     if not status.get("is_ready"):
@@ -1029,20 +1495,24 @@ def count_local_review_db_selection(
         mapped_subcategory=mapped_subcategory,
         product_id=product_id,
     )
-    sql = "SELECT COUNT(*) FROM reviews_enriched" + (f" WHERE {where_sql}" if where_sql else "")
+    sql = "SELECT COALESCE(SUM(review_count), 0) FROM product_directory" + (f" WHERE {where_sql}" if where_sql else "")
     with _connect(status["db_path"]) as conn:
-        value = conn.execute(sql, params).fetchone()[0]
+        try:
+            value = conn.execute(sql, params).fetchone()[0]
+        except sqlite3.OperationalError:
+            fallback_sql = "SELECT COUNT(*) FROM reviews_enriched" + (f" WHERE {where_sql}" if where_sql else "")
+            value = conn.execute(fallback_sql, params).fetchone()[0]
     return int(value or 0)
 
 
 def load_local_review_workspace(
     root: Optional[str] = None,
     *,
-    base_model_number: str = "",
-    mapped_brand: str = "",
-    mapped_category: str = "",
-    mapped_subcategory: str = "",
-    product_id: str = "",
+    base_model_number: Any = None,
+    mapped_brand: Any = None,
+    mapped_category: Any = None,
+    mapped_subcategory: Any = None,
+    product_id: Any = None,
     limit_rows: Optional[int] = None,
 ) -> Dict[str, Any]:
     status = get_local_review_db_status(root)
@@ -1085,14 +1555,19 @@ def load_local_review_workspace(
         product_id=product_id,
     )
     count_sql = "SELECT COUNT(*) FROM reviews_enriched" + (f" WHERE {where_sql}" if where_sql else "")
-    select_sql = "SELECT * FROM reviews_enriched" + (f" WHERE {where_sql}" if where_sql else "") + " ORDER BY submission_time DESC, review_id DESC"
-    if limit_rows is not None and int(limit_rows) > 0:
-        select_sql += f" LIMIT {int(limit_rows)}"
-
     with _connect(status["db_path"]) as conn:
-        total_count = int(conn.execute(count_sql, params).fetchone()[0] or 0)
+        try:
+            total_count = int((conn.execute("SELECT COALESCE(SUM(review_count), 0) FROM product_directory" + (f" WHERE {where_sql}" if where_sql else ""), params).fetchone() or [0])[0] or 0)
+        except sqlite3.OperationalError:
+            total_count = 0
+        if total_count <= 0:
+            total_count = int(conn.execute(count_sql, params).fetchone()[0] or 0)
         if total_count <= 0:
             raise ValueError("No reviews match the current local database selection.")
+        projected_columns = _workspace_projection_columns(conn)
+        select_sql = "SELECT " + ", ".join(_sanitize_sql_label(col) for col in projected_columns) + " FROM reviews_enriched" + (f" WHERE {where_sql}" if where_sql else "") + " ORDER BY submission_time DESC, review_id DESC"
+        if limit_rows is not None and int(limit_rows) > 0:
+            select_sql += f" LIMIT {int(limit_rows)}"
         df = pd.read_sql_query(select_sql, conn, params=params)
     df = finalize_df(df)
     label = _selection_label(
@@ -1104,7 +1579,7 @@ def load_local_review_workspace(
     )
     summary = ReviewBatchSummary(
         product_url="",
-        product_id=base_model_number or product_id or mapped_category or "LOCAL_REVIEW_DATABASE",
+        product_id=_primary_selection_value(base_model_number) or _primary_selection_value(product_id) or _primary_selection_value(mapped_category) or "LOCAL_REVIEW_DATABASE",
         total_reviews=total_count,
         page_size=max(len(df), 1),
         requests_needed=0,
@@ -1114,11 +1589,11 @@ def load_local_review_workspace(
         {
             "db_path": status["db_path"],
             "selection": {
-                "base_model_number": _safe_text(base_model_number),
-                "mapped_brand": _safe_text(mapped_brand),
-                "mapped_category": _safe_text(mapped_category),
-                "mapped_subcategory": _safe_text(mapped_subcategory),
-                "product_id": _safe_text(product_id),
+                "base_model_number": _selection_payload(base_model_number),
+                "mapped_brand": _selection_payload(mapped_brand),
+                "mapped_category": _selection_payload(mapped_category),
+                "mapped_subcategory": _selection_payload(mapped_subcategory),
+                "product_id": _selection_payload(product_id),
                 "limit_rows": int(limit_rows) if limit_rows is not None else None,
             },
             "manifest_id": (status.get("manifest") or {}).get("manifest_id"),
@@ -1135,11 +1610,11 @@ def load_local_review_workspace(
         "source_root": status["root"],
         "source_signature": source_signature,
         "selection": {
-            "base_model_number": _safe_text(base_model_number),
-            "mapped_brand": _safe_text(mapped_brand),
-            "mapped_category": _safe_text(mapped_category),
-            "mapped_subcategory": _safe_text(mapped_subcategory),
-            "product_id": _safe_text(product_id),
+            "base_model_number": _selection_payload(base_model_number),
+            "mapped_brand": _selection_payload(mapped_brand),
+            "mapped_category": _selection_payload(mapped_category),
+            "mapped_subcategory": _selection_payload(mapped_subcategory),
+            "product_id": _selection_payload(product_id),
             "limit_rows": int(limit_rows) if limit_rows is not None else None,
             "total_count": total_count,
             "cache_hit": False,
@@ -1164,11 +1639,11 @@ def load_local_review_analytics_frame(
     root: Optional[str] = None,
     *,
     columns: Optional[Sequence[str]] = None,
-    base_model_number: str = "",
-    mapped_brand: str = "",
-    mapped_category: str = "",
-    mapped_subcategory: str = "",
-    product_id: str = "",
+    base_model_number: Any = None,
+    mapped_brand: Any = None,
+    mapped_category: Any = None,
+    mapped_subcategory: Any = None,
+    product_id: Any = None,
     moderation_buckets: Optional[Sequence[str]] = None,
     organic_only: bool = False,
     brand_values: Optional[Sequence[str]] = None,

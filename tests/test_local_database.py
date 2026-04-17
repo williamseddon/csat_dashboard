@@ -116,6 +116,46 @@ def _write_reviews(path: Path) -> None:
     ).to_csv(path, index=False)
 
 
+def _write_dyson_mapping(path: Path) -> None:
+    pd.DataFrame(
+        [
+            {
+                "PID": "sv53-fluffyoptic-coco",
+                "Product Name": "V12s Detect Submarine Fluffy Optic (Copper/Copper)",
+                "Category": "Vacuum Cleaners",
+                "Sub-Category": "Cordless Stick",
+                "Model Code": "SV53",
+                "Color Variant": "Copper/Copper",
+            },
+            {
+                "PID": "tp07-whsv",
+                "Product Name": "Purifier Cool Tower (White/Silver)",
+                "Category": "Air Treatment",
+                "Sub-Category": "Tower Purifier / Fan",
+                "Model Code": "TP07",
+                "Color Variant": "White/Silver",
+            },
+        ]
+    ).to_excel(path, index=False)
+
+
+def _write_dyson_reviews(path: Path, *, locale: str, rows: list[dict]) -> None:
+    payload = []
+    for item in rows:
+        payload.append(
+            {
+                "title": item.get("title"),
+                "rating": item.get("rating"),
+                "date": item.get("date"),
+                "content": item.get("content"),
+                "verification": item.get("verification", "verifiedPurchaser"),
+                "incentivized": item.get("incentivized", False),
+                "locale": locale,
+            }
+        )
+    pd.DataFrame(payload).to_excel(path, index=False)
+
+
 
 def test_normalize_uploaded_df_prefers_product_id_and_parses_merged_review_aliases():
     raw = pd.DataFrame(
@@ -176,6 +216,94 @@ def test_local_database_sync_builds_base_model_directory_and_loads_slice(tmp_pat
     assert set(df["product_id"].astype(str)) == {"HD436SLUK", "XSKWCOMB400EU"}
     assert set(df["mapped_subcategory"].astype(str)) == {"Stylers", "Accessories"}
     assert set(df["catalog_match_type"].astype(str)) == {"product_to_sku"}
+
+
+def test_local_database_supports_multiselect_filters_and_full_selection_counts(tmp_path: Path):
+    dirs = ensure_local_review_db_dirs(str(tmp_path))
+    _write_mapping(Path(dirs["mapping_dir"]) / "master_mapping.xlsx")
+    _write_reviews(Path(dirs["reviews_dir"]) / "merged_reviews.csv")
+
+    sync_local_review_database(str(tmp_path), force=True)
+
+    options = get_local_review_db_filter_options(
+        str(tmp_path),
+        mapped_brand=["Shark", "Ninja"],
+        mapped_category=["Hair Care", "Beverage"],
+    )
+    assert "HD400" in options["base_model_number"]
+    assert "DB300" in options["base_model_number"]
+
+    count = count_local_review_db_selection(
+        str(tmp_path),
+        mapped_brand=["Shark", "Ninja"],
+        mapped_category=["Hair Care", "Beverage"],
+    )
+    assert count == 3
+
+    shark_and_hd400 = load_local_review_workspace(
+        str(tmp_path),
+        mapped_brand=["Shark"],
+        base_model_number=["HD400"],
+        limit_rows=None,
+    )
+    assert len(shark_and_hd400["reviews_df"]) == 2
+    assert set(shark_and_hd400["reviews_df"]["base_model_number"].astype(str)) == {"HD400"}
+
+
+def test_local_database_sync_includes_dyson_review_subfolder_and_mapping(tmp_path: Path):
+    dirs = ensure_local_review_db_dirs(str(tmp_path))
+    _write_mapping(Path(dirs["mapping_dir"]) / "master_mapping.xlsx")
+    _write_reviews(Path(dirs["reviews_dir"]) / "merged_reviews.csv")
+    _write_dyson_mapping(Path(dirs["dyson_mapping_dir"]) / "dyson_product_mapping.xlsx")
+    _write_dyson_reviews(
+        Path(dirs["dyson_reviews_dir"]) / "dyson__sv53-fluffyoptic-coco.xlsx",
+        locale="en_CA",
+        rows=[
+            {
+                "title": "Great vacuum",
+                "rating": 5,
+                "date": "2026-04-04T17:09:25.000+00:00",
+                "content": "The light is amazing and suction is strong.",
+            },
+            {
+                "title": "Heavy but good",
+                "rating": 4,
+                "date": "2026-03-24T18:00:25.000+00:00",
+                "content": "Powerful but a little heavy.",
+            },
+        ],
+    )
+    _write_dyson_reviews(
+        Path(dirs["dyson_reviews_dir"]) / "dyson__tp07-whsv.xlsx",
+        locale="en_US",
+        rows=[
+            {
+                "title": "Quiet and efficient",
+                "rating": 5,
+                "date": "2026-02-09T17:07:12.000+00:00",
+                "content": "Very quiet purifier and the room feels fresher.",
+            }
+        ],
+    )
+
+    sync_result = sync_local_review_database(str(tmp_path), force=True)
+    assert "including 2 Dyson review file(s)" in sync_result.get("message", "")
+
+    options = get_local_review_db_filter_options(str(tmp_path))
+    assert "Dyson" in options["mapped_brand"]
+    assert "SV53" in options["base_model_number"]
+    assert "TP07" in options["base_model_number"]
+
+    dyson_only = load_local_review_workspace(str(tmp_path), mapped_brand=["Dyson"], limit_rows=None)
+    df = dyson_only["reviews_df"]
+    assert len(df) == 3
+    assert set(df["mapped_brand"].astype(str)) == {"Dyson"}
+    assert set(df["base_model_number"].astype(str)) == {"SV53", "TP07"}
+    assert set(df["mapped_category"].astype(str)) == {"Vacuum Cleaners", "Air Treatment"}
+    assert set(df["moderation_bucket"].astype(str)) == {"Approved"}
+    assert set(df["catalog_match_type"].astype(str)) == {"product_to_sku"}
+    assert df["review_id"].astype(str).is_unique
+    assert set(df["country"].astype(str)) == {"CA", "US"}
 
 
 

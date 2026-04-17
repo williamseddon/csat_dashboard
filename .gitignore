@@ -1,2 +1,5 @@
+.starwalk_data/
+*.sqlite3
+*.zip
 *.csv
 *.xlsx

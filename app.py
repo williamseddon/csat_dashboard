@@ -761,6 +761,52 @@ def _safe_text(v, default=""):
     return default if t.lower() in {"nan", "none", "null", "<na>"} else t
 
 
+def _selection_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set, pd.Index)):
+        items = list(value)
+    else:
+        text = _safe_text(value)
+        items = [text] if text else []
+    seen = set()
+    ordered = []
+    for item in items:
+        text = _safe_text(item)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+    return ordered
+
+
+def _selection_tuple(value):
+    return tuple(_selection_list(value))
+
+
+def _selection_payload(value):
+    values = _selection_list(value)
+    if not values:
+        return []
+    if len(values) == 1:
+        return values[0]
+    return values
+
+
+def _selection_first(value):
+    values = _selection_list(value)
+    return values[0] if values else ""
+
+
+def _selection_summary_label(value, *, empty_label="All"):
+    values = _selection_list(value)
+    if not values:
+        return empty_label
+    if len(values) <= 2:
+        return ", ".join(values)
+    return f"{values[0]} +{len(values) - 1} more"
+
+
 def _safe_int(v, d=0):
     try:
         return int(float(v))
@@ -6289,11 +6335,11 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
             "loaded_workspace_rows": int(len(overall_df)),
             "build_row_limit": int(dataset_selection.get("limit_rows") or 0) or None,
             "selection": {
-                "base_model_number": _safe_text(dataset_selection.get("base_model_number")),
-                "mapped_brand": _safe_text(dataset_selection.get("mapped_brand")),
-                "mapped_category": _safe_text(dataset_selection.get("mapped_category")),
-                "mapped_subcategory": _safe_text(dataset_selection.get("mapped_subcategory")),
-                "product_id": _safe_text(dataset_selection.get("product_id")),
+                "base_model_number": _selection_payload(dataset_selection.get("base_model_number")),
+                "mapped_brand": _selection_payload(dataset_selection.get("mapped_brand")),
+                "mapped_category": _selection_payload(dataset_selection.get("mapped_category")),
+                "mapped_subcategory": _selection_payload(dataset_selection.get("mapped_subcategory")),
+                "product_id": _selection_payload(dataset_selection.get("product_id")),
             },
             "note": "When matched_review_count is larger than loaded_workspace_rows, the interactive workspace is a performance-focused slice of the synced local database. Do not imply the loaded slice is the full corpus unless the counts match.",
         }
@@ -9715,12 +9761,13 @@ def _init_state():
         workspace_local_db_root=(lambda: (_ensure_local_review_db_dirs() or {}).get("root", "") if callable(_ensure_local_review_db_dirs) else "")(),
         workspace_local_db_auto_sync=True,
         workspace_local_db_export_snapshot=False,
-        workspace_local_db_selected_brand="",
-        workspace_local_db_selected_category="",
-        workspace_local_db_selected_subcategory="",
-        workspace_local_db_selected_base_model="",
-        workspace_local_db_selected_product_id="",
-        workspace_local_db_limit_rows=100000,
+        workspace_local_db_selected_brand=[],
+        workspace_local_db_selected_category=[],
+        workspace_local_db_selected_subcategory=[],
+        workspace_local_db_selected_base_model=[],
+        workspace_local_db_selected_product_id=[],
+        workspace_local_db_load_profile="All matched",
+        workspace_local_db_limit_rows=0,
         _workspace_last_uploaded_build_sig=None,
         _workspace_last_uploaded_build_error="",
         _workspace_loaded_source_signature="",
@@ -9987,7 +10034,7 @@ def _url_source_signature(product_url="", *, bulk_urls=None):
 
 
 
-def _local_db_source_signature(status=None, *, root="", base_model_number="", mapped_brand="", mapped_category="", mapped_subcategory="", product_id="", limit_rows=None):
+def _local_db_source_signature(status=None, *, root="", base_model_number=None, mapped_brand=None, mapped_category=None, mapped_subcategory=None, product_id=None, limit_rows=None):
     manifest = (status or {}).get("manifest") or {}
     payload = {
         "root": _safe_text(root) or _safe_text((status or {}).get("root")),
@@ -9995,11 +10042,11 @@ def _local_db_source_signature(status=None, *, root="", base_model_number="", ma
         "review_file_name": manifest.get("review_file_name"),
         "mapping_file_name": manifest.get("mapping_file_name"),
         "selection": {
-            "base_model_number": _safe_text(base_model_number),
-            "mapped_brand": _safe_text(mapped_brand),
-            "mapped_category": _safe_text(mapped_category),
-            "mapped_subcategory": _safe_text(mapped_subcategory),
-            "product_id": _safe_text(product_id),
+            "base_model_number": _selection_payload(base_model_number),
+            "mapped_brand": _selection_payload(mapped_brand),
+            "mapped_category": _selection_payload(mapped_category),
+            "mapped_subcategory": _selection_payload(mapped_subcategory),
+            "product_id": _selection_payload(product_id),
             "limit_rows": int(limit_rows) if limit_rows not in {None, "", 0, "0"} else None,
         },
     }
@@ -10033,11 +10080,11 @@ def _workspace_source_context_from_dataset(dataset):
         selection = dataset.get("selection") or {}
         signature = _safe_text(dataset.get("source_signature")).strip() or _local_db_source_signature(
             root=_safe_text(dataset.get("source_root")),
-            base_model_number=_safe_text(selection.get("base_model_number")),
-            mapped_brand=_safe_text(selection.get("mapped_brand")),
-            mapped_category=_safe_text(selection.get("mapped_category")),
-            mapped_subcategory=_safe_text(selection.get("mapped_subcategory")),
-            product_id=_safe_text(selection.get("product_id")),
+            base_model_number=selection.get("base_model_number"),
+            mapped_brand=selection.get("mapped_brand"),
+            mapped_category=selection.get("mapped_category"),
+            mapped_subcategory=selection.get("mapped_subcategory"),
+            product_id=selection.get("product_id"),
             limit_rows=selection.get("limit_rows"),
         )
         return {
@@ -10278,7 +10325,7 @@ def _build_workspace_from_uploaded_files(uploaded_files, *, include_local_sympto
 
 
 
-def _build_workspace_from_local_database(*, root="", base_model_number="", mapped_brand="", mapped_category="", mapped_subcategory="", product_id="", limit_rows=None, replace_current=False, source_signature=""):
+def _build_workspace_from_local_database(*, root="", base_model_number=None, mapped_brand=None, mapped_category=None, mapped_subcategory=None, product_id=None, limit_rows=None, replace_current=False, source_signature=""):
     if not callable(_load_local_review_workspace):
         raise RuntimeError("Local review database support is not available in this build.")
     progress_ui = _make_workspace_progress_reporter("Building workspace from local review database")
@@ -10296,12 +10343,25 @@ def _build_workspace_from_local_database(*, root="", base_model_number="", mappe
         except Exception:
             total_count = None
     planned_rows = min(int(limit_rows or 0), int(total_count or 0)) if (limit_rows and total_count) else int(limit_rows or total_count or 0)
-    selection_label = base_model_number or product_id or mapped_category or mapped_brand or "current local selection"
+    selection_label = (
+        _selection_summary_label(base_model_number, empty_label="")
+        or _selection_summary_label(product_id, empty_label="")
+        or _selection_summary_label(mapped_category, empty_label="")
+        or _selection_summary_label(mapped_brand, empty_label="")
+        or "current local selection"
+    )
     if total_count:
         progress_ui(
             progress=0.06,
             title="Resolving local selection",
-            detail=f"{selection_label} matches {int(total_count):,} reviews in the synced database. The interactive workspace will hydrate {int(planned_rows or total_count):,} newest rows to stay responsive.",
+            detail=(
+                f"{selection_label} matches {int(total_count):,} reviews in the synced database. "
+                + (
+                    f"The interactive workspace will hydrate all {int(total_count):,} matched rows."
+                    if not limit_rows
+                    else f"The interactive workspace will hydrate {int(planned_rows or total_count):,} newest rows to stay responsive."
+                )
+            ),
         )
     else:
         progress_ui(progress=0.06, title="Resolving local selection", detail="Checking the synced database, row counts, and any reusable cached extract for this slice.")
@@ -10327,7 +10387,7 @@ def _build_workspace_from_local_database(*, root="", base_model_number="", mappe
         title="Selection loaded",
         detail=(
             f"{loaded_rows:,} reviews are in memory now ({total_count:,} total matched). "
-            + (f"Reused the preloaded selection cache in {load_seconds:.1f}s." if cache_hit else f"Loaded directly from SQLite in {load_seconds:.1f}s and saved a reusable cache for next time.")
+            + (f"Reused the preloaded selection cache in {load_seconds:.1f}s." if cache_hit else f"Loaded directly from the slim SQLite workspace projection in {load_seconds:.1f}s and saved a reusable cache for next time.")
             + (f" Approx throughput: {read_rate:,.0f} rows/sec." if read_rate else "")
         ),
     )
@@ -11718,19 +11778,21 @@ def _cached_local_db_filter_options(
     root: str,
     manifest_id: str,
     *,
-    mapped_brand: str = "",
-    mapped_category: str = "",
-    mapped_subcategory: str = "",
-    base_model_number: str = "",
+    mapped_brand: Tuple[str, ...] = tuple(),
+    mapped_category: Tuple[str, ...] = tuple(),
+    mapped_subcategory: Tuple[str, ...] = tuple(),
+    base_model_number: Tuple[str, ...] = tuple(),
+    product_id: Tuple[str, ...] = tuple(),
 ) -> Dict[str, List[str]]:
     if not callable(_get_local_review_db_filter_options):
         return {"mapped_brand": [], "mapped_category": [], "mapped_subcategory": [], "base_model_number": [], "product_id": []}
     return _get_local_review_db_filter_options(
         root or None,
-        mapped_brand=mapped_brand,
-        mapped_category=mapped_category,
-        mapped_subcategory=mapped_subcategory,
-        base_model_number=base_model_number,
+        mapped_brand=list(mapped_brand or []),
+        mapped_category=list(mapped_category or []),
+        mapped_subcategory=list(mapped_subcategory or []),
+        base_model_number=list(base_model_number or []),
+        product_id=list(product_id or []),
     )
 
 
@@ -11739,22 +11801,22 @@ def _cached_local_db_selection_count(
     root: str,
     manifest_id: str,
     *,
-    base_model_number: str = "",
-    mapped_brand: str = "",
-    mapped_category: str = "",
-    mapped_subcategory: str = "",
-    product_id: str = "",
+    base_model_number: Tuple[str, ...] = tuple(),
+    mapped_brand: Tuple[str, ...] = tuple(),
+    mapped_category: Tuple[str, ...] = tuple(),
+    mapped_subcategory: Tuple[str, ...] = tuple(),
+    product_id: Tuple[str, ...] = tuple(),
 ) -> int:
     if not callable(_count_local_review_db_selection):
         return 0
     return int(
         _count_local_review_db_selection(
             root or None,
-            base_model_number=base_model_number,
-            mapped_brand=mapped_brand,
-            mapped_category=mapped_category,
-            mapped_subcategory=mapped_subcategory,
-            product_id=product_id,
+            base_model_number=list(base_model_number or []),
+            mapped_brand=list(mapped_brand or []),
+            mapped_category=list(mapped_category or []),
+            mapped_subcategory=list(mapped_subcategory or []),
+            product_id=list(product_id or []),
         )
         or 0
     )
@@ -11772,11 +11834,11 @@ def _load_action_center_local_db_frame(
     root: str,
     manifest_id: str,
     *,
-    base_model_number: str = "",
-    mapped_brand: str = "",
-    mapped_category: str = "",
-    mapped_subcategory: str = "",
-    product_id: str = "",
+    base_model_number: Tuple[str, ...] = tuple(),
+    mapped_brand: Tuple[str, ...] = tuple(),
+    mapped_category: Tuple[str, ...] = tuple(),
+    mapped_subcategory: Tuple[str, ...] = tuple(),
+    product_id: Tuple[str, ...] = tuple(),
     moderation_values: Tuple[str, ...] = tuple(),
     organic_only: bool = False,
     brand_values: Tuple[str, ...] = tuple(),
@@ -11806,11 +11868,11 @@ def _load_action_center_local_db_frame(
     df = _load_local_review_analytics_frame(
         root or None,
         columns=cols,
-        base_model_number=base_model_number,
-        mapped_brand=mapped_brand,
-        mapped_category=mapped_category,
-        mapped_subcategory=mapped_subcategory,
-        product_id=product_id,
+        base_model_number=list(base_model_number or []),
+        mapped_brand=list(mapped_brand or []),
+        mapped_category=list(mapped_category or []),
+        mapped_subcategory=list(mapped_subcategory or []),
+        product_id=list(product_id or []),
         moderation_buckets=list(moderation_values or []),
         organic_only=bool(organic_only),
         brand_values=list(brand_values or []),
@@ -11839,11 +11901,11 @@ def _load_action_center_frame(
         return _load_action_center_local_db_frame(
             local_ctx.get("root") or "",
             str(local_ctx.get("manifest_id") or ""),
-            base_model_number=_safe_text(selection.get("base_model_number")),
-            mapped_brand=_safe_text(selection.get("mapped_brand")),
-            mapped_category=_safe_text(selection.get("mapped_category")),
-            mapped_subcategory=_safe_text(selection.get("mapped_subcategory")),
-            product_id=_safe_text(selection.get("product_id")),
+            base_model_number=_selection_tuple(selection.get("base_model_number")),
+            mapped_brand=_selection_tuple(selection.get("mapped_brand")),
+            mapped_category=_selection_tuple(selection.get("mapped_category")),
+            mapped_subcategory=_selection_tuple(selection.get("mapped_subcategory")),
+            product_id=_selection_tuple(selection.get("product_id")),
             moderation_values=tuple(_safe_text(v) for v in moderation_values if _safe_text(v)),
             organic_only=bool(organic_only),
             brand_values=tuple(_safe_text(v) for v in brand_values if _safe_text(v)),
@@ -14932,10 +14994,10 @@ def main():
                         "Local review database folder",
                         value=_safe_text(st.session_state.get("workspace_local_db_root")),
                         key="workspace_local_db_root",
-                        help="Drop the latest merged review export into incoming/reviews and the latest master SKU mapping workbook into incoming/sku_mapping inside this folder.",
+                        help="Drop the latest merged review export into incoming/reviews, the latest master SKU mapping workbook into incoming/sku_mapping, and any Dyson review workbooks into incoming/reviews/dyson with the Dyson mapping workbook in incoming/sku_mapping/dyson.",
                     )
                     local_dirs = _ensure_local_review_db_dirs(local_root or None)
-                    st.caption(f"Inputs live in {local_dirs.get('reviews_dir', '')} and {local_dirs.get('mapping_dir', '')}. The synced SQLite file is stored at {local_dirs.get('db_path', '')}.")
+                    st.caption(f"Inputs live in {local_dirs.get('reviews_dir', '')} and {local_dirs.get('mapping_dir', '')}. Dyson add-ons live in {local_dirs.get('dyson_reviews_dir', '')} and {local_dirs.get('dyson_mapping_dir', '')}. The synced SQLite file is stored at {local_dirs.get('db_path', '')}.")
                     local_status = _get_local_review_db_status(local_root or None)
                     auto_sync_local_db = st.checkbox(
                         "Auto-sync local database when newer files are detected",
@@ -14955,6 +15017,10 @@ def main():
                     st.caption(
                         f"Latest review file: {_safe_text(review_info.get('name')) or 'none'} · Latest SKU mapping: {_safe_text(mapping_info.get('name')) or 'none'}"
                     )
+                    if int(local_status.get("dyson_review_count") or 0) or int(local_status.get("dyson_mapping_count") or 0):
+                        st.caption(
+                            f"Dyson sources detected: {int(local_status.get('dyson_review_count') or 0):,} review file(s) · {int(local_status.get('dyson_mapping_count') or 0):,} mapping file(s)"
+                        )
                     if status_manifest:
                         st.caption(
                             f"Last sync: {_safe_text(status_manifest.get('synced_at')) or 'unknown'} · {int(status_manifest.get('review_count') or 0):,} reviews · {int(status_manifest.get('base_model_count') or 0):,} base models · {int(status_manifest.get('mapped_review_count') or 0):,} mapped rows"
@@ -14975,7 +15041,7 @@ def main():
                         ),
                         unsafe_allow_html=True,
                     )
-                    st.caption("Speed plan: keep the synced SQLite database as the durable store, load only the newest interactive slice with Fast or Balanced profiles, and preload repeated selections so the next workspace open can reuse a warm cached extract.")
+                    st.caption("Speed plan: keep the synced SQLite database as the durable store, default to all matched reviews when you want the full corpus in the workspace, and switch to Fast or Balanced when you want a lighter slice that opens more quickly. Preload warms repeated selections so the next workspace open can reuse a cached extract.")
                     sync_cols = st.columns([1.2, 1.1, 2.7])
                     sync_clicked = sync_cols[0].button("Sync latest folder files", key="ws_local_db_sync", use_container_width=True)
                     export_clicked = sync_cols[1].button("Export summary workbook", key="ws_local_db_export", use_container_width=True, disabled=not bool(local_status.get('is_ready')))
@@ -15040,112 +15106,204 @@ def main():
                                         f"Smart selection detected: {_safe_text(chosen_hit.get('mapped_brand')) or 'Unknown brand'} · {_safe_text(chosen_hit.get('mapped_category')) or 'Unknown category'} · {_safe_text(chosen_hit.get('mapped_subcategory')) or 'Unknown subcategory'}"
                                     )
                                     if st.button("Use search result", key="workspace_local_db_apply_search", use_container_width=True):
-                                        st.session_state["workspace_local_db_selected_brand"] = _safe_text(chosen_hit.get("mapped_brand"))
-                                        st.session_state["workspace_local_db_selected_category"] = _safe_text(chosen_hit.get("mapped_category"))
-                                        st.session_state["workspace_local_db_selected_subcategory"] = _safe_text(chosen_hit.get("mapped_subcategory"))
-                                        st.session_state["workspace_local_db_selected_base_model"] = _safe_text(chosen_hit.get("base_model_number"))
-                                        st.session_state["workspace_local_db_selected_product_id"] = _safe_text(chosen_hit.get("product_id"))
+                                        st.session_state["workspace_local_db_selected_brand"] = _selection_list(chosen_hit.get("mapped_brand"))
+                                        st.session_state["workspace_local_db_selected_category"] = _selection_list(chosen_hit.get("mapped_category"))
+                                        st.session_state["workspace_local_db_selected_subcategory"] = _selection_list(chosen_hit.get("mapped_subcategory"))
+                                        st.session_state["workspace_local_db_selected_base_model"] = _selection_list(chosen_hit.get("base_model_number"))
+                                        st.session_state["workspace_local_db_selected_product_id"] = _selection_list(chosen_hit.get("product_id"))
                                         st.rerun()
                             elif _safe_text(search_query):
                                 st.info("No local database search hits yet for that query. Try a shorter base model, SKU, or product-name fragment.")
 
+                        brand_selected = _selection_list(st.session_state.get("workspace_local_db_selected_brand"))
+                        category_selected = _selection_list(st.session_state.get("workspace_local_db_selected_category"))
+                        subcategory_selected = _selection_list(st.session_state.get("workspace_local_db_selected_subcategory"))
+                        base_model_selected = _selection_list(st.session_state.get("workspace_local_db_selected_base_model"))
+                        product_selected = _selection_list(st.session_state.get("workspace_local_db_selected_product_id"))
+
+                        for _state_key, _state_vals in [
+                            ("workspace_local_db_selected_brand", brand_selected),
+                            ("workspace_local_db_selected_category", category_selected),
+                            ("workspace_local_db_selected_subcategory", subcategory_selected),
+                            ("workspace_local_db_selected_base_model", base_model_selected),
+                            ("workspace_local_db_selected_product_id", product_selected),
+                        ]:
+                            st.session_state[_state_key] = _state_vals
+
                         options = _cached_local_db_filter_options(
                             local_root or "",
                             local_manifest_id,
-                            mapped_brand=_safe_text(st.session_state.get("workspace_local_db_selected_brand")),
-                            mapped_category=_safe_text(st.session_state.get("workspace_local_db_selected_category")),
-                            mapped_subcategory=_safe_text(st.session_state.get("workspace_local_db_selected_subcategory")),
-                            base_model_number=_safe_text(st.session_state.get("workspace_local_db_selected_base_model")),
+                            mapped_brand=_selection_tuple(brand_selected),
+                            mapped_category=_selection_tuple(category_selected),
+                            mapped_subcategory=_selection_tuple(subcategory_selected),
+                            base_model_number=_selection_tuple(base_model_selected),
+                            product_id=_selection_tuple(product_selected),
                         )
-                        brand_options = [""] + list(options.get("mapped_brand") or [])
-                        brand_choice = st.selectbox("Mapped brand", brand_options, index=(brand_options.index(_safe_text(st.session_state.get("workspace_local_db_selected_brand"))) if _safe_text(st.session_state.get("workspace_local_db_selected_brand")) in brand_options else 0), key="workspace_local_db_selected_brand", help="Optional pre-filter before loading a workspace from the local database.")
-                        options = _cached_local_db_filter_options(
-                            local_root or "",
-                            local_manifest_id,
-                            mapped_brand=_safe_text(brand_choice),
-                            mapped_category=_safe_text(st.session_state.get("workspace_local_db_selected_category")),
-                            mapped_subcategory=_safe_text(st.session_state.get("workspace_local_db_selected_subcategory")),
-                            base_model_number=_safe_text(st.session_state.get("workspace_local_db_selected_base_model")),
+
+                        filter_cols = st.columns([2.4, 1.0])
+                        filter_cols[0].caption("Multi-select any mix of brand, category, subcategory, base model, or product/SKU. Leave a field blank to keep it open.")
+                        clear_filters = filter_cols[1].button("Clear filters", key="ws_local_db_clear_filters", use_container_width=True)
+                        if clear_filters:
+                            for _state_key in [
+                                "workspace_local_db_selected_brand",
+                                "workspace_local_db_selected_category",
+                                "workspace_local_db_selected_subcategory",
+                                "workspace_local_db_selected_base_model",
+                                "workspace_local_db_selected_product_id",
+                            ]:
+                                st.session_state[_state_key] = []
+                            st.rerun()
+
+                        def _merge_current(current_values, option_values):
+                            ordered = []
+                            seen = set()
+                            for value in list(current_values or []) + list(option_values or []):
+                                text = _safe_text(value)
+                                if not text or text in seen:
+                                    continue
+                                seen.add(text)
+                                ordered.append(text)
+                            return ordered
+
+                        brand_options = _merge_current(brand_selected, options.get("mapped_brand") or [])
+                        category_options = _merge_current(category_selected, options.get("mapped_category") or [])
+                        subcategory_options = _merge_current(subcategory_selected, options.get("mapped_subcategory") or [])
+                        base_model_options = _merge_current(base_model_selected, options.get("base_model_number") or [])
+                        product_options = _merge_current(product_selected, options.get("product_id") or [])
+
+                        filter_grid_top = st.columns(2)
+                        filter_grid_mid = st.columns(2)
+                        filter_grid_bot = st.columns(1)
+                        brand_choice = filter_grid_top[0].multiselect(
+                            "Mapped brand",
+                            options=brand_options,
+                            default=brand_selected,
+                            key="workspace_local_db_selected_brand",
+                            help="Choose one or more mapped brands before building a workspace from the local database.",
                         )
-                        db_cols_1 = st.columns(2)
-                        category_options = [""] + list(options.get("mapped_category") or [])
-                        base_model_options = [""] + list(options.get("base_model_number") or [])
-                        category_choice = db_cols_1[0].selectbox("Mapped category", category_options, index=(category_options.index(_safe_text(st.session_state.get("workspace_local_db_selected_category"))) if _safe_text(st.session_state.get("workspace_local_db_selected_category")) in category_options else 0), key="workspace_local_db_selected_category")
-                        base_model_choice = db_cols_1[1].selectbox("Base model number", base_model_options, index=(base_model_options.index(_safe_text(st.session_state.get("workspace_local_db_selected_base_model"))) if _safe_text(st.session_state.get("workspace_local_db_selected_base_model")) in base_model_options else 0), key="workspace_local_db_selected_base_model", help="Examples: HD400, DB300, NC700. This is the main family-level filter that links child SKUs together.")
-                        options = _cached_local_db_filter_options(
-                            local_root or "",
-                            local_manifest_id,
-                            mapped_brand=_safe_text(brand_choice),
-                            mapped_category=_safe_text(category_choice),
-                            mapped_subcategory=_safe_text(st.session_state.get("workspace_local_db_selected_subcategory")),
-                            base_model_number=_safe_text(base_model_choice),
+                        category_choice = filter_grid_top[1].multiselect(
+                            "Mapped category",
+                            options=category_options,
+                            default=category_selected,
+                            key="workspace_local_db_selected_category",
                         )
-                        db_cols_2 = st.columns(2)
-                        subcategory_options = [""] + list(options.get("mapped_subcategory") or [])
-                        product_options = [""] + list(options.get("product_id") or [])
-                        subcategory_choice = db_cols_2[0].selectbox("Mapped subcategory", subcategory_options, index=(subcategory_options.index(_safe_text(st.session_state.get("workspace_local_db_selected_subcategory"))) if _safe_text(st.session_state.get("workspace_local_db_selected_subcategory")) in subcategory_options else 0), key="workspace_local_db_selected_subcategory")
-                        product_choice = db_cols_2[1].selectbox("Specific product / SKU", product_options, index=(product_options.index(_safe_text(st.session_state.get("workspace_local_db_selected_product_id"))) if _safe_text(st.session_state.get("workspace_local_db_selected_product_id")) in product_options else 0), key="workspace_local_db_selected_product_id")
-                        profile_defaults = {"Fast": 25000, "Balanced": 75000, "Deep": 150000, "Custom": None}
+                        subcategory_choice = filter_grid_mid[0].multiselect(
+                            "Mapped subcategory",
+                            options=subcategory_options,
+                            default=subcategory_selected,
+                            key="workspace_local_db_selected_subcategory",
+                        )
+                        base_model_choice = filter_grid_mid[1].multiselect(
+                            "Base model number",
+                            options=base_model_options,
+                            default=base_model_selected,
+                            key="workspace_local_db_selected_base_model",
+                            help="Examples: HD400, DB300, NC700. This is the family-level selector that links child SKUs together.",
+                        )
+                        product_choice = filter_grid_bot[0].multiselect(
+                            "Specific product / SKU",
+                            options=product_options,
+                            default=product_selected,
+                            key="workspace_local_db_selected_product_id",
+                        )
+
+                        st.markdown(
+                            _chip_html(
+                                [
+                                    (f"Brand: {_selection_summary_label(brand_choice)}", "gray"),
+                                    (f"Category: {_selection_summary_label(category_choice)}", "gray"),
+                                    (f"Subcategory: {_selection_summary_label(subcategory_choice)}", "gray"),
+                                    (f"Base model: {_selection_summary_label(base_model_choice)}", "indigo"),
+                                    (f"Product / SKU: {_selection_summary_label(product_choice)}", "gray"),
+                                ]
+                            ),
+                            unsafe_allow_html=True,
+                        )
+
+                        profile_defaults = {"All matched": None, "Fast": 50000, "Balanced": 150000, "Deep": 300000, "Custom": None}
+                        default_profile = _safe_text(st.session_state.get("workspace_local_db_load_profile")) or "All matched"
+                        if default_profile not in profile_defaults:
+                            default_profile = "All matched"
                         perf_cols = st.columns([0.9, 1.1])
                         load_profile = perf_cols[0].selectbox(
                             "Load profile",
                             options=list(profile_defaults.keys()),
-                            index=list(profile_defaults.keys()).index(_safe_text(st.session_state.get("workspace_local_db_load_profile")) or "Fast") if _safe_text(st.session_state.get("workspace_local_db_load_profile")) in profile_defaults else 0,
+                            index=list(profile_defaults.keys()).index(default_profile),
                             key="workspace_local_db_load_profile",
-                            help="Fast is now the recommended default for a quicker workspace open. Balanced keeps a broader slice in memory, and Deep loads a much larger slice before you start filtering.",
+                            help="All matched loads the full filtered corpus into the interactive workspace. Fast, Balanced, and Deep load lighter newest-review slices when you want quicker opens.",
                         )
                         preset_limit = profile_defaults.get(load_profile)
-                        if preset_limit and int(st.session_state.get("workspace_local_db_limit_rows") or 0) != int(preset_limit):
-                            st.session_state["workspace_local_db_limit_rows"] = int(preset_limit)
-                        local_limit_rows = int(
-                            perf_cols[1].number_input(
-                                "Load newest review rows",
-                                min_value=1000,
-                                max_value=500000,
-                                value=int(st.session_state.get("workspace_local_db_limit_rows") or preset_limit or 75000),
-                                step=5000,
-                                key="workspace_local_db_limit_rows",
-                                help="Keeps large database selections responsive by loading only the newest N reviews into the interactive workspace.",
+                        if load_profile != "Custom":
+                            normalized_limit = 0 if preset_limit is None else int(preset_limit)
+                            if int(st.session_state.get("workspace_local_db_limit_rows") or 0) != normalized_limit:
+                                st.session_state["workspace_local_db_limit_rows"] = normalized_limit
+                        if load_profile == "Custom":
+                            local_limit_rows = int(
+                                perf_cols[1].number_input(
+                                    "Custom row limit",
+                                    min_value=1000,
+                                    max_value=2000000,
+                                    value=int(st.session_state.get("workspace_local_db_limit_rows") or 250000),
+                                    step=25000,
+                                    key="workspace_local_db_limit_rows",
+                                    help="Choose a custom newest-review cap. Pick All matched in the profile selector when you want the entire filtered selection.",
+                                )
                             )
-                        )
+                        else:
+                            local_limit_rows = None if preset_limit is None else int(preset_limit)
+                            scope_label = "All matched reviews" if local_limit_rows is None else f"Newest {local_limit_rows:,} reviews"
+                            perf_cols[1].markdown(
+                                f"<div class='metric-label' style='margin-top:.45rem;'>Load scope</div><div class='metric-value' style='font-size:1.02rem;'>{_esc(scope_label)}</div>",
+                                unsafe_allow_html=True,
+                            )
+                            perf_cols[1].caption("All matched is now the default. Switch to Fast or Balanced when you want a lighter workspace slice that opens faster.")
+
                         selection_count = _cached_local_db_selection_count(
                             local_root or "",
                             local_manifest_id,
-                            base_model_number=_safe_text(base_model_choice),
-                            mapped_brand=_safe_text(brand_choice),
-                            mapped_category=_safe_text(category_choice),
-                            mapped_subcategory=_safe_text(subcategory_choice),
-                            product_id=_safe_text(product_choice),
+                            base_model_number=_selection_tuple(base_model_choice),
+                            mapped_brand=_selection_tuple(brand_choice),
+                            mapped_category=_selection_tuple(category_choice),
+                            mapped_subcategory=_selection_tuple(subcategory_choice),
+                            product_id=_selection_tuple(product_choice),
                         )
                         if selection_count:
-                            planned_rows = min(int(selection_count), int(local_limit_rows)) if local_limit_rows else int(selection_count)
-                            if selection_count > local_limit_rows:
-                                st.caption(f"Current local selection matches {selection_count:,} reviews. The workspace will hydrate the newest {local_limit_rows:,} rows to stay responsive, while Action Center can still analyze the broader synced database.")
+                            planned_rows = int(selection_count) if not local_limit_rows else min(int(selection_count), int(local_limit_rows))
+                            if not local_limit_rows:
+                                st.caption(f"Current local selection matches {selection_count:,} reviews. The interactive workspace will now load all matched reviews by default.")
+                                if selection_count >= 300000:
+                                    st.info("This is a very large full-corpus load. It is supported, but Fast or Balanced will open more quickly when you only need a lighter interactive slice.")
+                            elif selection_count > local_limit_rows:
+                                st.caption(f"Current local selection matches {selection_count:,} reviews. The workspace will hydrate the newest {local_limit_rows:,} rows to stay especially responsive, while Action Center can still analyze the broader synced database.")
                             else:
                                 st.caption(f"Current local selection matches {selection_count:,} reviews. The full selection can fit directly in the interactive workspace.")
                             st.caption("Repeat loads get faster because this exact selection is cached to disk after the first successful read. Use preload when you want to warm the cache before entering the workspace.")
                             local_source_sig = _local_db_source_signature(
                                 local_status,
                                 root=local_root,
-                                base_model_number=_safe_text(base_model_choice),
-                                mapped_brand=_safe_text(brand_choice),
-                                mapped_category=_safe_text(category_choice),
-                                mapped_subcategory=_safe_text(subcategory_choice),
-                                product_id=_safe_text(product_choice),
+                                base_model_number=base_model_choice,
+                                mapped_brand=brand_choice,
+                                mapped_category=category_choice,
+                                mapped_subcategory=subcategory_choice,
+                                product_id=product_choice,
                                 limit_rows=local_limit_rows,
                             )
                             preload_cols = st.columns([1.0, 2.6])
                             preload_clicked = preload_cols[0].button("Preload current selection", key="ws_preload_local_db", use_container_width=True)
-                            preload_cols[1].caption(f"Preload hydrates about {planned_rows:,} rows now so the next workspace open can reuse a warm cached extract.")
+                            preload_cols[1].caption(
+                                f"Preload hydrates about {planned_rows:,} rows now so the next workspace open can reuse a warm cached extract."
+                                if planned_rows
+                                else "Preload warms the current local database slice so the next workspace open can reuse a cached extract."
+                            )
                             if preload_clicked:
                                 try:
                                     preload_dataset = _load_local_review_workspace(
                                         local_root or None,
-                                        base_model_number=_safe_text(base_model_choice),
-                                        mapped_brand=_safe_text(brand_choice),
-                                        mapped_category=_safe_text(category_choice),
-                                        mapped_subcategory=_safe_text(subcategory_choice),
-                                        product_id=_safe_text(product_choice),
+                                        base_model_number=base_model_choice,
+                                        mapped_brand=brand_choice,
+                                        mapped_category=category_choice,
+                                        mapped_subcategory=subcategory_choice,
+                                        product_id=product_choice,
                                         limit_rows=local_limit_rows,
                                     )
                                     preload_meta = preload_dataset.get("load_meta") or {}
@@ -15171,11 +15329,11 @@ def main():
                                 try:
                                     _build_workspace_from_local_database(
                                         root=local_root or None,
-                                        base_model_number=_safe_text(base_model_choice),
-                                        mapped_brand=_safe_text(brand_choice),
-                                        mapped_category=_safe_text(category_choice),
-                                        mapped_subcategory=_safe_text(subcategory_choice),
-                                        product_id=_safe_text(product_choice),
+                                        base_model_number=base_model_choice,
+                                        mapped_brand=brand_choice,
+                                        mapped_category=category_choice,
+                                        mapped_subcategory=subcategory_choice,
+                                        product_id=product_choice,
                                         limit_rows=local_limit_rows,
                                         replace_current=bool(replace_local),
                                         source_signature=local_source_sig,
@@ -15184,7 +15342,7 @@ def main():
                                 except Exception as exc:
                                     st.error(f"Local database workspace build failed: {exc}")
                         else:
-                            st.info("Sync the database, then pick a base model, category, or product selection that returns at least one review.")
+                            st.info("Sync the database, then pick any combination of brand, category, base model, subcategory, or product filters that returns at least one review.")
                 else:
                     st.info("Local database support is not available in this build.")
 

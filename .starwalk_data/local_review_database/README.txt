@@ -1,5 +1,7 @@
 Drop your latest merged review export into incoming/reviews/
 Drop your latest master SKU mapping workbook into incoming/sku_mapping/
+Drop Dyson review workbooks like dyson__sv53-fluffyoptic-coco.xlsx into incoming/reviews/dyson/
+Drop the Dyson mapping workbook into incoming/sku_mapping/dyson/
 
 Then either:
 1. Open the app and use the Local central review database panel to sync, or

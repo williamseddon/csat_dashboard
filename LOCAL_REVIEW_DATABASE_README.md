@@ -9,6 +9,8 @@ Use Excel and CSV as the input/source files, and use SQLite as the actual runtim
 - **Input files (easy to replace):**
   - `incoming/reviews/` → latest merged review export (`.csv`, `.xlsx`, `.xlsm`, `.xls`)
   - `incoming/sku_mapping/` → latest master SKU mapping file (`.xlsx`, `.xlsm`, `.xls`, `.csv`)
+  - `incoming/reviews/dyson/` → optional Dyson review workbooks named like `dyson__tp07-whsv.xlsx`
+  - `incoming/sku_mapping/dyson/` → optional Dyson product mapping workbook
 - **Runtime database (fast filtering in the app):**
   - `central_review_database.sqlite3`
 - **Optional Excel snapshot for sharing/checking:**
@@ -29,8 +31,10 @@ The app still accepts Excel as an input source. The recommended pattern is:
 
 1. Drop the newest review export into `incoming/reviews/`
 2. Drop the newest SKU mapping file into `incoming/sku_mapping/`
-3. Let the app sync those files into SQLite
-4. Use the app UI to filter by base model, category, subcategory, or product ID
+3. If you want Dyson included, drop Dyson review workbooks into `incoming/reviews/dyson/`
+4. Drop the Dyson product mapping workbook into `incoming/sku_mapping/dyson/`
+5. Let the app sync those files into SQLite
+6. Use the app UI to filter by base model, category, subcategory, or product ID
 
 ## Base model linking
 
@@ -47,6 +51,8 @@ The importer enriches each review with catalog fields such as:
 - `mapped_lifecycle_phase`
 
 This means a family like **HD400** can link child SKUs and accessories while still preserving the exact product ID for each review.
+
+For Dyson review workbooks, filenames such as `dyson__sv53-fluffyoptic-coco.xlsx` are treated as product IDs, then mapped against the Dyson product mapping workbook so model codes like **SV53** or **TP07** become the Dyson base model numbers in the same central SQLite database.
 
 ## App workflow
 
@@ -74,7 +80,9 @@ The app creates this structure automatically:
   local_review_database/
     incoming/
       reviews/
+        dyson/
       sku_mapping/
+        dyson/
     exports/
     central_review_database.sqlite3
 ```
