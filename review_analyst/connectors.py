@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import pandas as pd
@@ -66,6 +66,51 @@ def get_session() -> requests.Session:
         }
     )
     return session
+
+
+def _report_progress(progress_ui: Optional[Callable[..., None]], *, progress: Optional[float] = None, title: str = "", detail: str = "") -> None:
+    if not callable(progress_ui):
+        return
+    kwargs: Dict[str, Any] = {}
+    if progress is not None:
+        kwargs["progress"] = progress
+    if title:
+        kwargs["title"] = safe_text(title)
+    if detail:
+        kwargs["detail"] = safe_text(detail)
+    try:
+        progress_ui(**kwargs)
+    except TypeError:
+        try:
+            progress_ui(progress, safe_text(title), safe_text(detail))
+        except Exception:
+            return
+    except Exception:
+        return
+
+
+def _scale_progress(progress_ui: Optional[Callable[..., None]], *, start: float = 0.0, end: float = 1.0, prefix: str = ""):
+    if not callable(progress_ui):
+        return None
+    start_f = float(start or 0.0)
+    end_f = float(end or 0.0)
+
+    def _child(*, progress: Optional[float] = None, title: str = "", detail: str = "") -> None:
+        mapped = None
+        if progress is not None:
+            try:
+                base = max(0.0, min(1.0, float(progress)))
+            except Exception:
+                base = 0.0
+            mapped = start_f + (end_f - start_f) * base
+        title_text = safe_text(title).strip()
+        if prefix and title_text:
+            title_text = f"{prefix} · {title_text}"
+        elif prefix:
+            title_text = prefix
+        _report_progress(progress_ui, progress=mapped, title=title_text, detail=detail)
+
+    return _child
 
 
 def site_config_from_url(url: str) -> Optional[Dict[str, Any]]:
@@ -350,39 +395,59 @@ def extract_ulta_powerreviews_candidates(product_url: str, product_html: str = "
     return dedupe_keep_order(candidates)
 
 
-def load_bazaarvoice_api_url(api_url: str, *, product_url_hint: str = "", retailer_hint: str = "") -> Dict[str, Any]:
+
+def load_bazaarvoice_api_url(api_url: str, *, product_url_hint: str = "", retailer_hint: str = "", progress_ui=None) -> Dict[str, Any]:
     session = get_session()
     parsed = urlparse(api_url)
     base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
     params = parse_qs(parsed.query, keep_blank_values=True)
     page_size = int(_query_first_ci(params, ["limit", "Limit"], default=DEFAULT_PAGE_SIZE) or DEFAULT_PAGE_SIZE)
     product_id = _extract_bazaarvoice_product_id_from_params(params) or "UNKNOWN_PRODUCT"
+
+    _report_progress(progress_ui, progress=0.05, title="Review feed detected", detail="Loading Bazaarvoice reviews from the matched API endpoint.")
     first = fetch_bazaarvoice_raw_page(session, api_url=base_url, params=params)
     total = int(first.get("TotalResults", 0) or 0)
     raw_reviews = list(first.get("Results") or [])
+    total_requests = max(1, math.ceil(total / max(page_size, 1))) if total else 1
+    _report_progress(
+        progress_ui,
+        progress=0.22,
+        title="Fetching reviews",
+        detail=f"Matched Bazaarvoice product {product_id}. {total:,} review(s) reported across about {total_requests} request(s).",
+    )
+
     if total > len(raw_reviews):
         offsets = list(range(len(raw_reviews), total, page_size))
-        for offset in offsets:
+        for index, offset in enumerate(offsets, start=2):
             query = _clone_params(params)
             _set_ci_param(query, ["offset", "Offset"], int(offset))
             _set_ci_param(query, ["limit", "Limit"], int(page_size))
             payload = fetch_bazaarvoice_raw_page(session, api_url=base_url, params=query)
             raw_reviews.extend(payload.get("Results") or [])
+            fraction = index / max(total_requests, 1)
+            _report_progress(
+                progress_ui,
+                progress=min(0.22 + (0.68 * fraction), 0.9),
+                title="Fetching reviews",
+                detail=f"Loaded Bazaarvoice page {index} of {total_requests}.",
+            )
+
     source_label = product_url_hint or api_url
+    _report_progress(progress_ui, progress=0.95, title="Normalizing reviews", detail=f"{len(raw_reviews):,} review(s) collected from Bazaarvoice.")
     return build_bv_dataset(
         raw_reviews,
         product_url=product_url_hint or api_url,
         product_id=product_id,
         total=total,
         page_size=page_size,
-        requests_needed=max(1, math.ceil(total / max(page_size, 1))) if total else 1,
+        requests_needed=total_requests,
         source_label=source_label,
         retailer=retailer_hint,
         source_system="Bazaarvoice API",
     )
 
 
-def load_powerreviews_api_url(api_url: str, *, product_url_hint: str = "", retailer_hint: str = "") -> Dict[str, Any]:
+def load_powerreviews_api_url(api_url: str, *, product_url_hint: str = "", retailer_hint: str = "", progress_ui=None) -> Dict[str, Any]:
     session = get_session()
     parsed = urlparse(api_url)
     match = re.search(r"/m/(\d+)/l/([A-Za-z_]+)/product/([^/]+)/reviews", parsed.path)
@@ -398,6 +463,7 @@ def load_powerreviews_api_url(api_url: str, *, product_url_hint: str = "", retai
     requested_size = int(_query_first_ci(params, ["paging.size"], default=POWERREVIEWS_MAX_PAGE_SIZE) or POWERREVIEWS_MAX_PAGE_SIZE)
     page_size = min(requested_size, POWERREVIEWS_MAX_PAGE_SIZE)
 
+    _report_progress(progress_ui, progress=0.05, title="Review feed detected", detail="Loading PowerReviews reviews from the matched API endpoint.")
     first = fetch_powerreviews_page(
         session,
         merchant_id=merchant_id,
@@ -415,8 +481,15 @@ def load_powerreviews_api_url(api_url: str, *, product_url_hint: str = "", retai
     results = first.get("results") or []
     product_name = safe_text((results[0].get("rollup") or {}).get("name") if results and isinstance(results[0], dict) else "")
     all_reviews = powerreviews_extract_reviews(first)
+    total_requests = max(1, math.ceil(total / max(server_page_size, 1))) if total else 1
+    _report_progress(
+        progress_ui,
+        progress=0.22,
+        title="Fetching reviews",
+        detail=f"Matched PowerReviews product {product_id}. {total:,} review(s) reported across about {total_requests} request(s).",
+    )
 
-    for start in range(server_page_size, total, server_page_size):
+    for page_index, start in enumerate(range(server_page_size, total, server_page_size), start=2):
         payload = fetch_powerreviews_page(
             session,
             merchant_id=merchant_id,
@@ -429,21 +502,28 @@ def load_powerreviews_api_url(api_url: str, *, product_url_hint: str = "", retai
             page_locale=page_locale,
         )
         all_reviews.extend(powerreviews_extract_reviews(payload))
+        fraction = page_index / max(total_requests, 1)
+        _report_progress(
+            progress_ui,
+            progress=min(0.22 + (0.68 * fraction), 0.9),
+            title="Fetching reviews",
+            detail=f"Loaded PowerReviews page {page_index} of {total_requests}.",
+        )
 
     source_label = product_url_hint or api_url
+    _report_progress(progress_ui, progress=0.95, title="Normalizing reviews", detail=f"{len(all_reviews):,} review(s) collected from PowerReviews.")
     return build_powerreviews_dataset(
         all_reviews,
         product_url=product_url_hint or api_url,
         product_id=product_id,
         total=total,
         page_size=server_page_size,
-        requests_needed=max(1, math.ceil(total / max(server_page_size, 1))) if total else 1,
+        requests_needed=total_requests,
         source_label=source_label,
         product_name=product_name,
         retailer=retailer_hint,
         source_system="PowerReviews API",
     )
-
 
 def fetch_okendo_raw_page(session: requests.Session, *, api_url: str) -> Dict[str, Any]:
     resp = session.get(api_url, timeout=45, headers={"okendo-api-version": OKENDO_API_VERSION, "Accept": "application/json"})
@@ -525,13 +605,16 @@ def build_currentbody_okendo_api_url(session: requests.Session, product_url: str
     return f"{OKENDO_API_ROOT}/stores/{cfg['okendo_user_id']}/products/shopify-{numeric_product_id}/reviews?{urlencode(params)}"
 
 
-def load_okendo_api_url(api_url: str, *, product_url_hint: str = "", retailer_hint: str = "") -> Dict[str, Any]:
+
+def load_okendo_api_url(api_url: str, *, product_url_hint: str = "", retailer_hint: str = "", progress_ui=None) -> Dict[str, Any]:
     session = get_session()
     current_url = api_url
+    _report_progress(progress_ui, progress=0.05, title="Review feed detected", detail="Loading Okendo reviews from the matched API endpoint.")
     first = fetch_okendo_raw_page(session, api_url=current_url)
     all_reviews = list(first.get("reviews") or [])
     requests_needed = 1
     next_url = safe_text(first.get("nextUrl"))
+    _report_progress(progress_ui, progress=0.24, title="Fetching reviews", detail=f"Loaded Okendo page 1. {len(all_reviews):,} review(s) collected so far.")
 
     while next_url:
         current_url = _resolve_okendo_next_url(current_url, next_url)
@@ -539,12 +622,19 @@ def load_okendo_api_url(api_url: str, *, product_url_hint: str = "", retailer_hi
         all_reviews.extend(payload.get("reviews") or [])
         next_url = safe_text(payload.get("nextUrl"))
         requests_needed += 1
+        _report_progress(
+            progress_ui,
+            progress=min(0.24 + (0.13 * requests_needed), 0.9),
+            title="Fetching reviews",
+            detail=f"Loaded Okendo page {requests_needed}. {len(all_reviews):,} review(s) collected so far.",
+        )
 
     product_id = _extract_okendo_product_id_from_api_url(api_url)
     primary_review = next((review for review in all_reviews if isinstance(review, dict)), {})
     product_name = safe_text(primary_review.get("productName"))
     inferred_product_url = _normalize_protocol_relative_url(safe_text(primary_review.get("productUrl")))
     source_label = product_url_hint or api_url
+    _report_progress(progress_ui, progress=0.95, title="Normalizing reviews", detail=f"{len(all_reviews):,} review(s) collected from Okendo.")
     return build_okendo_dataset(
         all_reviews,
         product_url=product_url_hint or inferred_product_url or api_url,
@@ -559,22 +649,50 @@ def load_okendo_api_url(api_url: str, *, product_url_hint: str = "", retailer_hi
     )
 
 
-def _load_currentbody_product_page(session: requests.Session, *, product_url: str, product_html: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _load_currentbody_product_page(session: requests.Session, *, product_url: str, product_html: str, cfg: Dict[str, Any], progress_ui=None) -> Dict[str, Any]:
+    _report_progress(progress_ui, progress=0.05, title="Scanning product page", detail="Looking for embedded Okendo review feeds.")
     embedded_urls = [url for url in extract_embedded_review_api_urls(product_html) if is_okendo_api_url(url)]
-    for api_url in embedded_urls:
+    for api_index, api_url in enumerate(embedded_urls, start=1):
         try:
-            return load_okendo_api_url(api_url, product_url_hint=product_url, retailer_hint=cfg.get("retailer", "CurrentBody"))
+            _report_progress(
+                progress_ui,
+                progress=0.14,
+                title="Embedded review feed found",
+                detail=f"Trying embedded Okendo feed {api_index} of {len(embedded_urls)}.",
+            )
+            return load_okendo_api_url(
+                api_url,
+                product_url_hint=product_url,
+                retailer_hint=cfg.get("retailer", "CurrentBody"),
+                progress_ui=_scale_progress(progress_ui, start=0.18, end=0.95, prefix="Okendo API"),
+            )
         except Exception:
             continue
 
+    _report_progress(progress_ui, progress=0.18, title="Resolving review feed", detail="Matching the CurrentBody product page with its Okendo review endpoint.")
     api_url = build_currentbody_okendo_api_url(session, product_url, cfg=cfg, product_html=product_html)
-    return load_okendo_api_url(api_url, product_url_hint=product_url, retailer_hint=cfg.get("retailer", "CurrentBody"))
+    return load_okendo_api_url(
+        api_url,
+        product_url_hint=product_url,
+        retailer_hint=cfg.get("retailer", "CurrentBody"),
+        progress_ui=_scale_progress(progress_ui, start=0.22, end=0.95, prefix="Okendo API"),
+    )
 
 
-def _probe_bazaarvoice_candidates(session: requests.Session, *, candidates: Sequence[str], cfg: Dict[str, Any]):
+def _probe_bazaarvoice_candidates(session: requests.Session, *, candidates: Sequence[str], cfg: Dict[str, Any], progress_ui=None):
     tried: List[str] = []
     zero_match: Optional[Tuple[str, Dict[str, Any]]] = None
-    for candidate in dedupe_keep_order(candidates):
+    candidate_list = dedupe_keep_order(candidates)
+    total_candidates = len(candidate_list)
+    if total_candidates:
+        _report_progress(progress_ui, progress=0.05, title="Matching review feed", detail=f"Trying {total_candidates} Bazaarvoice product ID candidate(s).")
+    for index, candidate in enumerate(candidate_list, start=1):
+        _report_progress(
+            progress_ui,
+            progress=min(0.05 + (0.8 * ((index - 1) / max(total_candidates, 1))), 0.88),
+            title="Matching review feed",
+            detail=f"Trying candidate {index} of {total_candidates}: {candidate}",
+        )
         try:
             if cfg.get("kind") == "action":
                 payload = fetch_reviews_page(
@@ -604,6 +722,7 @@ def _probe_bazaarvoice_candidates(session: requests.Session, *, candidates: Sequ
             total = int(payload.get("TotalResults", 0) or 0)
             has_products = bool(((payload.get("Includes") or {}).get("Products") or {}))
             if total > 0 or has_products:
+                _report_progress(progress_ui, progress=1.0, title="Review feed matched", detail=f"Matched Bazaarvoice candidate {candidate}.")
                 return candidate, payload
             if zero_match is None:
                 zero_match = (candidate, payload)
@@ -614,10 +733,20 @@ def _probe_bazaarvoice_candidates(session: requests.Session, *, candidates: Sequ
     raise ReviewDownloaderError("Could not match a Bazaarvoice product ID. Tried: " + "; ".join(tried[:8]))
 
 
-def _probe_powerreviews_candidates(session: requests.Session, *, candidates: Sequence[str], cfg: Dict[str, Any]):
+def _probe_powerreviews_candidates(session: requests.Session, *, candidates: Sequence[str], cfg: Dict[str, Any], progress_ui=None):
     tried: List[str] = []
     zero_match: Optional[Tuple[str, Dict[str, Any]]] = None
-    for candidate in dedupe_keep_order(candidates):
+    candidate_list = dedupe_keep_order(candidates)
+    total_candidates = len(candidate_list)
+    if total_candidates:
+        _report_progress(progress_ui, progress=0.05, title="Matching review feed", detail=f"Trying {total_candidates} PowerReviews product ID candidate(s).")
+    for index, candidate in enumerate(candidate_list, start=1):
+        _report_progress(
+            progress_ui,
+            progress=min(0.05 + (0.8 * ((index - 1) / max(total_candidates, 1))), 0.88),
+            title="Matching review feed",
+            detail=f"Trying candidate {index} of {total_candidates}: {candidate}",
+        )
         try:
             payload = fetch_powerreviews_page(
                 session,
@@ -635,6 +764,7 @@ def _probe_powerreviews_candidates(session: requests.Session, *, candidates: Seq
             results = payload.get("results") or []
             extracted = powerreviews_extract_reviews(payload)
             if total > 0 or results or extracted:
+                _report_progress(progress_ui, progress=1.0, title="Review feed matched", detail=f"Matched PowerReviews candidate {candidate}.")
                 return candidate, payload
             if zero_match is None:
                 zero_match = (candidate, payload)
@@ -645,7 +775,8 @@ def _probe_powerreviews_candidates(session: requests.Session, *, candidates: Seq
     raise ReviewDownloaderError("Could not match a PowerReviews product ID. Tried: " + "; ".join(tried[:8]))
 
 
-def _fetch_all_bazaarvoice_for_candidate(session: requests.Session, *, product_url: str, product_id: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _fetch_all_bazaarvoice_for_candidate(session: requests.Session, *, product_url: str, product_id: str, cfg: Dict[str, Any], progress_ui=None) -> Dict[str, Any]:
+    _report_progress(progress_ui, progress=0.05, title="Fetching reviews", detail=f"Matched Bazaarvoice product {product_id}. Loading review pages.")
     if cfg.get("kind") == "action":
         first = fetch_reviews_page(
             session,
@@ -660,7 +791,9 @@ def _fetch_all_bazaarvoice_for_candidate(session: requests.Session, *, product_u
         )
         total = int(first.get("TotalResults", 0) or 0)
         raw_reviews = list(first.get("Results") or [])
-        for offset in range(len(raw_reviews), total, DEFAULT_PAGE_SIZE):
+        total_requests = max(1, math.ceil(total / DEFAULT_PAGE_SIZE)) if total else 1
+        _report_progress(progress_ui, progress=0.22, title="Fetching reviews", detail=f"Loaded Bazaarvoice page 1 of {total_requests}. {total:,} review(s) reported.")
+        for page_index, offset in enumerate(range(len(raw_reviews), total, DEFAULT_PAGE_SIZE), start=2):
             page = fetch_reviews_page(
                 session,
                 product_id=product_id,
@@ -673,6 +806,8 @@ def _fetch_all_bazaarvoice_for_candidate(session: requests.Session, *, product_u
                 content_locales=cfg.get("content_locales", DEFAULT_CONTENT_LOCALES),
             )
             raw_reviews.extend(page.get("Results") or [])
+            fraction = page_index / max(total_requests, 1)
+            _report_progress(progress_ui, progress=min(0.22 + (0.68 * fraction), 0.9), title="Fetching reviews", detail=f"Loaded Bazaarvoice page {page_index} of {total_requests}.")
     else:
         first = fetch_bv_simple_page(
             session,
@@ -688,7 +823,9 @@ def _fetch_all_bazaarvoice_for_candidate(session: requests.Session, *, product_u
         )
         total = int(first.get("TotalResults", 0) or 0)
         raw_reviews = list(first.get("Results") or [])
-        for offset in range(len(raw_reviews), total, DEFAULT_PAGE_SIZE):
+        total_requests = max(1, math.ceil(total / DEFAULT_PAGE_SIZE)) if total else 1
+        _report_progress(progress_ui, progress=0.22, title="Fetching reviews", detail=f"Loaded Bazaarvoice page 1 of {total_requests}. {total:,} review(s) reported.")
+        for page_index, offset in enumerate(range(len(raw_reviews), total, DEFAULT_PAGE_SIZE), start=2):
             page = fetch_bv_simple_page(
                 session,
                 product_id=product_id,
@@ -702,20 +839,24 @@ def _fetch_all_bazaarvoice_for_candidate(session: requests.Session, *, product_u
                 include=cfg.get("include", "Products,Comments"),
             )
             raw_reviews.extend(page.get("Results") or [])
+            fraction = page_index / max(total_requests, 1)
+            _report_progress(progress_ui, progress=min(0.22 + (0.68 * fraction), 0.9), title="Fetching reviews", detail=f"Loaded Bazaarvoice page {page_index} of {total_requests}.")
+    _report_progress(progress_ui, progress=0.95, title="Normalizing reviews", detail=f"{len(raw_reviews):,} review(s) collected from Bazaarvoice.")
     return build_bv_dataset(
         raw_reviews,
         product_url=product_url,
         product_id=product_id,
         total=total,
         page_size=DEFAULT_PAGE_SIZE,
-        requests_needed=max(1, math.ceil(total / DEFAULT_PAGE_SIZE)) if total else 1,
+        requests_needed=total_requests,
         source_label=product_url,
         retailer=cfg.get("retailer", ""),
         source_system=cfg.get("source_system", "Bazaarvoice"),
     )
 
 
-def _fetch_all_powerreviews_for_candidate(session: requests.Session, *, product_url: str, product_id: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _fetch_all_powerreviews_for_candidate(session: requests.Session, *, product_url: str, product_id: str, cfg: Dict[str, Any], progress_ui=None) -> Dict[str, Any]:
+    _report_progress(progress_ui, progress=0.05, title="Fetching reviews", detail=f"Matched PowerReviews product {product_id}. Loading review pages.")
     first = fetch_powerreviews_page(
         session,
         merchant_id=cfg["merchant_id"],
@@ -733,7 +874,9 @@ def _fetch_all_powerreviews_for_candidate(session: requests.Session, *, product_
     results = first.get("results") or []
     product_name = safe_text((results[0].get("rollup") or {}).get("name") if results and isinstance(results[0], dict) else "")
     all_reviews = powerreviews_extract_reviews(first)
-    for start in range(server_page_size, total, server_page_size):
+    total_requests = max(1, math.ceil(total / max(server_page_size, 1))) if total else 1
+    _report_progress(progress_ui, progress=0.22, title="Fetching reviews", detail=f"Loaded PowerReviews page 1 of {total_requests}. {total:,} review(s) reported.")
+    for page_index, start in enumerate(range(server_page_size, total, server_page_size), start=2):
         payload = fetch_powerreviews_page(
             session,
             merchant_id=cfg["merchant_id"],
@@ -746,13 +889,16 @@ def _fetch_all_powerreviews_for_candidate(session: requests.Session, *, product_
             page_locale=cfg.get("page_locale", cfg.get("locale", "en_US")),
         )
         all_reviews.extend(powerreviews_extract_reviews(payload))
+        fraction = page_index / max(total_requests, 1)
+        _report_progress(progress_ui, progress=min(0.22 + (0.68 * fraction), 0.9), title="Fetching reviews", detail=f"Loaded PowerReviews page {page_index} of {total_requests}.")
+    _report_progress(progress_ui, progress=0.95, title="Normalizing reviews", detail=f"{len(all_reviews):,} review(s) collected from PowerReviews.")
     return build_powerreviews_dataset(
         all_reviews,
         product_url=product_url,
         product_id=product_id,
         total=total,
         page_size=server_page_size,
-        requests_needed=max(1, math.ceil(total / max(server_page_size, 1))) if total else 1,
+        requests_needed=total_requests,
         source_label=product_url,
         product_name=product_name,
         retailer=cfg.get("retailer", ""),
@@ -760,11 +906,23 @@ def _fetch_all_powerreviews_for_candidate(session: requests.Session, *, product_
     )
 
 
-def _load_bazaarvoice_product_page(session: requests.Session, *, product_url: str, product_html: str, cfg: Dict[str, Any], extra_candidates: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+def _load_bazaarvoice_product_page(session: requests.Session, *, product_url: str, product_html: str, cfg: Dict[str, Any], extra_candidates: Optional[Sequence[str]] = None, progress_ui=None) -> Dict[str, Any]:
+    _report_progress(progress_ui, progress=0.05, title="Scanning product page", detail="Looking for embedded Bazaarvoice review feeds.")
     embedded_urls = [url for url in extract_embedded_review_api_urls(product_html) if is_bazaarvoice_api_url(url)]
-    for api_url in embedded_urls:
+    for api_index, api_url in enumerate(embedded_urls, start=1):
         try:
-            return load_bazaarvoice_api_url(api_url, product_url_hint=product_url, retailer_hint=cfg.get("retailer", ""))
+            _report_progress(
+                progress_ui,
+                progress=0.14,
+                title="Embedded review feed found",
+                detail=f"Trying embedded Bazaarvoice feed {api_index} of {len(embedded_urls)}.",
+            )
+            return load_bazaarvoice_api_url(
+                api_url,
+                product_url_hint=product_url,
+                retailer_hint=cfg.get("retailer", ""),
+                progress_ui=_scale_progress(progress_ui, start=0.18, end=0.95, prefix="Bazaarvoice API"),
+            )
         except Exception:
             continue
 
@@ -775,28 +933,60 @@ def _load_bazaarvoice_product_page(session: requests.Session, *, product_url: st
     fallback_pid = _extract_generic_bv_product_id(product_url, product_html)
     if fallback_pid:
         candidates.insert(0, fallback_pid)
-    product_id, _ = _probe_bazaarvoice_candidates(session, candidates=candidates, cfg=cfg)
-    return _fetch_all_bazaarvoice_for_candidate(session, product_url=product_url, product_id=product_id, cfg=cfg)
+    candidate_list = dedupe_keep_order(candidates)
+    _report_progress(progress_ui, progress=0.18, title="Matching review feed", detail=f"Trying {len(candidate_list)} Bazaarvoice product ID candidate(s).")
+    product_id, _ = _probe_bazaarvoice_candidates(
+        session,
+        candidates=candidate_list,
+        cfg=cfg,
+        progress_ui=_scale_progress(progress_ui, start=0.22, end=0.48, prefix="Bazaarvoice match"),
+    )
+    return _fetch_all_bazaarvoice_for_candidate(
+        session,
+        product_url=product_url,
+        product_id=product_id,
+        cfg=cfg,
+        progress_ui=_scale_progress(progress_ui, start=0.5, end=0.95, prefix="Bazaarvoice fetch"),
+    )
 
 
-def _load_powerreviews_product_page(session: requests.Session, *, product_url: str, product_html: str, cfg: Dict[str, Any], extra_candidates: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+def _load_powerreviews_product_page(session: requests.Session, *, product_url: str, product_html: str, cfg: Dict[str, Any], extra_candidates: Optional[Sequence[str]] = None, progress_ui=None) -> Dict[str, Any]:
+    _report_progress(progress_ui, progress=0.05, title="Scanning product page", detail="Looking for embedded PowerReviews review feeds.")
     embedded_urls = [url for url in extract_embedded_review_api_urls(product_html) if is_powerreviews_api_url(url)]
-    for api_url in embedded_urls:
+    for api_index, api_url in enumerate(embedded_urls, start=1):
         try:
-            return load_powerreviews_api_url(api_url, product_url_hint=product_url, retailer_hint=cfg.get("retailer", ""))
+            _report_progress(
+                progress_ui,
+                progress=0.14,
+                title="Embedded review feed found",
+                detail=f"Trying embedded PowerReviews feed {api_index} of {len(embedded_urls)}.",
+            )
+            return load_powerreviews_api_url(
+                api_url,
+                product_url_hint=product_url,
+                retailer_hint=cfg.get("retailer", ""),
+                progress_ui=_scale_progress(progress_ui, start=0.18, end=0.95, prefix="PowerReviews API"),
+            )
         except Exception:
             continue
 
     embeds = extract_powerreviews_embeds(product_html)
-    for embed in embeds:
+    for embed_index, embed in enumerate(embeds, start=1):
         try:
             cfg2 = dict(cfg)
             cfg2.update({key: value for key, value in embed.items() if value})
+            _report_progress(
+                progress_ui,
+                progress=0.18,
+                title="Embedded review feed found",
+                detail=f"Trying embedded PowerReviews configuration {embed_index} of {len(embeds)}.",
+            )
             return _fetch_all_powerreviews_for_candidate(
                 session,
                 product_url=product_url,
                 product_id=cfg2["product_id"],
                 cfg=cfg2,
+                progress_ui=_scale_progress(progress_ui, start=0.24, end=0.95, prefix="PowerReviews fetch"),
             )
         except Exception:
             continue
@@ -808,11 +998,31 @@ def _load_powerreviews_product_page(session: requests.Session, *, product_url: s
         candidates.extend(extract_ulta_powerreviews_candidates(product_url, product_html))
     candidates.extend(extract_candidate_tokens_from_html(product_html))
     candidates.extend(extract_candidate_tokens_from_url(product_url))
-    product_id, _ = _probe_powerreviews_candidates(session, candidates=candidates, cfg=cfg)
-    return _fetch_all_powerreviews_for_candidate(session, product_url=product_url, product_id=product_id, cfg=cfg)
+    candidate_list = dedupe_keep_order(candidates)
+    _report_progress(progress_ui, progress=0.2, title="Matching review feed", detail=f"Trying {len(candidate_list)} PowerReviews product ID candidate(s).")
+    product_id, _ = _probe_powerreviews_candidates(
+        session,
+        candidates=candidate_list,
+        cfg=cfg,
+        progress_ui=_scale_progress(progress_ui, start=0.24, end=0.5, prefix="PowerReviews match"),
+    )
+    return _fetch_all_powerreviews_for_candidate(
+        session,
+        product_url=product_url,
+        product_id=product_id,
+        cfg=cfg,
+        progress_ui=_scale_progress(progress_ui, start=0.52, end=0.95, prefix="PowerReviews fetch"),
+    )
 
 
-def load_product_reviews(product_url: str) -> Dict[str, Any]:
+def load_product_reviews(product_url: str, *, progress_ui=None) -> Dict[str, Any]:
+    def _finish(dataset: Dict[str, Any]) -> Dict[str, Any]:
+        reviews_df = dataset.get("reviews_df")
+        review_count = len(reviews_df) if isinstance(reviews_df, pd.DataFrame) else 0
+        label = safe_text(dataset.get("source_label")) or host or product_url
+        _report_progress(progress_ui, progress=1.0, title="Reviews loaded", detail=f"{review_count:,} review(s) ready from {label}.")
+        return dataset
+
     product_url = normalize_input_url(product_url)
     parsed = urlparse(product_url)
     host = strip_www(parsed.netloc)
@@ -832,104 +1042,123 @@ def load_product_reviews(product_url: str) -> Dict[str, Any]:
     elif looks_like_sharkninja_us(host):
         retailer_hint = "SharkNinja"
 
+    _report_progress(progress_ui, progress=0.02, title="Preparing source", detail=f"Checking {host or 'the source link'} for a supported review feed.")
+
     if is_bazaarvoice_api_url(product_url):
-        return load_bazaarvoice_api_url(product_url)
+        return _finish(load_bazaarvoice_api_url(product_url, progress_ui=_scale_progress(progress_ui, start=0.08, end=0.96, prefix="Bazaarvoice")))
     if is_powerreviews_api_url(product_url):
-        return load_powerreviews_api_url(product_url)
+        return _finish(load_powerreviews_api_url(product_url, progress_ui=_scale_progress(progress_ui, start=0.08, end=0.96, prefix="PowerReviews")))
     if is_okendo_api_url(product_url):
-        return load_okendo_api_url(product_url, retailer_hint=retailer_hint)
+        return _finish(load_okendo_api_url(product_url, retailer_hint=retailer_hint, progress_ui=_scale_progress(progress_ui, start=0.08, end=0.96, prefix="Okendo")))
 
     session = get_session()
     product_html = ""
     page_fetch_error = None
     try:
+        _report_progress(progress_ui, progress=0.08, title="Loading product page", detail=f"Fetching {host or product_url} and scanning it for embedded review feeds.")
         resp = session.get(product_url, timeout=35)
         resp.raise_for_status()
         product_html = resp.text or ""
+        _report_progress(progress_ui, progress=0.22, title="Product page loaded", detail="Scanning the page for embedded Bazaarvoice, PowerReviews, or Okendo endpoints.")
     except Exception as exc:
         page_fetch_error = exc
         product_html = ""
+        _report_progress(progress_ui, progress=0.22, title="Product page unavailable", detail=f"Falling back to known review patterns for {host or product_url}.")
 
     embedded_urls = extract_embedded_review_api_urls(product_html) if product_html else []
     if embedded_urls:
-        for api_url in embedded_urls:
+        _report_progress(progress_ui, progress=0.28, title="Embedded review feed found", detail=f"Found {len(embedded_urls)} embedded review endpoint(s) on the page.")
+        for api_index, api_url in enumerate(embedded_urls, start=1):
             try:
+                child = _scale_progress(progress_ui, start=0.32, end=0.96, prefix=f"Embedded feed {api_index} of {len(embedded_urls)}")
                 if is_bazaarvoice_api_url(api_url):
-                    return load_bazaarvoice_api_url(api_url, product_url_hint=product_url, retailer_hint=retailer_hint)
+                    return _finish(load_bazaarvoice_api_url(api_url, product_url_hint=product_url, retailer_hint=retailer_hint, progress_ui=child))
                 if is_powerreviews_api_url(api_url):
-                    return load_powerreviews_api_url(api_url, product_url_hint=product_url, retailer_hint=retailer_hint)
+                    return _finish(load_powerreviews_api_url(api_url, product_url_hint=product_url, retailer_hint=retailer_hint, progress_ui=child))
                 if is_okendo_api_url(api_url):
-                    return load_okendo_api_url(api_url, product_url_hint=product_url, retailer_hint=retailer_hint)
+                    return _finish(load_okendo_api_url(api_url, product_url_hint=product_url, retailer_hint=retailer_hint, progress_ui=child))
             except Exception:
                 continue
 
     if "costco.com" in host:
-        return _load_bazaarvoice_product_page(
-            session,
-            product_url=product_url,
-            product_html=product_html,
-            cfg={
-                "kind": "action",
-                "passkey": next(cfg["passkey"] for cfg in SITE_REVIEW_CONFIGS if cfg["key"] == "costco"),
-                "displaycode": "2070_2_0-en_us",
-                "api_version": "5.5",
-                "sort": "SubmissionTime:desc",
-                "content_locales": "en_US,ar*,zh*,hr*,cs*,da*,nl*,en*,et*,fi*,fr*,de*,el*,he*,hu*,id*,it*,ja*,ko*,lv*,lt*,ms*,no*,pl*,pt*,ro*,sk*,sl*,es*,sv*,th*,tr*,vi*",
-                "retailer": "Costco",
-                "source_system": "Bazaarvoice",
-            },
+        return _finish(
+            _load_bazaarvoice_product_page(
+                session,
+                product_url=product_url,
+                product_html=product_html,
+                cfg={
+                    "kind": "action",
+                    "passkey": next(cfg["passkey"] for cfg in SITE_REVIEW_CONFIGS if cfg["key"] == "costco"),
+                    "displaycode": "2070_2_0-en_us",
+                    "api_version": "5.5",
+                    "sort": "SubmissionTime:desc",
+                    "content_locales": "en_US,ar*,zh*,hr*,cs*,da*,nl*,en*,et*,fi*,fr*,de*,el*,he*,hu*,id*,it*,ja*,ko*,lv*,lt*,ms*,no*,pl*,pt*,ro*,sk*,sl*,es*,sv*,th*,tr*,vi*",
+                    "retailer": "Costco",
+                    "source_system": "Bazaarvoice",
+                },
+                progress_ui=_scale_progress(progress_ui, start=0.28, end=0.96, prefix="Costco feed"),
+            )
         )
 
     if "sephora.com" in host:
         sephora_candidates: List[str] = []
-        sephora_candidates.extend(re.findall(r"\b(P\d{5,10})\b", product_url, flags=re.IGNORECASE))
-        sephora_candidates.extend(re.findall(r"\b(P\d{5,10})\b", product_html or "", flags=re.IGNORECASE))
-        return _load_bazaarvoice_product_page(
-            session,
-            product_url=product_url,
-            product_html=product_html,
-            cfg={
-                "kind": "simple",
-                "passkey": next(cfg["passkey"] for cfg in SITE_REVIEW_CONFIGS if cfg["key"] == "sephora"),
-                "api_version": "5.4",
-                "sort": "SubmissionTime:desc",
-                "content_locale": "en*",
-                "locale": "en_US",
-                "source_system": "Bazaarvoice",
-                "retailer": "Sephora",
-            },
-            extra_candidates=sephora_candidates,
+        sephora_candidates.extend(re.findall(r"(P\d{5,10})", product_url, flags=re.IGNORECASE))
+        sephora_candidates.extend(re.findall(r"(P\d{5,10})", product_html or "", flags=re.IGNORECASE))
+        return _finish(
+            _load_bazaarvoice_product_page(
+                session,
+                product_url=product_url,
+                product_html=product_html,
+                cfg={
+                    "kind": "simple",
+                    "passkey": next(cfg["passkey"] for cfg in SITE_REVIEW_CONFIGS if cfg["key"] == "sephora"),
+                    "api_version": "5.4",
+                    "sort": "SubmissionTime:desc",
+                    "content_locale": "en*",
+                    "locale": "en_US",
+                    "source_system": "Bazaarvoice",
+                    "retailer": "Sephora",
+                },
+                extra_candidates=sephora_candidates,
+                progress_ui=_scale_progress(progress_ui, start=0.28, end=0.96, prefix="Sephora feed"),
+            )
         )
 
     if "ulta.com" in host:
-        return _load_powerreviews_product_page(
-            session,
-            product_url=product_url,
-            product_html=product_html,
-            cfg={
-                "merchant_id": "6406",
-                "locale": "en_US",
-                "page_locale": "en_US",
-                "apikey": next(cfg["api_key"] for cfg in SITE_REVIEW_CONFIGS if cfg["key"] == "ulta"),
-                "sort": "Newest",
-                "retailer": "Ulta",
-                "source_system": "PowerReviews",
-            },
-            extra_candidates=extract_ulta_powerreviews_candidates(product_url, product_html),
+        return _finish(
+            _load_powerreviews_product_page(
+                session,
+                product_url=product_url,
+                product_html=product_html,
+                cfg={
+                    "merchant_id": "6406",
+                    "locale": "en_US",
+                    "page_locale": "en_US",
+                    "apikey": next(cfg["api_key"] for cfg in SITE_REVIEW_CONFIGS if cfg["key"] == "ulta"),
+                    "sort": "Newest",
+                    "retailer": "Ulta",
+                    "source_system": "PowerReviews",
+                },
+                extra_candidates=extract_ulta_powerreviews_candidates(product_url, product_html),
+                progress_ui=_scale_progress(progress_ui, start=0.28, end=0.96, prefix="Ulta feed"),
+            )
         )
 
     if "currentbody.com" in host:
-        return _load_currentbody_product_page(
-            session,
-            product_url=product_url,
-            product_html=product_html,
-            cfg=next((dict(cfg) for cfg in SITE_REVIEW_CONFIGS if cfg["key"] == "currentbody"), {
-                "okendo_user_id": "",
-                "locale": "en",
-                "order_by": "date desc",
-                "page_size": OKENDO_MAX_PAGE_SIZE,
-                "retailer": "CurrentBody",
-            }),
+        return _finish(
+            _load_currentbody_product_page(
+                session,
+                product_url=product_url,
+                product_html=product_html,
+                cfg=next((dict(cfg) for cfg in SITE_REVIEW_CONFIGS if cfg["key"] == "currentbody"), {
+                    "okendo_user_id": "",
+                    "locale": "en",
+                    "order_by": "date desc",
+                    "page_size": OKENDO_MAX_PAGE_SIZE,
+                    "retailer": "CurrentBody",
+                }),
+                progress_ui=_scale_progress(progress_ui, start=0.28, end=0.96, prefix="CurrentBody feed"),
+            )
         )
 
     if "hoka.com" in host:
@@ -939,49 +1168,81 @@ def load_product_reviews(product_url: str) -> Dict[str, Any]:
         hoka_candidates.extend(re.findall(r"Item\s*No\.?\s*(\d{5,10})", product_html or "", flags=re.IGNORECASE))
         hoka_candidates.extend(re.findall(r'"product_page_id"\s*[:=]\s*"?(\d{5,10})', product_html or "", flags=re.IGNORECASE))
         hoka_candidates.extend(re.findall(r'"page_id"\s*[:=]\s*"?(\d{5,10})', product_html or "", flags=re.IGNORECASE))
-        return _load_powerreviews_product_page(
-            session,
-            product_url=product_url,
-            product_html=product_html,
-            cfg={
-                "merchant_id": "437772",
-                "locale": "en_US",
-                "page_locale": "en_US",
-                "apikey": next(cfg["api_key"] for cfg in SITE_REVIEW_CONFIGS if cfg["key"] == "hoka"),
-                "sort": "Newest",
-                "retailer": "Hoka",
-                "source_system": "PowerReviews",
-            },
-            extra_candidates=hoka_candidates,
+        return _finish(
+            _load_powerreviews_product_page(
+                session,
+                product_url=product_url,
+                product_html=product_html,
+                cfg={
+                    "merchant_id": "437772",
+                    "locale": "en_US",
+                    "page_locale": "en_US",
+                    "apikey": next(cfg["api_key"] for cfg in SITE_REVIEW_CONFIGS if cfg["key"] == "hoka"),
+                    "sort": "Newest",
+                    "retailer": "Hoka",
+                    "source_system": "PowerReviews",
+                },
+                extra_candidates=hoka_candidates,
+                progress_ui=_scale_progress(progress_ui, start=0.28, end=0.96, prefix="Hoka feed"),
+            )
         )
 
     if looks_like_sharkninja_uk_eu(host):
         uk_pid = _extract_generic_bv_product_id(product_url, product_html)
-        return _load_bazaarvoice_product_page(
-            session,
-            product_url=product_url,
-            product_html=product_html,
-            cfg={
-                "kind": "simple",
-                "passkey": next(cfg["passkey"] for cfg in SITE_REVIEW_CONFIGS if cfg["key"] == "sharkninja_uk_eu"),
-                "api_version": "5.4",
-                "locale": "en_GB",
-                "include": "Products,Comments",
-                "sort": "SubmissionTime:desc",
-                "content_locale": "en*",
-                "retailer": "SharkNinja UK/EU",
-                "source_system": "Bazaarvoice",
-            },
-            extra_candidates=[uk_pid] if uk_pid else None,
+        return _finish(
+            _load_bazaarvoice_product_page(
+                session,
+                product_url=product_url,
+                product_html=product_html,
+                cfg={
+                    "kind": "simple",
+                    "passkey": next(cfg["passkey"] for cfg in SITE_REVIEW_CONFIGS if cfg["key"] == "sharkninja_uk_eu"),
+                    "api_version": "5.4",
+                    "locale": "en_GB",
+                    "include": "Products,Comments",
+                    "sort": "SubmissionTime:desc",
+                    "content_locale": "en*",
+                    "retailer": "SharkNinja UK/EU",
+                    "source_system": "Bazaarvoice",
+                },
+                extra_candidates=[uk_pid] if uk_pid else None,
+                progress_ui=_scale_progress(progress_ui, start=0.28, end=0.96, prefix="SharkNinja UK/EU feed"),
+            )
         )
 
     pid = _extract_generic_bv_product_id(product_url, product_html)
     if pid:
         try:
-            return _fetch_all_bazaarvoice_for_candidate(
+            return _finish(
+                _fetch_all_bazaarvoice_for_candidate(
+                    session,
+                    product_url=product_url,
+                    product_id=pid,
+                    cfg={
+                        "kind": "action",
+                        "passkey": DEFAULT_PASSKEY,
+                        "displaycode": DEFAULT_DISPLAYCODE,
+                        "api_version": DEFAULT_API_VERSION,
+                        "sort": DEFAULT_SORT,
+                        "content_locales": DEFAULT_CONTENT_LOCALES,
+                        "retailer": "SharkNinja",
+                        "source_system": "Bazaarvoice",
+                    },
+                    progress_ui=_scale_progress(progress_ui, start=0.32, end=0.96, prefix="Matched feed"),
+                )
+            )
+        except Exception:
+            pass
+
+    generic_candidates: List[str] = []
+    generic_candidates.extend(extract_candidate_tokens_from_url(product_url))
+    generic_candidates.extend(extract_candidate_tokens_from_html(product_html))
+    try:
+        return _finish(
+            _load_bazaarvoice_product_page(
                 session,
                 product_url=product_url,
-                product_id=pid,
+                product_html=product_html,
                 cfg={
                     "kind": "action",
                     "passkey": DEFAULT_PASSKEY,
@@ -992,29 +1253,9 @@ def load_product_reviews(product_url: str) -> Dict[str, Any]:
                     "retailer": "SharkNinja",
                     "source_system": "Bazaarvoice",
                 },
+                extra_candidates=generic_candidates,
+                progress_ui=_scale_progress(progress_ui, start=0.32, end=0.96, prefix="Generic feed"),
             )
-        except Exception:
-            pass
-
-    generic_candidates: List[str] = []
-    generic_candidates.extend(extract_candidate_tokens_from_url(product_url))
-    generic_candidates.extend(extract_candidate_tokens_from_html(product_html))
-    try:
-        return _load_bazaarvoice_product_page(
-            session,
-            product_url=product_url,
-            product_html=product_html,
-            cfg={
-                "kind": "action",
-                "passkey": DEFAULT_PASSKEY,
-                "displaycode": DEFAULT_DISPLAYCODE,
-                "api_version": DEFAULT_API_VERSION,
-                "sort": DEFAULT_SORT,
-                "content_locales": DEFAULT_CONTENT_LOCALES,
-                "retailer": "SharkNinja",
-                "source_system": "Bazaarvoice",
-            },
-            extra_candidates=generic_candidates,
         )
     except Exception:
         if page_fetch_error is not None:
@@ -1024,20 +1265,26 @@ def load_product_reviews(product_url: str) -> Dict[str, Any]:
         raise
 
 
-def load_multiple_product_reviews(urls: Sequence[str] | str) -> Dict[str, Any]:
+def load_multiple_product_reviews(urls: Sequence[str] | str, *, progress_ui=None) -> Dict[str, Any]:
     url_list = parse_bulk_product_urls(urls if isinstance(urls, str) else "\n".join([str(url) for url in (urls or [])]))
     if not url_list:
         raise ReviewDownloaderError("Add at least one product or review URL.")
     if len(url_list) == 1:
-        return load_product_reviews(url_list[0])
+        return load_product_reviews(url_list[0], progress_ui=progress_ui)
 
     frames: List[pd.DataFrame] = []
     loaded: List[Dict[str, Any]] = []
     failures: List[Tuple[str, str]] = []
+    total_urls = len(url_list)
+    _report_progress(progress_ui, progress=0.03, title="Preparing combined workspace", detail=f"{total_urls} source link(s) queued for scraping.")
 
     for index, url in enumerate(url_list, start=1):
+        host = strip_www(urlparse(url).netloc) or url
+        start = 0.08 + (0.76 * ((index - 1) / max(total_urls, 1)))
+        end = 0.08 + (0.76 * (index / max(total_urls, 1)))
+        _report_progress(progress_ui, progress=start, title="Loading source", detail=f"Starting source {index} of {total_urls}: {host}")
         try:
-            dataset = load_product_reviews(url)
+            dataset = load_product_reviews(url, progress_ui=_scale_progress(progress_ui, start=start, end=end, prefix=f"Source {index} of {total_urls}"))
             frame = dataset["reviews_df"].copy()
             frame["loaded_from_url"] = url
             frame["loaded_from_host"] = strip_www(urlparse(url).netloc) or "Unknown"
@@ -1045,13 +1292,16 @@ def load_multiple_product_reviews(urls: Sequence[str] | str) -> Dict[str, Any]:
             frame["loaded_from_batch"] = f"Link {index}"
             frames.append(frame)
             loaded.append(dataset)
+            _report_progress(progress_ui, progress=end, title="Source loaded", detail=f"Loaded source {index} of {total_urls}: {len(frame):,} review(s) from {host}.")
         except Exception as exc:
             failures.append((url, str(exc)))
+            _report_progress(progress_ui, progress=end, title="Source skipped", detail=f"Could not load source {index} of {total_urls}: {host}. {exc}")
 
     if not frames:
         details = "; ".join(f"{url} -> {err}" for url, err in failures[:3]) if failures else "No links loaded."
         raise ReviewDownloaderError(f"Could not load any links. {details}")
 
+    _report_progress(progress_ui, progress=0.9, title="Combining reviews", detail=f"Loaded {len(loaded)} of {total_urls} source link(s). Merging and deduplicating reviews.")
     combined = pd.concat(frames, ignore_index=True)
     if "review_id" in combined.columns:
         exact_key = (
@@ -1077,6 +1327,7 @@ def load_multiple_product_reviews(urls: Sequence[str] | str) -> Dict[str, Any]:
         requests_needed=sum(int(getattr(dataset.get("summary"), "requests_needed", 0)) for dataset in loaded),
         reviews_downloaded=len(combined),
     )
+    _report_progress(progress_ui, progress=1.0, title="Combined workspace ready", detail=f"{len(combined):,} review(s) ready across {len(loaded)} loaded source link(s).")
     return {
         "summary": summary,
         "reviews_df": combined,
@@ -1085,7 +1336,6 @@ def load_multiple_product_reviews(urls: Sequence[str] | str) -> Dict[str, Any]:
         "source_urls": url_list,
         "source_failures": failures,
     }
-
 
 def load_uploaded_files(files, *, include_local_symptomization: bool = False) -> Dict[str, Any]:
     if not files:

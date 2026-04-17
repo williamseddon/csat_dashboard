@@ -52,6 +52,46 @@ except Exception:
     _package_load_multiple_product_reviews = None
     _package_load_uploaded_files = None
 
+try:
+    from review_analyst.local_database import (
+        count_local_review_db_selection as _count_local_review_db_selection,
+        ensure_local_review_db_dirs as _ensure_local_review_db_dirs,
+        export_local_review_database_snapshot as _export_local_review_database_snapshot,
+        get_local_review_db_filter_options as _get_local_review_db_filter_options,
+        get_local_review_db_status as _get_local_review_db_status,
+        load_local_review_analytics_frame as _load_local_review_analytics_frame,
+        load_local_review_workspace as _load_local_review_workspace,
+        search_local_review_entities as _search_local_review_entities,
+        sync_local_review_database as _sync_local_review_database,
+    )
+except Exception:
+    _count_local_review_db_selection = None
+    _ensure_local_review_db_dirs = None
+    _export_local_review_database_snapshot = None
+    _get_local_review_db_filter_options = None
+    _get_local_review_db_status = None
+    _load_local_review_analytics_frame = None
+    _load_local_review_workspace = None
+    _search_local_review_entities = None
+    _sync_local_review_database = None
+
+try:
+    from review_analyst.action_center import (
+        apply_action_filters as _apply_action_filters,
+        build_alert_feed as _build_alert_feed,
+        detect_trend_movers as _detect_trend_movers,
+        prepare_action_frame as _prepare_action_frame,
+        summarize_base_models as _summarize_base_models,
+        summarize_dimension as _summarize_dimension,
+    )
+except Exception:
+    _apply_action_filters = None
+    _build_alert_feed = None
+    _detect_trend_movers = None
+    _prepare_action_frame = None
+    _summarize_base_models = None
+    _summarize_dimension = None
+
 from review_analyst.api_key_ui import (
     BUILDER_API_KEY_SUBTITLE as _BUILDER_API_KEY_SUBTITLE,
     MANUAL_API_KEY_HELP as _MANUAL_API_KEY_HELP,
@@ -558,8 +598,10 @@ HOKA_PR_CONFIG = {
 DEFAULT_PRODUCT_URL = "https://www.sharkninja.com/ninja-air-fryer-pro-xl-6-in-1/AF181.html"
 SOURCE_MODE_URL = "Product / review URL"
 SOURCE_MODE_FILE = "Uploaded review file"
+SOURCE_MODE_LOCAL_DB = "Local review database"
 
 TAB_DASHBOARD = "📊  Dashboard"
+TAB_ACTION_CENTER = "🚨  Action Center"
 TAB_REVIEW_EXPLORER = "🔍  Review Explorer"
 TAB_AI_ANALYST = "🤖  AI Analyst"
 TAB_REVIEW_PROMPT = "🏷️  Review Prompt"
@@ -567,12 +609,14 @@ TAB_SYMPTOMIZER = "💊  Symptomizer"
 TAB_SOCIAL_LISTENING = "📣  Social Listening Beta"
 WORKSPACE_TABS = [
     TAB_DASHBOARD,
+    TAB_ACTION_CENTER,
     TAB_REVIEW_EXPLORER,
     TAB_REVIEW_PROMPT,
     TAB_SYMPTOMIZER,
 ]
 WORKSPACE_NAV_META = {
     TAB_DASHBOARD: {"label": "Dashboard", "hint": "Executive snapshot"},
+    TAB_ACTION_CENTER: {"label": "Action Center", "hint": "Alerts + compare views"},
     TAB_REVIEW_EXPLORER: {"label": "Review Explorer", "hint": "Rows, filters, evidence"},
     TAB_REVIEW_PROMPT: {"label": "Review Prompt", "hint": "AI row tagging"},
     TAB_SYMPTOMIZER: {"label": "Symptomizer", "hint": "Theme taxonomy + runs"},
@@ -795,6 +839,20 @@ def _fmt_pct(v, d=1):
     if v is None or _is_missing(v):
         return "n/a"
     return f"{100 * float(v):.{d}f}%"
+
+
+
+def _fmt_file_size(num_bytes: Any) -> str:
+    try:
+        size = float(num_bytes or 0)
+    except Exception:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if abs(size) < 1024 or unit == units[-1]:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return "0 B"
 
 
 def _trunc(text, max_chars=420):
@@ -1797,7 +1855,7 @@ def _finalize_df(df):
     df["base_sku"] = df.get("base_sku", pd.Series(dtype="str")).fillna("").astype(str).str.strip()
     df["sku_item"] = df.get("sku_item", pd.Series(dtype="str")).fillna("").astype(str).str.strip()
     df["product_id"] = df["product_id"].fillna("").astype(str).str.strip()
-    fallback = df["base_sku"].where(df["base_sku"].ne(""), df["product_id"])
+    fallback = df["product_id"].where(df["product_id"].ne(""), df["base_sku"])
     df["product_or_sku"] = df["sku_item"].where(df["sku_item"].ne(""), fallback)
     df["product_or_sku"] = df["product_or_sku"].fillna("").astype(str).str.strip().replace({"": pd.NA})
     df["title_and_text"] = (df["title"].str.strip() + " " + df["review_text"].str.strip()).str.strip()
@@ -1824,8 +1882,8 @@ def _pick_col(df, aliases):
 UPLOAD_REVIEW_ID_ALIASES = ["Event Id", "Event ID", "Review ID", "Review Id", "Verbatim Id", "Verbatim ID", "Id", "review_id"]
 UPLOAD_REVIEW_TEXT_ALIASES = ["Review Text", "Review", "Verbatim", "Body", "Content", "review_text"]
 UPLOAD_TITLE_ALIASES = ["Title", "Review Title", "Review title", "Headline", "title"]
-UPLOAD_RATING_ALIASES = ["Rating (num)", "Rating", "Stars", "Star Rating", "rating"]
-UPLOAD_DATE_ALIASES = ["Opened date", "Opened Date", "Submission Time", "Review Date", "Date", "submission_time"]
+UPLOAD_RATING_ALIASES = ["Overall Rating", "Rating (num)", "Rating", "Stars", "Star Rating", "rating"]
+UPLOAD_DATE_ALIASES = ["Review Submission Date", "Opened date", "Opened Date", "Submission Time", "Review Date", "Date", "submission_time"]
 LOCAL_SYMPTOM_META_ALIASES = {
     "AI Safety": ["AI Safety", "Safety"],
     "AI Reliability": ["AI Reliability", "Reliability"],
@@ -1924,16 +1982,16 @@ def _normalize_uploaded_df(raw, *, source_name="", include_local_symptomization=
     w = _collapse_duplicate_named_columns(w)
     n = pd.DataFrame(index=w.index)
     n["review_id"] = _series_alias(w, UPLOAD_REVIEW_ID_ALIASES)
-    n["product_id"] = _series_alias(w, ["Base SKU", "Model (SKU)", "Model SKU", "Product ID", "Product Id", "ProductId", "BaseSKU"])
+    n["product_id"] = _series_alias(w, ["Product ID", "Product Id", "ProductId", "Model (SKU)", "Model SKU", "Base SKU", "BaseSKU"])
     n["base_sku"] = _series_alias(w, ["Base SKU", "Model (SKU)", "Model SKU", "BaseSKU"])
     n["sku_item"] = _series_alias(w, ["SKU Item", "Model (SKU)", "Model SKU", "SKU", "Child SKU", "Variant SKU", "Item Number", "Item No"])
     n["original_product_name"] = _series_alias(w, ["Product Name", "Product", "Name"])
     n["review_text"] = _series_alias(w, UPLOAD_REVIEW_TEXT_ALIASES)
     n["title"] = _series_alias(w, UPLOAD_TITLE_ALIASES)
-    n["post_link"] = _series_alias(w, ["Post Link", "Web Link", "URL", "Review URL", "Product URL"])
+    n["post_link"] = _series_alias(w, ["Post Link", "Web Link", "URL", "Review URL", "Product URL", "Product Page URL"])
     n["rating"] = _series_alias(w, UPLOAD_RATING_ALIASES)
     n["submission_time"] = _series_alias(w, UPLOAD_DATE_ALIASES)
-    n["content_locale"] = _series_alias(w, ["Content Locale", "Locale", "Reviewer Location", "Location", "Country"])
+    n["content_locale"] = _series_alias(w, ["Review Display Locale", "Content Locale", "Locale", "Reviewer Location", "Location", "Country"])
     n["retailer"] = _series_alias(w, ["Retailer", "Merchant", "Channel", "Source"])
     n["age_group"] = _series_alias(w, ["Age Group", "Age", "Age Range"])
     n["user_location"] = _series_alias(w, ["Reviewer Location", "Location", "Country"])
@@ -3071,42 +3129,45 @@ def _sw_style_fig(fig):
     trace_count = len(legend_labels) or len(getattr(fig, "data", []) or [])
     longest_label = max((len(label) for label in legend_labels), default=0)
     total_label_chars = sum(len(label) for label in legend_labels)
-    use_vertical_legend = trace_count > 3 or (
-        trace_count >= 2 and (longest_label >= 10 or (trace_count >= 3 and total_label_chars >= 14))
+    use_vertical_legend = trace_count > 4 or (
+        trace_count >= 3 and (longest_label >= 12 or total_label_chars >= 28)
     )
     if use_vertical_legend:
         legend_cfg = dict(
             orientation="v",
             y=1.0,
-            x=1.01,
+            x=1.02,
             xanchor="left",
             yanchor="top",
-            bgcolor="rgba(255,255,255,0.86)",
+            bgcolor="rgba(255,255,255,0.88)",
             bordercolor="rgba(148,163,184,0.22)",
             borderwidth=1,
             font=dict(size=11),
+            title_text="",
         )
-        margin = dict(l=26, r=118, t=56, b=44)
+        margin = dict(l=26, r=146, t=62, b=56)
     else:
         legend_cfg = dict(
             orientation="h",
-            y=1.12,
+            y=-0.24,
             x=0,
             xanchor="left",
-            yanchor="bottom",
-            bgcolor="rgba(255,255,255,0.84)",
+            yanchor="top",
+            bgcolor="rgba(255,255,255,0.86)",
             bordercolor="rgba(148,163,184,0.18)",
             borderwidth=1,
             font=dict(size=11),
+            title_text="",
         )
-        margin = dict(l=26, r=18, t=64, b=44)
+        margin = dict(l=26, r=18, t=58, b=92)
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Inter, system-ui, sans-serif", size=12),
         margin=margin,
-        title=dict(x=0, xanchor="left", font=dict(size=15)),
+        title=dict(x=0, xanchor="left", y=0.98, font=dict(size=15)),
         legend=legend_cfg,
+        legend_title_text="",
         hoverlabel=dict(font=dict(family="Inter, system-ui, sans-serif", size=12)),
     )
     fig.update_xaxes(gridcolor=GRID, zerolinecolor=GRID, automargin=True, title_standoff=10)
@@ -4684,7 +4745,103 @@ def _symptom_table_column_config(df_in):
         return {}
 
 
-def _render_interactive_symptom_table(tbl, *, key_prefix, empty_label):
+def _symptom_drilldown_dimension_specs(df: pd.DataFrame) -> List[Tuple[str, str]]:
+    specs: List[Tuple[str, str]] = []
+    if df is None or df.empty:
+        return specs
+    candidates = [
+        ("Country", "country"),
+        ("Market / Locale", "content_locale"),
+        ("Reviewer Location", "user_location"),
+        ("Base Model", "base_model_number"),
+        ("Product / SKU", "product_id"),
+        ("Mapped Category", "mapped_category"),
+        ("Mapped Subcategory", "mapped_subcategory"),
+        ("Acquisition Channel", "review_acquisition_channel"),
+        ("Moderation", "moderation_bucket"),
+    ]
+    for label, col in candidates:
+        if col in df.columns:
+            specs.append((label, col))
+    specs.append(("Review Type", "__review_type"))
+    return specs
+
+
+
+def _render_symptom_drilldown(detail_df, symptom_cols, *, key_prefix, side_label="Theme"):
+    if detail_df is None or not isinstance(detail_df, pd.DataFrame) or detail_df.empty or not symptom_cols:
+        return
+    long, symptomized_reviews = _prepare_symptom_long(detail_df, symptom_cols)
+    if long.empty:
+        return
+    symptom_options = sorted(long["symptom"].dropna().astype(str).unique().tolist(), key=lambda x: x.lower())
+    if not symptom_options:
+        return
+    dim_specs = _symptom_drilldown_dimension_specs(detail_df)
+    if not dim_specs:
+        return
+
+    with st.expander(f"🔎 {side_label.title()} breakdown explorer", expanded=False):
+        c1, c2, c3 = st.columns([1.8, 1.45, 0.9])
+        symptom_choice = c1.selectbox(f"{side_label.title()} theme", options=symptom_options, key=f"{key_prefix}_drill_symptom")
+        dim_labels = [label for label, _ in dim_specs]
+        dim_label = c2.selectbox("Break down by", options=dim_labels, key=f"{key_prefix}_drill_dimension")
+        row_limit = int(c3.selectbox("Rows", options=[10, 20, 50], index=1, key=f"{key_prefix}_drill_rows"))
+        dim_col = dict(dim_specs).get(dim_label) or dim_specs[0][1]
+        hit_rows = long.loc[long["symptom"] == symptom_choice, "__row"].drop_duplicates().astype(int).tolist()
+        if not hit_rows:
+            st.info("No tagged reviews match the selected theme.")
+            return
+        subset = detail_df.reset_index(drop=True).iloc[hit_rows].copy()
+        subset["rating"] = pd.to_numeric(subset.get("rating"), errors="coerce")
+        subset["submission_time"] = pd.to_datetime(subset.get("submission_time"), errors="coerce")
+        if dim_col == "__review_type":
+            if "review_origin_group" in subset.columns:
+                subset[dim_col] = subset["review_origin_group"].astype("string").fillna("Unknown").str.strip().replace({"": "Unknown"})
+            else:
+                subset[dim_col] = subset.get("incentivized_review", pd.Series(False, index=subset.index)).astype("boolean").fillna(False).map({True: "Seeded / Incentivized", False: "Organic"})
+        elif dim_col == "country" and "country" not in subset.columns:
+            subset[dim_col] = subset.get("content_locale", pd.Series(pd.NA, index=subset.index)).astype("string").str.split("_").str[-1]
+        else:
+            subset[dim_col] = subset.get(dim_col, pd.Series(pd.NA, index=subset.index))
+        subset[dim_col] = subset[dim_col].astype("string").fillna("Unknown").str.strip().replace({"": "Unknown"})
+
+        rollup = (
+            subset.groupby(dim_col, dropna=False)
+            .agg(
+                Reviews=("review_id", "count"),
+                Avg_Star=("rating", "mean"),
+                Low_Star_Share=("rating", lambda s: float((pd.to_numeric(s, errors="coerce") <= 2).mean()) if len(s) else 0.0),
+                Latest=("submission_time", "max"),
+            )
+            .reset_index()
+            .rename(columns={dim_col: dim_label})
+            .sort_values(["Reviews", "Avg_Star", dim_label], ascending=[False, True, True], kind="mergesort")
+        )
+        rollup["Avg ★"] = rollup["Avg_Star"].map(lambda v: round(float(v), 2) if pd.notna(v) else None)
+        rollup["Low-star %"] = (pd.to_numeric(rollup["Low_Star_Share"], errors="coerce").fillna(0.0) * 100.0).round(1)
+        rollup["Latest review"] = pd.to_datetime(rollup["Latest"], errors="coerce").dt.strftime("%Y-%m-%d")
+        top_rollup = rollup.head(row_limit).copy()
+        st.caption(f"{len(hit_rows):,} tagged reviews mention {symptom_choice}. These cuts help you see where the theme is concentrated and whether it is localized by market, product, moderation state, or review source.")
+        fig = px.bar(
+            top_rollup.sort_values("Reviews", ascending=True),
+            x="Reviews",
+            y=dim_label,
+            orientation="h",
+            text="Reviews",
+            hover_data={"Avg ★": True, "Low-star %": True, "Latest review": True},
+        )
+        fig.update_layout(height=max(320, 34 * len(top_rollup) + 90), margin=dict(l=24, r=18, t=20, b=24), title=None)
+        fig.update_traces(textposition="outside")
+        fig = _sw_style_fig(fig)
+        _show_plotly(fig)
+        display_cols = [dim_label, "Reviews", "Avg ★", "Low-star %", "Latest review"]
+        st.dataframe(top_rollup[display_cols], use_container_width=True, hide_index=True, height=min(560, max(280, 36 * len(top_rollup) + 40)))
+        st.caption(f"Symptomized reviews on this side: {symptomized_reviews:,}. Use the breakdown above to turn a high-level detractor or delighter into a concrete action list.")
+
+
+
+def _render_interactive_symptom_table(tbl, *, key_prefix, empty_label, detail_df=None, symptom_cols=None):
     display = _symptom_table_for_display(tbl)
     if display.empty:
         st.info(f"No {empty_label.lower()} data.")
@@ -4733,6 +4890,8 @@ def _render_interactive_symptom_table(tbl, *, key_prefix, empty_label):
         return
     height_px = int(min(max(360, 36 * len(filtered) + 72), 760))
     st.dataframe(filtered[visible_cols], use_container_width=True, hide_index=True, height=height_px, column_config=_symptom_table_column_config(filtered[visible_cols]))
+    if detail_df is not None and symptom_cols:
+        _render_symptom_drilldown(detail_df, symptom_cols, key_prefix=key_prefix, side_label=empty_label)
 
 
 def _compute_detailed_symptom_impact(df_in, symptom_cols, baseline, *, kind):
@@ -5033,10 +5192,10 @@ def _render_symptom_dashboard(filtered_df, overall_df=None):
     t1, t2 = st.tabs([f"🔴 Detractors ({len(det_tbl):,})", f"🟢 Delighters ({len(del_tbl):,})"])
     with t1:
         with st.container(border=True):
-            _render_interactive_symptom_table(det_tbl, key_prefix="sw_det_table", empty_label="detractor")
+            _render_interactive_symptom_table(det_tbl, key_prefix="sw_det_table", empty_label="detractor", detail_df=filtered_df, symptom_cols=det_cols)
     with t2:
         with st.container(border=True):
-            _render_interactive_symptom_table(del_tbl, key_prefix="sw_del_table", empty_label="delighter")
+            _render_interactive_symptom_table(del_tbl, key_prefix="sw_del_table", empty_label="delighter", detail_df=filtered_df, symptom_cols=del_cols)
     try:
         out_xlsx = io.BytesIO()
         with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
@@ -5084,7 +5243,13 @@ def _render_symptom_dashboard(filtered_df, overall_df=None):
 # ═══════════════════════════════════════════════════════════════════════════════
 CORE_REVIEW_FILTER_SPECS = [
     {"key": "product_or_sku", "label": "SKU / Product", "kind": "column", "aliases": ["product_or_sku", "product_name", "product", "product_id", "sku", "item_id", "model", "model_number", "asin"]},
+    {"key": "base_model_number", "label": "Base Model", "kind": "column", "aliases": ["base_model_number", "master_item", "master item", "base model", "base_sku", "base sku"]},
+    {"key": "mapped_category", "label": "Mapped Category", "kind": "column", "aliases": ["mapped_category", "product_category", "catalog_category"]},
+    {"key": "mapped_subcategory", "label": "Mapped Subcategory", "kind": "column", "aliases": ["mapped_subcategory", "product_subcategory", "catalog_subcategory"]},
+    {"key": "mapped_subsub_category", "label": "Mapped Sub-subcategory", "kind": "column", "aliases": ["mapped_subsub_category", "product_subsub_category", "catalog_subsub_category"]},
     {"key": "content_locale", "label": "Market / Locale", "kind": "column", "aliases": ["content_locale", "locale", "market", "region", "country", "country_code", "geo", "marketplace"]},
+    {"key": "moderation_bucket", "label": "Moderation", "kind": "column", "aliases": ["moderation_bucket", "moderation_status"]},
+    {"key": "review_acquisition_channel", "label": "Acquisition Channel", "kind": "column", "aliases": ["review_acquisition_channel"]},
     {"key": "retailer", "label": "Retailer", "kind": "column", "aliases": ["retailer", "merchant", "channel", "store", "seller", "retailer_name", "retail_partner", "site_name"]},
     {"key": "source_system", "label": "Source System", "kind": "column", "aliases": ["source_system", "source", "platform", "provider", "review_source", "connector", "system"]},
     {"key": "loaded_from_host", "label": "Loaded Site", "kind": "column", "aliases": ["loaded_from_host", "loaded_host", "domain", "host", "site", "website"]},
@@ -5290,8 +5455,11 @@ def _filter_series_for_spec(df: pd.DataFrame, spec: Dict[str, Any]) -> pd.Series
         s = df[spec["column"]].astype("string").fillna("Unknown").str.strip()
         return s.replace("", "Unknown")
     if key == "review_type":
+        if "review_origin_group" in df.columns:
+            raw = df["review_origin_group"].astype("string").fillna("Unknown").str.strip()
+            return raw.replace("", "Unknown")
         raw = df.get("incentivized_review", pd.Series(False, index=df.index)).astype("boolean")
-        return raw.map({True: "Incentivized", False: "Organic"}).fillna("Unknown")
+        return raw.map({True: "Seeded / Incentivized", False: "Organic"}).fillna("Unknown")
     if key == "recommendation":
         raw = df.get("is_recommended", pd.Series(pd.NA, index=df.index)).astype("boolean")
         return raw.map({True: "Recommended", False: "Not Recommended"}).fillna("Unknown")
@@ -5685,7 +5853,7 @@ def _render_workspace_nav() -> str:
     current = st.session_state.get("workspace_active_tab", TAB_DASHBOARD)
     nav_items = WORKSPACE_TABS
     st.markdown(
-        "<div class='workspace-nav-card'><div class='builder-kicker'>Workspace sections</div><div class='builder-title' style='font-size:16px;'>Move between the key workflows</div><div class='workspace-nav-sub'>Start on the Dashboard for the executive readout, then move into Review Explorer, Review Prompt, or Symptomizer for deeper work. Social Listening Beta now lives only in the sidebar.</div></div>",
+        "<div class='workspace-nav-card'><div class='builder-kicker'>Workspace sections</div><div class='builder-title' style='font-size:16px;'>Move between the key workflows</div><div class='workspace-nav-sub'>Start on the Dashboard for the executive readout, jump into Action Center for category / country / base-model comparisons, then use Review Explorer, Review Prompt, or Symptomizer for deeper work. Social Listening Beta now lives only in the sidebar.</div></div>",
         unsafe_allow_html=True,
     )
     cols = st.columns(len(nav_items))
@@ -5777,6 +5945,150 @@ def _product_name(summary, df):
             return f"Combined review workspace ({len(prods)} products)"
     return _safe_summary_product_label(summary)
 
+def _ai_entity_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _safe_text(value).lower())
+
+
+
+def _build_ai_entity_resolution(question: str, *, dataset=None, filtered_df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    question_text = _safe_text(question)
+    if not question_text:
+        return {}
+    question_key = _ai_entity_key(question_text)
+    question_tokens = {token for token in re.split(r"[^a-z0-9]+", question_text.lower()) if token}
+    filtered_df = filtered_df.copy() if isinstance(filtered_df, pd.DataFrame) else pd.DataFrame()
+    local_matches = []
+    local_ctx = _workspace_local_db_context(dataset) if dataset else {}
+    manifest_id = str(local_ctx.get("manifest_id") or "")
+    if local_ctx and callable(_search_local_review_entities):
+        try:
+            raw_hits = _cached_local_db_entity_search(local_ctx.get("root") or "", manifest_id, query=question_text, limit=8)
+        except Exception:
+            raw_hits = []
+        for hit in raw_hits:
+            score = float(hit.get("score") or 0.0)
+            if score < 115:
+                continue
+            local_matches.append(
+                {
+                    "entity_type": _safe_text(hit.get("entity_type")) or "Item",
+                    "base_model_number": _safe_text(hit.get("base_model_number")),
+                    "product_id": _safe_text(hit.get("product_id")),
+                    "original_product_name": _safe_text(hit.get("original_product_name")),
+                    "mapped_brand": _safe_text(hit.get("mapped_brand")),
+                    "mapped_category": _safe_text(hit.get("mapped_category")),
+                    "mapped_subcategory": _safe_text(hit.get("mapped_subcategory")),
+                    "review_count": int(hit.get("review_count") or 0),
+                    "avg_rating": float(hit.get("avg_rating")) if pd.notna(hit.get("avg_rating")) else None,
+                    "match_score": round(score, 1),
+                }
+            )
+    workspace_hits = []
+    resolved_entities = {"base_model_number": set(), "product_id": set(), "original_product_name": set()}
+    for col in ["base_model_number", "product_id", "original_product_name"]:
+        if col not in filtered_df.columns:
+            continue
+        series = filtered_df[col].astype("string").fillna("").str.strip()
+        counts = filtered_df.assign(__entity_value=series).groupby("__entity_value", dropna=False).size().sort_values(ascending=False)
+        for value, count in counts.items():
+            value_text = _safe_text(value)
+            if not value_text:
+                continue
+            value_key = _ai_entity_key(value_text)
+            token_overlap = len(question_tokens & {token for token in re.split(r"[^a-z0-9]+", value_text.lower()) if token})
+            matches = False
+            if question_key and value_key and (question_key == value_key or question_key in value_key or value_key in question_key):
+                matches = True
+            elif token_overlap:
+                matches = True
+            if matches:
+                workspace_hits.append({"column": col, "value": value_text, "review_count": int(count)})
+                resolved_entities[col].add(value_text)
+            if len(workspace_hits) >= 8:
+                break
+    for hit in local_matches:
+        if _safe_text(hit.get("base_model_number")):
+            resolved_entities["base_model_number"].add(_safe_text(hit.get("base_model_number")))
+        if _safe_text(hit.get("product_id")):
+            resolved_entities["product_id"].add(_safe_text(hit.get("product_id")))
+        if _safe_text(hit.get("original_product_name")):
+            resolved_entities["original_product_name"].add(_safe_text(hit.get("original_product_name")))
+    report: Dict[str, Any] = {}
+    if local_matches:
+        report["local_db_entity_matches"] = local_matches[:6]
+    if workspace_hits:
+        report["current_workspace_matches"] = workspace_hits[:6]
+    report["resolved_entities"] = {
+        key: sorted(values)[:8]
+        for key, values in resolved_entities.items()
+        if values
+    }
+    if report.get("local_db_entity_matches"):
+        report["note"] = "Use these local-database entity matches to disambiguate product names, base models, SKUs, and common misspellings. If multiple candidates remain plausible, say that clearly instead of guessing."
+    elif report.get("current_workspace_matches"):
+        report["note"] = "Use these current-workspace entity matches to anchor any product-specific answer. If the requested identifier is not clearly present, say that it is uncertain."
+    return report
+
+
+def _load_ai_local_db_entity_evidence(*, dataset=None, resolved_entities: Optional[Dict[str, Sequence[str]]] = None, limit: int = 10) -> List[Dict[str, Any]]:
+    local_ctx = _workspace_local_db_context(dataset) if dataset else {}
+    if not local_ctx or not callable(_load_local_review_analytics_frame):
+        return []
+    resolved_entities = dict(resolved_entities or {})
+    base_models = [_safe_text(value) for value in resolved_entities.get("base_model_number", []) if _safe_text(value)]
+    product_ids = [_safe_text(value) for value in resolved_entities.get("product_id", []) if _safe_text(value)]
+    base_model_number = base_models[0] if len(base_models) == 1 else ""
+    product_id = product_ids[0] if len(product_ids) == 1 and not base_model_number else ""
+    if not base_model_number and not product_id:
+        return []
+    try:
+        df = _load_local_review_analytics_frame(
+            local_ctx.get("root") or None,
+            columns=[
+                "review_id",
+                "submission_time",
+                "submission_date",
+                "rating",
+                "incentivized_review",
+                "content_locale",
+                "title",
+                "review_text",
+                "base_model_number",
+                "product_id",
+                "original_product_name",
+                "mapped_brand",
+                "mapped_category",
+                "mapped_subcategory",
+            ],
+            base_model_number=base_model_number,
+            product_id=product_id,
+            limit_rows=max(int(limit or 10) * 2, 18),
+        )
+    except Exception:
+        return []
+    if df is None or df.empty:
+        return []
+    evidence: List[Dict[str, Any]] = []
+    for _, row in df.head(max(int(limit or 10), 1)).iterrows():
+        evidence.append(
+            dict(
+                review_id=_safe_text(row.get("review_id")),
+                rating=_safe_int(row.get("rating"), 0) if pd.notna(row.get("rating")) else None,
+                incentivized_review=_safe_bool(row.get("incentivized_review"), False),
+                content_locale=_safe_text(row.get("content_locale")),
+                submission_date=_safe_text(row.get("submission_date")),
+                base_model_number=_safe_text(row.get("base_model_number")),
+                product_id=_safe_text(row.get("product_id")),
+                original_product_name=_safe_text(row.get("original_product_name")),
+                mapped_brand=_safe_text(row.get("mapped_brand")),
+                mapped_category=_safe_text(row.get("mapped_category")),
+                title=_trunc(row.get("title", ""), 120),
+                snippet=_trunc(row.get("review_text", ""), 420),
+            )
+        )
+    return evidence
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  AI ANALYST
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5798,9 +6110,11 @@ GENERAL_INSTRUCTIONS = textwrap.dedent("""
     • If symptom data shows a dominant theme (>30%), flag it as a primary driver.
     • If symptom data shows singleton themes (1 occurrence), treat them as anecdotal, not systematic.
     GUARDRAILS
-    • Do not invent review IDs, quotes, counts, or trends not in the evidence.
+    • Do not invent review IDs, quotes, counts, trends, or product mappings not in the evidence.
     • If the data is insufficient, say so explicitly.
     • Never hallucinate product specs — only cite what reviews mention.
+    • If a product name, SKU, or base model is ambiguous, say that clearly instead of guessing.
+    • Use any entity-resolution hints in the context to disambiguate product identifiers before answering.
     • When comparing time periods, state the sample sizes to help the reader gauge significance.
 """).strip()
 
@@ -5811,14 +6125,20 @@ def _persona_instructions(name):
     return PERSONAS[name]["instructions"]
 
 
-def _select_relevant(df, question, max_reviews=22):
+def _select_relevant(df, question, max_reviews=22, resolved_entities: Optional[Dict[str, Sequence[str]]] = None):
     if df.empty:
         return df.copy()
     w = df.copy()
-    w["blob"] = w["title_and_text"].fillna("").astype(str).map(_norm_text)
+    text_col = "title_and_text" if "title_and_text" in w.columns else ("review_text" if "review_text" in w.columns else None)
+    if text_col is None:
+        return w.head(max_reviews).copy()
+    w["blob"] = w[text_col].fillna("").astype(str).map(_norm_text)
     qt = set(_tokenize(question))
+    resolved_entities = dict(resolved_entities or {})
+    resolved_base_models = {_safe_text(value) for value in resolved_entities.get("base_model_number", []) if _safe_text(value)}
+    resolved_products = {_safe_text(value) for value in resolved_entities.get("product_id", []) if _safe_text(value)}
+    resolved_name_keys = {_ai_entity_key(value) for value in resolved_entities.get("original_product_name", []) if _safe_text(value)}
 
-    # TF-IDF-inspired scoring: penalize common terms, boost rare matches
     term_doc_freq = {}
     all_blobs = w["blob"].tolist()
     for blob in all_blobs:
@@ -5834,25 +6154,26 @@ def _select_relevant(df, question, max_reviews=22):
         t = row["blob"]
         for tk in qt:
             if tk in t:
-                # IDF boost: rare terms score higher
-                df = term_doc_freq.get(tk, 1)
-                idf = max(0.5, 3.0 - (df / n_docs) * 2.5)
+                dfreq = term_doc_freq.get(tk, 1)
+                idf = max(0.5, 3.0 - (dfreq / n_docs) * 2.5)
                 s += idf * (1 + min(t.count(tk), 3))
         r = row.get("rating")
-        # Boost low-star reviews for negative queries
         neg_terms = {"defect","broken","issue","problem","bad","fail","broke","terrible","awful","worst","disappointing","leaked","cracked","stopped"}
         pos_terms = {"love","great","perfect","best","amazing","excellent","recommend","easy","quick","comfortable"}
         if qt & neg_terms and pd.notna(r):
             s += max(0, 6 - float(r))
         elif qt & pos_terms and pd.notna(r):
             s += max(0, float(r) - 2)
-        # Organic review bonus
+        if resolved_base_models and _safe_text(row.get("base_model_number")) in resolved_base_models:
+            s += 7.0
+        if resolved_products and _safe_text(row.get("product_id")) in resolved_products:
+            s += 8.0
+        if resolved_name_keys and _ai_entity_key(row.get("original_product_name")) in resolved_name_keys:
+            s += 6.0
         if not _safe_bool(row.get("incentivized_review"), False):
             s += 0.5
-        # Length bonus (longer reviews = more evidence)
         if pd.notna(row.get("review_length_words")):
             s += min(float(row.get("review_length_words", 0)) / 60, 2.5)
-        # Symptom tag bonus — reviews with symptoms are richer context
         symptom_cols = [c for c in row.index if c.startswith("AI Symptom")]
         for sc in symptom_cols[:6]:
             if _safe_text(row.get(sc)) and _safe_text(row.get(sc)).upper() not in NON_VALUES:
@@ -5886,7 +6207,7 @@ def _snippet_rows(df, *, max_reviews=22):
     return rows
 
 
-def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, question):
+def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, question, dataset=None):
     om = _get_metrics(overall_df)
     fm = _get_metrics(filtered_df)
     try:
@@ -5897,11 +6218,13 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
         md = _monthly_trend(filtered_df).tail(12).to_dict(orient="records")
     except Exception:
         md = []
-    rel = _select_relevant(filtered_df, question, max_reviews=22)
+    entity_resolution = _build_ai_entity_resolution(question, dataset=dataset, filtered_df=filtered_df)
+    rel = _select_relevant(filtered_df, question, max_reviews=22, resolved_entities=entity_resolution.get("resolved_entities"))
     rec = filtered_df.sort_values(["submission_time", "review_id"], ascending=[False, False], na_position="last").head(10)
     low = filtered_df[filtered_df["rating"].isin([1, 2])].head(8)
     hi = filtered_df[filtered_df["rating"].isin([4, 5])].head(8)
     ev = pd.concat([rel, rec, low, hi], ignore_index=True).drop_duplicates(subset=["review_id"]).head(32)
+    local_db_entity_evidence = _load_ai_local_db_entity_evidence(dataset=dataset, resolved_entities=entity_resolution.get("resolved_entities"), limit=10)
     symptom_context = {}
     try:
         det_cols = [c for c in filtered_df.columns if c.startswith("AI Symptom Det")]
@@ -5957,11 +6280,30 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
             "top_delighters": [{"label": k, "count": v, "pct": round(v / max(n_proc, 1) * 100, 1)} for k, v in del_counts.most_common(10)],
         }
 
+    dataset = dataset if isinstance(dataset, dict) else {}
+    dataset_selection = dict(dataset.get("selection") or {}) if isinstance(dataset, dict) else {}
+    local_db_scope = {}
+    if _safe_text(dataset.get("source_type")).strip().lower() == "local_database":
+        local_db_scope = {
+            "matched_review_count": int(dataset_selection.get("total_count") or len(overall_df)),
+            "loaded_workspace_rows": int(len(overall_df)),
+            "build_row_limit": int(dataset_selection.get("limit_rows") or 0) or None,
+            "selection": {
+                "base_model_number": _safe_text(dataset_selection.get("base_model_number")),
+                "mapped_brand": _safe_text(dataset_selection.get("mapped_brand")),
+                "mapped_category": _safe_text(dataset_selection.get("mapped_category")),
+                "mapped_subcategory": _safe_text(dataset_selection.get("mapped_subcategory")),
+                "product_id": _safe_text(dataset_selection.get("product_id")),
+            },
+            "note": "When matched_review_count is larger than loaded_workspace_rows, the interactive workspace is a performance-focused slice of the synced local database. Do not imply the loaded slice is the full corpus unless the counts match.",
+        }
+
     payload = dict(
         workspace=dict(
             workspace_name=_safe_text(st.session_state.get("workspace_name") or ""),
             source_type=_safe_text((st.session_state.get("analysis_dataset") or {}).get("source_type") if isinstance(st.session_state.get("analysis_dataset"), dict) else ""),
             source_label=_safe_text((st.session_state.get("analysis_dataset") or {}).get("source_label") if isinstance(st.session_state.get("analysis_dataset"), dict) else ""),
+            local_database_scope=local_db_scope or "Not using the synced local database for this workspace.",
         ),
         product=dict(
             product_id=_safe_summary_product_label(summary),
@@ -5989,6 +6331,8 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
         symptom_tags=symptom_context if symptom_context else "No current tag columns in the filtered view.",
         symptomizer_run_summary=sym_snapshot,
         product_knowledge=knowledge,
+        entity_resolution=entity_resolution or "No strong product-identifier match detected from the question.",
+        local_db_entity_evidence=local_db_entity_evidence or "No extra local-database evidence was added for this question.",
         review_text_evidence=_snippet_rows(ev, max_reviews=32),
     )
     full_json = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
@@ -5999,10 +6343,14 @@ def _build_ai_context(*, overall_df, filtered_df, summary, filter_description, q
         payload["review_text_evidence"] = _snippet_rows(ev, max_reviews=max_ev)
         full_json = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         tok = _estimate_tokens(full_json)
+    if tok > AI_CONTEXT_TOKEN_BUDGET and isinstance(payload.get("local_db_entity_evidence"), list):
+        payload["local_db_entity_evidence"] = payload["local_db_entity_evidence"][:4]
+        full_json = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        tok = _estimate_tokens(full_json)
     return full_json
 
 
-def _call_analyst(*, question, overall_df, filtered_df, summary, filter_description, chat_history, persona_name=None, target_words=1200, include_references=False, freeform_mode=False):
+def _call_analyst(*, question, overall_df, filtered_df, summary, filter_description, chat_history, persona_name=None, target_words=1200, include_references=False, freeform_mode=False, dataset=None):
     client = _get_client()
     if client is None:
         raise ReviewDownloaderError("No OpenAI API key configured.")
@@ -6037,10 +6385,14 @@ def _call_analyst(*, question, overall_df, filtered_df, summary, filter_descript
         "When you recommend an action, name the likely owner (product, CX, support, content, ops, merchandising, or retention), explain the expected benefit, and state what evidence supports it. "
         "If the data is thin or mixed, say that clearly instead of overcommitting."
     )
-    instructions = base_instructions + "\n\n" + length_note + "\n\n" + reference_note + "\n\n" + quality_note
+    entity_note = (
+        "ENTITY GROUNDING: when the context includes entity-resolution matches, treat those as the preferred candidates for product names, SKUs, base models, and likely misspellings. "
+        "If several candidates remain plausible, say so explicitly instead of choosing one."
+    )
+    instructions = base_instructions + "\n\n" + length_note + "\n\n" + reference_note + "\n\n" + quality_note + "\n\n" + entity_note
     if freeform_mode:
         instructions += "\n\nFREEFORM ANSWERING: do not force a persona-specific frame. Answer the most natural interpretation of the user's request using the supplied review context. Use structure only when it improves clarity."
-    ai_ctx = _build_ai_context(overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, question=question)
+    ai_ctx = _build_ai_context(overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, question=question, dataset=dataset)
     msgs = [{"role": m["role"], "content": m["content"]} for m in list(chat_history)[-8:]]
     msgs.append({"role": "user", "content": f"User request:\n{question}\n\nReview dataset context (JSON):\n{ai_ctx}"})
     result = _chat_complete_with_fallback_models(
@@ -9360,6 +9712,15 @@ def _init_state():
         workspace_auto_prepare_uploaded_taxonomy=True,
         workspace_auto_prepare_url_taxonomy=True,
         workspace_auto_build_uploaded_files=True,
+        workspace_local_db_root=(lambda: (_ensure_local_review_db_dirs() or {}).get("root", "") if callable(_ensure_local_review_db_dirs) else "")(),
+        workspace_local_db_auto_sync=True,
+        workspace_local_db_export_snapshot=False,
+        workspace_local_db_selected_brand="",
+        workspace_local_db_selected_category="",
+        workspace_local_db_selected_subcategory="",
+        workspace_local_db_selected_base_model="",
+        workspace_local_db_selected_product_id="",
+        workspace_local_db_limit_rows=100000,
         _workspace_last_uploaded_build_sig=None,
         _workspace_last_uploaded_build_error="",
         _workspace_loaded_source_signature="",
@@ -9626,6 +9987,27 @@ def _url_source_signature(product_url="", *, bulk_urls=None):
 
 
 
+def _local_db_source_signature(status=None, *, root="", base_model_number="", mapped_brand="", mapped_category="", mapped_subcategory="", product_id="", limit_rows=None):
+    manifest = (status or {}).get("manifest") or {}
+    payload = {
+        "root": _safe_text(root) or _safe_text((status or {}).get("root")),
+        "manifest_id": manifest.get("manifest_id"),
+        "review_file_name": manifest.get("review_file_name"),
+        "mapping_file_name": manifest.get("mapping_file_name"),
+        "selection": {
+            "base_model_number": _safe_text(base_model_number),
+            "mapped_brand": _safe_text(mapped_brand),
+            "mapped_category": _safe_text(mapped_category),
+            "mapped_subcategory": _safe_text(mapped_subcategory),
+            "product_id": _safe_text(product_id),
+            "limit_rows": int(limit_rows) if limit_rows not in {None, "", 0, "0"} else None,
+        },
+    }
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8", errors="ignore")).hexdigest()
+    return f"localdb::{digest}"
+
+
+
 def _workspace_source_context_from_dataset(dataset):
     if not isinstance(dataset, dict):
         return {"source_mode": "", "source_signature": "", "source_label": ""}
@@ -9644,6 +10026,23 @@ def _workspace_source_context_from_dataset(dataset):
         return {
             "source_mode": SOURCE_MODE_FILE,
             "source_signature": f"file-saved::{_slugify(fallback, fallback='uploaded-workspace')}",
+            "source_label": fallback,
+        }
+    if source_type == "local_database":
+        fallback = source_label or _default_workspace_name_for_dataset(dataset) or "local-review-database"
+        selection = dataset.get("selection") or {}
+        signature = _safe_text(dataset.get("source_signature")).strip() or _local_db_source_signature(
+            root=_safe_text(dataset.get("source_root")),
+            base_model_number=_safe_text(selection.get("base_model_number")),
+            mapped_brand=_safe_text(selection.get("mapped_brand")),
+            mapped_category=_safe_text(selection.get("mapped_category")),
+            mapped_subcategory=_safe_text(selection.get("mapped_subcategory")),
+            product_id=_safe_text(selection.get("product_id")),
+            limit_rows=selection.get("limit_rows"),
+        )
+        return {
+            "source_mode": SOURCE_MODE_LOCAL_DB,
+            "source_signature": signature,
             "source_label": fallback,
         }
     product_url = _safe_text(_summary_attr(summary, "product_url", "")).strip()
@@ -9702,15 +10101,19 @@ def _activate_workspace_dataset(dataset, *, raw_bytes=None, symptom_seed=None, r
 def _make_workspace_progress_reporter(title="Building review workspace"):
     container = st.container(border=True)
     container.markdown(
-        f"<div class='builder-kicker'>Live progress</div><div class='builder-title' style='font-size:15px;'>{_esc(title)}</div><div class='status-note'>This updates as pages are fetched, review feeds are matched, and the workspace is prepared.</div>",
+        f"<div class='builder-kicker'>Live progress</div><div class='builder-title' style='font-size:15px;'>{_esc(title)}</div><div class='status-note'>This updates as the local database is checked, selections are resolved, caches are reused when available, and the workspace is hydrated for analysis.</div>",
         unsafe_allow_html=True,
     )
+    meta_slot = container.empty()
     status_slot = container.empty()
     detail_slot = container.empty()
     progress_bar = container.progress(0.0)
     history = []
+    started_at = time.perf_counter()
+    latest_progress = 0.0
 
     def _report(*, progress=None, title="", detail=""):
+        nonlocal latest_progress
         if title:
             status_slot.markdown(f"**{_safe_text(title).strip()}**")
         if progress is not None:
@@ -9718,15 +10121,21 @@ def _make_workspace_progress_reporter(title="Building review workspace"):
                 value = max(0.0, min(1.0, float(progress)))
             except Exception:
                 value = 0.0
+            latest_progress = value
             try:
                 progress_bar.progress(value)
             except TypeError:
                 progress_bar.progress(int(round(value * 100)))
+        elapsed = max(0.0, time.perf_counter() - started_at)
+        meta_slot.markdown(
+            f"<div class='status-note'><strong>{int(round(latest_progress * 100))}%</strong> complete · <strong>{elapsed:.1f}s</strong> elapsed</div>",
+            unsafe_allow_html=True,
+        )
         detail_text = _safe_text(detail).strip()
         if detail_text:
             if not history or history[-1] != detail_text:
                 history.append(detail_text)
-            recent = history[-4:]
+            recent = history[-5:]
             detail_slot.markdown(
                 "<div class='status-note'>" + "<br>".join(f"• {_esc(item)}" for item in recent) + "</div>",
                 unsafe_allow_html=True,
@@ -9868,6 +10277,72 @@ def _build_workspace_from_uploaded_files(uploaded_files, *, include_local_sympto
     return {"dataset": nd, "seed_result": seed_result, "prep": prep, "notice": notice, "raw_bytes": raw_bytes}
 
 
+
+def _build_workspace_from_local_database(*, root="", base_model_number="", mapped_brand="", mapped_category="", mapped_subcategory="", product_id="", limit_rows=None, replace_current=False, source_signature=""):
+    if not callable(_load_local_review_workspace):
+        raise RuntimeError("Local review database support is not available in this build.")
+    progress_ui = _make_workspace_progress_reporter("Building workspace from local review database")
+    total_count = None
+    if callable(_count_local_review_db_selection):
+        try:
+            total_count = _count_local_review_db_selection(
+                root or None,
+                base_model_number=base_model_number,
+                mapped_brand=mapped_brand,
+                mapped_category=mapped_category,
+                mapped_subcategory=mapped_subcategory,
+                product_id=product_id,
+            )
+        except Exception:
+            total_count = None
+    planned_rows = min(int(limit_rows or 0), int(total_count or 0)) if (limit_rows and total_count) else int(limit_rows or total_count or 0)
+    selection_label = base_model_number or product_id or mapped_category or mapped_brand or "current local selection"
+    if total_count:
+        progress_ui(
+            progress=0.06,
+            title="Resolving local selection",
+            detail=f"{selection_label} matches {int(total_count):,} reviews in the synced database. The interactive workspace will hydrate {int(planned_rows or total_count):,} newest rows to stay responsive.",
+        )
+    else:
+        progress_ui(progress=0.06, title="Resolving local selection", detail="Checking the synced database, row counts, and any reusable cached extract for this slice.")
+    dataset = _load_local_review_workspace(
+        root or None,
+        base_model_number=base_model_number,
+        mapped_brand=mapped_brand,
+        mapped_category=mapped_category,
+        mapped_subcategory=mapped_subcategory,
+        product_id=product_id,
+        limit_rows=limit_rows,
+    )
+    selection = dataset.get("selection") or {}
+    load_meta = dataset.get("load_meta") or {}
+    total_count = int(selection.get("total_count") or len(dataset.get("reviews_df", pd.DataFrame())))
+    loaded_rows = len(dataset.get("reviews_df", pd.DataFrame()))
+    cache_hit = bool(load_meta.get("cache_hit"))
+    load_strategy = _safe_text(load_meta.get("load_strategy")).replace("_", " ") or "sqlite read"
+    load_seconds = float(load_meta.get("load_seconds") or 0.0)
+    read_rate = (loaded_rows / load_seconds) if load_seconds and loaded_rows else 0.0
+    progress_ui(
+        progress=0.74,
+        title="Selection loaded",
+        detail=(
+            f"{loaded_rows:,} reviews are in memory now ({total_count:,} total matched). "
+            + (f"Reused the preloaded selection cache in {load_seconds:.1f}s." if cache_hit else f"Loaded directly from SQLite in {load_seconds:.1f}s and saved a reusable cache for next time.")
+            + (f" Approx throughput: {read_rate:,.0f} rows/sec." if read_rate else "")
+        ),
+    )
+    progress_ui(progress=0.9, title="Hydrating workspace", detail="Refreshing filters, metrics, and AI-grounded tabs against the selected local-database slice.")
+    seed_result = _activate_workspace_dataset(
+        dataset,
+        replace_current=replace_current,
+        source_mode=SOURCE_MODE_LOCAL_DB,
+        source_signature=source_signature or _safe_text(dataset.get("source_signature")).strip(),
+        source_label=_safe_text(dataset.get("source_label")).strip(),
+    )
+    progress_ui(progress=1.0, title="Workspace ready", detail="Dashboard, Action Center, Review Explorer, Review Prompt, and Symptomizer are now pointed at the synced local review database slice.")
+    return {"dataset": dataset, "seed_result": seed_result}
+
+
 _init_state()
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SIDEBAR
@@ -9919,8 +10394,15 @@ def _render_sidebar(df: Optional[pd.DataFrame]):
                 st.caption("")
                 for spec in core_specs:
                     key = f"rf_{spec['key']}"
-                    _sanitize_multiselect(key, spec["options"], ["ALL"])
+                    default_vals = ["ALL"]
+                    if spec.get("key") == "moderation_bucket":
+                        preferred = [value for value in ["Approved", "Pending"] if value in spec["options"]]
+                        if preferred:
+                            default_vals = preferred
+                    _sanitize_multiselect(key, spec["options"], default_vals)
                     st.multiselect(spec["label"], options=spec["options"], default=st.session_state[key], key=key)
+                    if spec.get("key") == "moderation_bucket":
+                        st.caption("Default view keeps Approved + Pending reviews visible and hides Rejected / Removed unless you opt in.")
             if det_opts or del_opts:
                 with st.expander("🩺 Symptom filters", expanded=False):
                     st.caption("Only shown when symptom tags are present in the workspace.")
@@ -10849,14 +11331,14 @@ def _render_symptomizer_taxonomy_workbench(*, processed_df, delighters, detracto
         st.caption("Default view opens on the L2 symptom table so the exact detractors are visible first.")
         theme_tabs = st.tabs(["L2 symptom table", "L1 theme rollup"])
         with theme_tabs[0]:
-            _render_interactive_symptom_table(det_l2, key_prefix="sym_det_l2", empty_label="Detractors")
+            _render_interactive_symptom_table(det_l2, key_prefix="sym_det_l2", empty_label="Detractors", detail_df=processed_df, symptom_cols=det_cols)
         with theme_tabs[1]:
             _render_interactive_symptom_table(det_l1, key_prefix="sym_det_l1", empty_label="Detractor themes")
     with tabs[1]:
         st.caption("Default view opens on the L2 symptom table so the exact delighters are visible first.")
         theme_tabs = st.tabs(["L2 symptom table", "L1 theme rollup"])
         with theme_tabs[0]:
-            _render_interactive_symptom_table(del_l2, key_prefix="sym_del_l2", empty_label="Delighters")
+            _render_interactive_symptom_table(del_l2, key_prefix="sym_del_l2", empty_label="Delighters", detail_df=processed_df, symptom_cols=del_cols)
         with theme_tabs[1]:
             _render_interactive_symptom_table(del_l1, key_prefix="sym_del_l1", empty_label="Delighter themes")
 
@@ -11214,9 +11696,925 @@ def _set_review_explorer_page(page: int, page_count: int):
     st.session_state["re_page_input"] = target
 
 
+
+def _workspace_local_db_context(dataset) -> Dict[str, Any]:
+    if not isinstance(dataset, dict):
+        return {}
+    if _safe_text(dataset.get("source_type")).strip().lower() != "local_database":
+        return {}
+    root = _safe_text(dataset.get("source_root")).strip() or _safe_text(st.session_state.get("workspace_local_db_root")).strip()
+    selection = dict(dataset.get("selection") or {})
+    status = _get_local_review_db_status(root or None) if callable(_get_local_review_db_status) else {}
+    return {
+        "root": root,
+        "selection": selection,
+        "status": status,
+        "manifest_id": (status.get("manifest") or {}).get("manifest_id"),
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _cached_local_db_filter_options(
+    root: str,
+    manifest_id: str,
+    *,
+    mapped_brand: str = "",
+    mapped_category: str = "",
+    mapped_subcategory: str = "",
+    base_model_number: str = "",
+) -> Dict[str, List[str]]:
+    if not callable(_get_local_review_db_filter_options):
+        return {"mapped_brand": [], "mapped_category": [], "mapped_subcategory": [], "base_model_number": [], "product_id": []}
+    return _get_local_review_db_filter_options(
+        root or None,
+        mapped_brand=mapped_brand,
+        mapped_category=mapped_category,
+        mapped_subcategory=mapped_subcategory,
+        base_model_number=base_model_number,
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _cached_local_db_selection_count(
+    root: str,
+    manifest_id: str,
+    *,
+    base_model_number: str = "",
+    mapped_brand: str = "",
+    mapped_category: str = "",
+    mapped_subcategory: str = "",
+    product_id: str = "",
+) -> int:
+    if not callable(_count_local_review_db_selection):
+        return 0
+    return int(
+        _count_local_review_db_selection(
+            root or None,
+            base_model_number=base_model_number,
+            mapped_brand=mapped_brand,
+            mapped_category=mapped_category,
+            mapped_subcategory=mapped_subcategory,
+            product_id=product_id,
+        )
+        or 0
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=90)
+def _cached_local_db_entity_search(root: str, manifest_id: str, *, query: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+    if not callable(_search_local_review_entities):
+        return []
+    return list(_search_local_review_entities(root or None, query=query, limit=limit) or [])
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _load_action_center_local_db_frame(
+    root: str,
+    manifest_id: str,
+    *,
+    base_model_number: str = "",
+    mapped_brand: str = "",
+    mapped_category: str = "",
+    mapped_subcategory: str = "",
+    product_id: str = "",
+    moderation_values: Tuple[str, ...] = tuple(),
+    organic_only: bool = False,
+    brand_values: Tuple[str, ...] = tuple(),
+    country_values: Tuple[str, ...] = tuple(),
+    limit_rows: Optional[int] = None,
+) -> pd.DataFrame:
+    if not callable(_load_local_review_analytics_frame):
+        return pd.DataFrame()
+    cols = [
+        "review_id",
+        "submission_time",
+        "submission_date",
+        "rating",
+        "incentivized_review",
+        "review_origin_group",
+        "review_acquisition_channel",
+        "moderation_bucket",
+        "country",
+        "content_locale",
+        "mapped_brand",
+        "mapped_category",
+        "mapped_subcategory",
+        "base_model_number",
+        "product_id",
+        "original_product_name",
+    ]
+    df = _load_local_review_analytics_frame(
+        root or None,
+        columns=cols,
+        base_model_number=base_model_number,
+        mapped_brand=mapped_brand,
+        mapped_category=mapped_category,
+        mapped_subcategory=mapped_subcategory,
+        product_id=product_id,
+        moderation_buckets=list(moderation_values or []),
+        organic_only=bool(organic_only),
+        brand_values=list(brand_values or []),
+        country_values=list(country_values or []),
+        limit_rows=limit_rows,
+    )
+    return _prepare_action_frame(df) if callable(_prepare_action_frame) else df
+
+
+
+def _load_action_center_frame(
+    *,
+    dataset,
+    overall_df: pd.DataFrame,
+    filtered_df: pd.DataFrame,
+    scope: str,
+    moderation_values: Sequence[str],
+    organic_only: bool,
+    brand_values: Sequence[str],
+    country_values: Sequence[str],
+) -> pd.DataFrame:
+    local_ctx = _workspace_local_db_context(dataset)
+    use_local_db = bool(local_ctx) and scope in {"Full local DB selection", "All synced local DB"}
+    if use_local_db:
+        selection = dict(local_ctx.get("selection") or {}) if scope == "Full local DB selection" else {}
+        return _load_action_center_local_db_frame(
+            local_ctx.get("root") or "",
+            str(local_ctx.get("manifest_id") or ""),
+            base_model_number=_safe_text(selection.get("base_model_number")),
+            mapped_brand=_safe_text(selection.get("mapped_brand")),
+            mapped_category=_safe_text(selection.get("mapped_category")),
+            mapped_subcategory=_safe_text(selection.get("mapped_subcategory")),
+            product_id=_safe_text(selection.get("product_id")),
+            moderation_values=tuple(_safe_text(v) for v in moderation_values if _safe_text(v)),
+            organic_only=bool(organic_only),
+            brand_values=tuple(_safe_text(v) for v in brand_values if _safe_text(v)),
+            country_values=tuple(_safe_text(v) for v in country_values if _safe_text(v)),
+            limit_rows=None,
+        )
+    base = filtered_df if scope == "Current filtered workspace" else overall_df
+    df = _prepare_action_frame(base) if callable(_prepare_action_frame) else base.copy()
+    if callable(_apply_action_filters):
+        df = _apply_action_filters(
+            df,
+            moderation_values=moderation_values,
+            organic_only=organic_only,
+            brand_values=brand_values,
+            country_values=country_values,
+        )
+    return df.copy()
+
+
+
+def _render_action_metric_strip(action_df: pd.DataFrame):
+    if action_df is None or action_df.empty:
+        return
+    review_count = len(action_df)
+    avg_rating = float(pd.to_numeric(action_df.get("rating"), errors="coerce").mean() or 0.0)
+    organic_share = float((~action_df.get("incentivized_review", pd.Series(False, index=action_df.index)).fillna(False)).mean() or 0.0)
+    category_count = int(action_df.get("mapped_category", pd.Series(dtype="string")).dropna().astype(str).nunique()) if "mapped_category" in action_df.columns else 0
+    country_count = int(action_df.get("country", pd.Series(dtype="string")).dropna().astype(str).nunique()) if "country" in action_df.columns else 0
+    base_model_count = int(action_df.get("base_model_number", pd.Series(dtype="string")).dropna().astype(str).nunique()) if "base_model_number" in action_df.columns else 0
+    mc = st.columns(6)
+    mc[0].metric("Reviews", f"{review_count:,}")
+    mc[1].metric("Average rating", f"{avg_rating:.2f}★")
+    mc[2].metric("Organic share", _fmt_pct(organic_share))
+    mc[3].metric("Categories", f"{category_count:,}")
+    mc[4].metric("Countries", f"{country_count:,}")
+    mc[5].metric("Base models", f"{base_model_count:,}")
+
+
+
+def _display_action_dataframe(df: pd.DataFrame, *, rename_map: Optional[Dict[str, str]] = None, percent_cols: Optional[Sequence[str]] = None, star_cols: Optional[Sequence[str]] = None, delta_cols: Optional[Sequence[str]] = None, height: int = 360):
+    if df is None or df.empty:
+        st.info("No rows match the current view.")
+        return
+    rename_map = rename_map or {}
+    percent_cols = list(percent_cols or [])
+    star_cols = list(star_cols or [])
+    delta_cols = list(delta_cols or [])
+    display_df = df.copy()
+    for col in percent_cols:
+        if col in display_df.columns:
+            display_df[col] = pd.to_numeric(display_df[col], errors="coerce").map(lambda value: _fmt_pct(value) if pd.notna(value) else "—")
+    for col in star_cols:
+        if col in display_df.columns:
+            display_df[col] = pd.to_numeric(display_df[col], errors="coerce").map(lambda value: f"{float(value):.2f}★" if pd.notna(value) else "—")
+    for col in delta_cols:
+        if col in display_df.columns:
+            display_df[col] = pd.to_numeric(display_df[col], errors="coerce").map(lambda value: f"{float(value):+.2f}" if pd.notna(value) else "—")
+    display_df = display_df.rename(columns=rename_map)
+    st.dataframe(display_df, use_container_width=True, hide_index=True, height=height)
+
+
+
+def _render_action_center_category_tab(action_df: pd.DataFrame, *, freq_code: str, min_reviews: int):
+    if not callable(_summarize_dimension):
+        st.info("Category command center is not available in this build.")
+        return
+    summary, trend = _summarize_dimension(action_df, group_cols=["mapped_brand", "mapped_category"], freq=freq_code, min_reviews=min_reviews)
+    summary = summary[summary.get("mapped_category").notna()].copy() if not summary.empty else summary
+    if summary is None or summary.empty:
+        st.info("Not enough category coverage to compare Shark and Ninja yet for the current scope.")
+        return
+    st.markdown("**Category command center**")
+    st.caption("Compare category averages, review counts, and rating momentum across Shark and Ninja. Use this view to quickly spot which categories deserve scaling, protection, or triage.")
+    controls = st.columns([1.05, 0.8, 1.45])
+    sort_choice = controls[0].selectbox("Sort by", ["Review count", "Average rating", "Rating delta", "Low-star share"], key="ac_cat_sort")
+    top_n = int(controls[1].slider("Show top", 5, 30, 12, 1, key="ac_cat_top_n"))
+    category_options = sorted(summary["mapped_category"].dropna().astype(str).unique(), key=lambda value: value.lower())
+    default_categories = category_options[: min(6, len(category_options))]
+    focus_categories = controls[2].multiselect("Focus categories", category_options, default=default_categories, key="ac_cat_focus")
+    view = summary.copy()
+    if focus_categories:
+        view = view[view["mapped_category"].astype(str).isin(focus_categories)].copy()
+    sort_map = {
+        "Review count": ["review_count", "avg_rating"],
+        "Average rating": ["avg_rating", "review_count"],
+        "Rating delta": ["rating_delta", "review_count"],
+        "Low-star share": ["low_star_share", "review_count"],
+    }
+    ascending = sort_choice == "Low-star share"
+    view = view.sort_values(sort_map.get(sort_choice, ["review_count"]), ascending=[ascending, False][: len(sort_map.get(sort_choice, ["review_count"]))])
+    plot_df = view.head(top_n).copy()
+    plot_df["category_label"] = plot_df["mapped_category"].astype(str)
+    vc1, vc2 = st.columns(2)
+    with vc1:
+        fig = px.bar(
+            plot_df,
+            x="category_label",
+            y="review_count",
+            color="mapped_brand",
+            barmode="group",
+            hover_data={"avg_rating": ":.2f", "low_star_share": ":.1%", "rating_delta": ":+.2f", "segment": True},
+            labels={"category_label": "Category", "review_count": "Reviews", "mapped_brand": "Brand"},
+            title="Review count by category",
+        )
+        fig.update_layout(height=390, xaxis_title="Category", yaxis_title="Reviews")
+        _sw_style_fig(fig)
+        _show_plotly(fig)
+    with vc2:
+        fig = px.scatter(
+            plot_df,
+            x="review_count",
+            y="avg_rating",
+            color="mapped_brand",
+            size="review_count",
+            hover_name="category_label",
+            hover_data={"low_star_share": ":.1%", "organic_share": ":.1%", "rating_delta": ":+.2f", "segment": True},
+            labels={"review_count": "Reviews", "avg_rating": "Average rating", "mapped_brand": "Brand"},
+            title="Category quality vs. volume",
+        )
+        fig.update_layout(height=390, xaxis_title="Reviews", yaxis_title="Average rating")
+        _sw_style_fig(fig)
+        _show_plotly(fig)
+    trend_ctrl = st.columns([1.05, 1.2])
+    trend_metric_label = trend_ctrl[0].selectbox("Trend metric", ["Average rating", "Review count", "Low-star share", "Organic share"], key="ac_cat_trend_metric")
+    trend_metric_map = {
+        "Average rating": "avg_rating",
+        "Review count": "review_count",
+        "Low-star share": "low_star_share",
+        "Organic share": "organic_share",
+    }
+    trend_metric = trend_metric_map[trend_metric_label]
+    trend_default = focus_categories[:4] if focus_categories else category_options[:4]
+    trend_focus = trend_ctrl[1].multiselect("Trend categories", category_options, default=trend_default, key="ac_cat_trend_focus")
+    trend_view = trend.copy()
+    if trend_focus:
+        trend_view = trend_view[trend_view["mapped_category"].astype(str).isin(trend_focus)].copy()
+    trend_view["series_label"] = trend_view["mapped_brand"].astype(str) + " · " + trend_view["mapped_category"].astype(str)
+    keep_series = trend_view.groupby("series_label", as_index=False)["review_count"].sum().sort_values("review_count", ascending=False).head(10)["series_label"].tolist()
+    trend_view = trend_view[trend_view["series_label"].isin(keep_series)].copy()
+    if trend_view.empty:
+        st.info("No category trend rows match the current focus.")
+    else:
+        fig = px.line(trend_view.sort_values("period_start"), x="period_start", y=trend_metric, color="series_label", markers=True, title="Category trend line")
+        fig.update_layout(height=390, xaxis_title="Period", yaxis_title=trend_metric_label)
+        if trend_metric in {"low_star_share", "organic_share"}:
+            fig.update_yaxes(tickformat=".0%")
+        _sw_style_fig(fig)
+        _show_plotly(fig)
+    table_cols = ["mapped_brand", "mapped_category", "review_count", "avg_rating", "low_star_share", "organic_share", "rating_delta", "segment"]
+    _display_action_dataframe(
+        view[table_cols].head(max(18, top_n)),
+        rename_map={
+            "mapped_brand": "Brand",
+            "mapped_category": "Category",
+            "review_count": "Reviews",
+            "avg_rating": "Avg ★",
+            "low_star_share": "Low-star %",
+            "organic_share": "Organic %",
+            "rating_delta": "Δ vs baseline",
+            "segment": "Action segment",
+        },
+        percent_cols=["low_star_share", "organic_share"],
+        star_cols=["avg_rating"],
+        delta_cols=["rating_delta"],
+        height=360,
+    )
+
+
+
+def _render_action_center_brand_tab(action_df: pd.DataFrame, *, freq_code: str, min_reviews: int):
+    if not callable(_summarize_dimension):
+        st.info("Brand comparison is not available in this build.")
+        return
+    working = action_df[action_df.get("mapped_brand").notna()].copy() if "mapped_brand" in action_df.columns else pd.DataFrame()
+    if working.empty:
+        st.info("Brand values are not available for the current scope.")
+        return
+    summary, trend = _summarize_dimension(working, group_cols=["mapped_brand"], freq=freq_code, min_reviews=max(10, min_reviews))
+    summary = summary[summary.get("mapped_brand").notna()].copy() if not summary.empty else summary
+    if summary is None or summary.empty:
+        st.info("Not enough brand coverage is available for comparison in the current scope.")
+        return
+    extra = (
+        working.groupby(["mapped_brand"], dropna=False)
+        .agg(
+            category_count=("mapped_category", lambda s: s.dropna().astype(str).nunique()),
+            base_model_count=("base_model_number", lambda s: s.dropna().astype(str).nunique()),
+            top_category=("mapped_category", lambda s: s.dropna().astype(str).value_counts().index[0] if s.dropna().astype(str).size else pd.NA),
+            top_country=("country", lambda s: s.dropna().astype(str).value_counts().index[0] if s.dropna().astype(str).size else pd.NA),
+        )
+        .reset_index()
+    )
+    summary = summary.merge(extra, on=["mapped_brand"], how="left", suffixes=("", "_extra"))
+    brand_count = int(summary["mapped_brand"].dropna().astype(str).nunique()) if "mapped_brand" in summary.columns else 0
+    st.markdown("**Brand performance board**")
+    if brand_count >= 2:
+        st.caption("Use this executive compare view when multiple brands are present. It keeps scale, satisfaction, downside risk, organic mix, and portfolio breadth in one place so brand-level tradeoffs are easier to action.")
+    else:
+        st.caption("Only one brand is active in the current scope, so this board acts as a compact brand scorecard rather than a cross-brand comparison.")
+
+    chart_cols = st.columns(2)
+    with chart_cols[0]:
+        fig = px.scatter(
+            summary.sort_values("review_count", ascending=False),
+            x="review_count",
+            y="avg_rating",
+            color="mapped_brand",
+            size="base_model_count",
+            hover_name="mapped_brand",
+            hover_data={
+                "low_star_share": ":.1%",
+                "organic_share": ":.1%",
+                "category_count": True,
+                "country_count": True,
+                "rating_delta": ":+.2f",
+                "segment": True,
+            },
+            labels={
+                "review_count": "Reviews",
+                "avg_rating": "Average rating",
+                "mapped_brand": "Brand",
+                "base_model_count": "Base models",
+            },
+            title="Brand scale vs. satisfaction",
+        )
+        fig.update_layout(height=380, xaxis_title="Reviews", yaxis_title="Average rating")
+        _sw_style_fig(fig)
+        _show_plotly(fig)
+    with chart_cols[1]:
+        fig = px.bar(
+            summary.sort_values("avg_rating", ascending=False),
+            x="mapped_brand",
+            y="avg_rating",
+            color="mapped_brand",
+            text="review_count",
+            hover_data={
+                "low_star_share": ":.1%",
+                "organic_share": ":.1%",
+                "category_count": True,
+                "country_count": True,
+                "rating_delta": ":+.2f",
+                "segment": True,
+            },
+            labels={"mapped_brand": "Brand", "avg_rating": "Average rating"},
+            title="Brand rating comparison",
+        )
+        fig.update_layout(height=380, xaxis_title="Brand", yaxis_title="Average rating")
+        fig.update_traces(textposition="outside")
+        _sw_style_fig(fig)
+        _show_plotly(fig)
+
+    trend_ctrl = st.columns([1.0, 1.2])
+    trend_metric_label = trend_ctrl[0].selectbox("Trend metric", ["Average rating", "Review count", "Low-star share", "Organic share"], key="ac_brand_trend_metric")
+    trend_metric_map = {
+        "Average rating": "avg_rating",
+        "Review count": "review_count",
+        "Low-star share": "low_star_share",
+        "Organic share": "organic_share",
+    }
+    keep_brands = trend_ctrl[1].multiselect(
+        "Brand focus",
+        options=sorted(summary["mapped_brand"].dropna().astype(str).unique().tolist(), key=lambda value: value.lower()),
+        default=sorted(summary["mapped_brand"].dropna().astype(str).unique().tolist(), key=lambda value: value.lower())[: min(4, brand_count or 1)],
+        key="ac_brand_focus",
+    )
+    trend_view = trend.copy()
+    if keep_brands:
+        trend_view = trend_view[trend_view["mapped_brand"].astype(str).isin(keep_brands)].copy()
+    if trend_view.empty:
+        st.info("No brand trend rows match the current focus.")
+    else:
+        metric_key = trend_metric_map[trend_metric_label]
+        fig = px.line(trend_view.sort_values("period_start"), x="period_start", y=metric_key, color="mapped_brand", markers=True, title="Brand trend line")
+        fig.update_layout(height=380, xaxis_title="Period", yaxis_title=trend_metric_label)
+        if metric_key in {"low_star_share", "organic_share"}:
+            fig.update_yaxes(tickformat=".0%")
+        _sw_style_fig(fig)
+        _show_plotly(fig)
+
+    matrix_summary, _ = _summarize_dimension(working, group_cols=["mapped_brand", "mapped_category"], freq=freq_code, min_reviews=max(8, min_reviews // 2 or 8))
+    matrix_summary = matrix_summary[matrix_summary.get("mapped_category").notna()].copy() if not matrix_summary.empty else matrix_summary
+    if brand_count >= 2 and matrix_summary is not None and not matrix_summary.empty:
+        matrix_ctrl = st.columns([1.0, 1.4])
+        matrix_metric_label = matrix_ctrl[0].selectbox("Brand × category matrix", ["Average rating", "Review count", "Low-star share", "Organic share"], key="ac_brand_matrix_metric")
+        matrix_top_n = int(matrix_ctrl[1].slider("Show top categories", 4, 16, 8, 1, key="ac_brand_matrix_top_n"))
+        category_rank = matrix_summary.groupby("mapped_category", as_index=False)["review_count"].sum().sort_values("review_count", ascending=False)
+        top_categories = category_rank.head(matrix_top_n)["mapped_category"].astype(str).tolist()
+        matrix_metric_key = {
+            "Average rating": "avg_rating",
+            "Review count": "review_count",
+            "Low-star share": "low_star_share",
+            "Organic share": "organic_share",
+        }[matrix_metric_label]
+        matrix_df = matrix_summary[matrix_summary["mapped_category"].astype(str).isin(top_categories)].copy()
+        matrix = matrix_df.pivot_table(index="mapped_category", columns="mapped_brand", values=matrix_metric_key, aggfunc="mean")
+        if not matrix.empty:
+            text_auto = ".2f" if matrix_metric_key == "avg_rating" else (".0%" if matrix_metric_key in {"low_star_share", "organic_share"} else ".0f")
+            fig = px.imshow(matrix, aspect="auto", text_auto=text_auto, title="Brand × category matrix")
+            fig.update_layout(height=max(330, 70 + 36 * len(matrix.index)), xaxis_title="Brand", yaxis_title="Category")
+            _sw_style_fig(fig)
+            _show_plotly(fig)
+
+    table_cols = [
+        "mapped_brand",
+        "review_count",
+        "avg_rating",
+        "low_star_share",
+        "organic_share",
+        "category_count",
+        "country_count",
+        "base_model_count",
+        "top_category",
+        "top_country",
+        "rating_delta",
+        "volume_delta_pct",
+        "segment",
+        "trend_direction",
+    ]
+    _display_action_dataframe(
+        summary[table_cols],
+        rename_map={
+            "mapped_brand": "Brand",
+            "review_count": "Reviews",
+            "avg_rating": "Avg ★",
+            "low_star_share": "Low-star %",
+            "organic_share": "Organic %",
+            "category_count": "Categories",
+            "country_count": "Countries",
+            "base_model_count": "Base models",
+            "top_category": "Top category",
+            "top_country": "Top country",
+            "rating_delta": "Δ vs baseline",
+            "volume_delta_pct": "Volume Δ",
+            "segment": "Action segment",
+            "trend_direction": "Trend",
+        },
+        percent_cols=["low_star_share", "organic_share", "volume_delta_pct"],
+        star_cols=["avg_rating"],
+        delta_cols=["rating_delta"],
+        height=360,
+    )
+
+
+def _render_action_center_country_tab(action_df: pd.DataFrame, *, freq_code: str, min_reviews: int):
+    if not callable(_summarize_dimension):
+        st.info("Country comparison is not available in this build.")
+        return
+    working = action_df[action_df.get("country").notna()].copy() if "country" in action_df.columns else pd.DataFrame()
+    if working.empty:
+        st.info("Country values are not available for the current scope.")
+        return
+    summary, trend = _summarize_dimension(working, group_cols=["mapped_brand", "country"], freq=freq_code, min_reviews=max(10, min_reviews))
+    if summary is None or summary.empty:
+        st.info("Not enough country coverage for comparison in the current scope.")
+        return
+    st.markdown("**Country comparison**")
+    st.caption("Use this view when ELT or regional teams need to see where performance is strong, softening, or structurally different by country.")
+    controls = st.columns([0.85, 0.85, 1.3])
+    top_n = int(controls[0].slider("Show top", 5, 25, 10, 1, key="ac_country_top_n"))
+    sort_choice = controls[1].selectbox("Sort by", ["Review count", "Average rating", "Low-star share"], key="ac_country_sort")
+    country_options = sorted(summary["country"].dropna().astype(str).unique(), key=lambda value: value.lower())
+    focus_countries = controls[2].multiselect("Focus countries", country_options, default=country_options[: min(6, len(country_options))], key="ac_country_focus")
+    view = summary.copy()
+    if focus_countries:
+        view = view[view["country"].astype(str).isin(focus_countries)].copy()
+    sort_col = {"Review count": "review_count", "Average rating": "avg_rating", "Low-star share": "low_star_share"}.get(sort_choice, "review_count")
+    view = view.sort_values([sort_col, "review_count"], ascending=[sort_choice == "Low-star share", False])
+    plot_df = view.head(top_n).copy()
+    hc1, hc2 = st.columns(2)
+    with hc1:
+        fig = px.bar(
+            plot_df,
+            x="country",
+            y="avg_rating",
+            color="mapped_brand",
+            barmode="group",
+            hover_data={"review_count": True, "low_star_share": ":.1%", "rating_delta": ":+.2f", "segment": True},
+            labels={"country": "Country", "avg_rating": "Average rating", "mapped_brand": "Brand"},
+            title="Average rating by country",
+        )
+        fig.update_layout(height=390, xaxis_title="Country", yaxis_title="Average rating")
+        _sw_style_fig(fig)
+        _show_plotly(fig)
+    with hc2:
+        fig = px.scatter(
+            plot_df,
+            x="review_count",
+            y="low_star_share",
+            color="mapped_brand",
+            size="review_count",
+            hover_name="country",
+            hover_data={"avg_rating": ":.2f", "rating_delta": ":+.2f", "segment": True},
+            labels={"review_count": "Reviews", "low_star_share": "Low-star share", "mapped_brand": "Brand"},
+            title="Country risk vs. volume",
+        )
+        fig.update_layout(height=390, xaxis_title="Reviews", yaxis_title="Low-star share")
+        fig.update_yaxes(tickformat=".0%")
+        _sw_style_fig(fig)
+        _show_plotly(fig)
+    trend_metric_label = st.selectbox("Country trend metric", ["Average rating", "Review count", "Low-star share"], key="ac_country_trend_metric")
+    trend_metric_map = {"Average rating": "avg_rating", "Review count": "review_count", "Low-star share": "low_star_share"}
+    trend_metric = trend_metric_map[trend_metric_label]
+    trend_view = trend.copy()
+    if focus_countries:
+        trend_view = trend_view[trend_view["country"].astype(str).isin(focus_countries)].copy()
+    trend_view["series_label"] = trend_view["mapped_brand"].astype(str) + " · " + trend_view["country"].astype(str)
+    keep_series = trend_view.groupby("series_label", as_index=False)["review_count"].sum().sort_values("review_count", ascending=False).head(10)["series_label"].tolist()
+    trend_view = trend_view[trend_view["series_label"].isin(keep_series)].copy()
+    if trend_view.empty:
+        st.info("No country trend rows match the current focus.")
+    else:
+        fig = px.line(trend_view.sort_values("period_start"), x="period_start", y=trend_metric, color="series_label", markers=True, title="Country trend line")
+        fig.update_layout(height=390, xaxis_title="Period", yaxis_title=trend_metric_label)
+        if trend_metric == "low_star_share":
+            fig.update_yaxes(tickformat=".0%")
+        _sw_style_fig(fig)
+        _show_plotly(fig)
+    table_cols = ["mapped_brand", "country", "review_count", "avg_rating", "low_star_share", "rating_delta", "segment"]
+    _display_action_dataframe(
+        view[table_cols].head(max(18, top_n)),
+        rename_map={
+            "mapped_brand": "Brand",
+            "country": "Country",
+            "review_count": "Reviews",
+            "avg_rating": "Avg ★",
+            "low_star_share": "Low-star %",
+            "rating_delta": "Δ vs baseline",
+            "segment": "Action segment",
+        },
+        percent_cols=["low_star_share"],
+        star_cols=["avg_rating"],
+        delta_cols=["rating_delta"],
+        height=360,
+    )
+
+
+
+def _render_action_center_base_model_tab(action_df: pd.DataFrame, *, freq_code: str, min_reviews: int):
+    if not callable(_summarize_base_models):
+        st.info("Base-model map is not available in this build.")
+        return
+    summary, trend = _summarize_base_models(action_df, min_reviews=max(10, min_reviews // 2), freq=freq_code)
+    if summary is None or summary.empty:
+        st.info("Not enough base-model coverage to build the segmentation map in the current scope.")
+        return
+    st.markdown("**Base-model map**")
+    st.caption("This is the action layer built around the new local database design: families like HD400 stay linked together so you can compare product lines instead of fragmented child SKUs.")
+    controls = st.columns([1.2, 1.0, 1.4])
+    search_text = controls[0].text_input("Search base model", key="ac_base_search", placeholder="HD400, FlexStyle, product name…")
+    segment_options = ["Fix now", "Protect", "Scale", "Watch", "Stable"]
+    selected_segments = controls[1].multiselect("Segments", segment_options, default=segment_options, key="ac_base_segments")
+    metric_choice = controls[2].selectbox("Trend metric", ["Average rating", "Review count"], key="ac_base_metric")
+    view = summary.copy()
+    if search_text:
+        q = _safe_text(search_text).lower()
+        masks = []
+        for col in ["base_model_number", "exemplar_product_name", "mapped_category", "mapped_subcategory"]:
+            if col in view.columns:
+                masks.append(view[col].astype("string").fillna("").str.lower().str.contains(q, na=False))
+        if masks:
+            mask = masks[0].copy()
+            for extra in masks[1:]:
+                mask |= extra
+            view = view[mask].copy()
+    if selected_segments:
+        view = view[view["segment"].astype(str).isin(selected_segments)].copy()
+    if view.empty:
+        st.info("No base models match the current search and segment filters.")
+        return
+    chart_df = view.sort_values(["review_count", "avg_rating"], ascending=[False, False]).head(200).copy()
+    chart_df["hover_label"] = chart_df["mapped_brand"].astype(str) + " · " + chart_df["base_model_number"].astype(str)
+    bc1, bc2 = st.columns([1.1, 0.9])
+    with bc1:
+        fig = px.scatter(
+            chart_df,
+            x="review_count",
+            y="avg_rating",
+            color="segment",
+            size="product_count",
+            symbol="mapped_brand",
+            hover_name="hover_label",
+            hover_data={"mapped_category": True, "mapped_subcategory": True, "country_count": True, "rating_delta": ":+.2f"},
+            labels={"review_count": "Reviews", "avg_rating": "Average rating", "product_count": "SKUs"},
+            title="Base-model action map",
+        )
+        fig.update_layout(height=430, xaxis_title="Reviews", yaxis_title="Average rating")
+        _sw_style_fig(fig)
+        _show_plotly(fig)
+    with bc2:
+        seg_counts = view.groupby("segment", as_index=False)["base_model_number"].nunique().rename(columns={"base_model_number": "base_model_count"})
+        if not seg_counts.empty:
+            fig = px.bar(seg_counts, x="segment", y="base_model_count", title="Families by action segment", labels={"segment": "Segment", "base_model_count": "Base models"})
+            fig.update_layout(height=430, xaxis_title="Segment", yaxis_title="Base models")
+            _sw_style_fig(fig)
+            _show_plotly(fig)
+        else:
+            st.info("No segment counts available yet.")
+    trend_metric = "avg_rating" if metric_choice == "Average rating" else "review_count"
+    base_model_options = view["base_model_number"].dropna().astype(str).unique().tolist()
+    default_focus = base_model_options[:4]
+    trend_focus = st.multiselect("Trend families", base_model_options, default=default_focus, key="ac_base_focus")
+    trend_view = trend.copy()
+    if trend_focus:
+        trend_view = trend_view[trend_view["base_model_number"].astype(str).isin(trend_focus)].copy()
+    trend_view["series_label"] = trend_view["mapped_brand"].astype(str) + " · " + trend_view["base_model_number"].astype(str)
+    if trend_view.empty:
+        st.info("No base-model trend rows match the current focus.")
+    else:
+        fig = px.line(trend_view.sort_values("period_start"), x="period_start", y=trend_metric, color="series_label", markers=True, title="Base-model trend line")
+        fig.update_layout(height=390, xaxis_title="Period", yaxis_title=metric_choice)
+        _sw_style_fig(fig)
+        _show_plotly(fig)
+    table_cols = [
+        "mapped_brand",
+        "base_model_number",
+        "exemplar_product_name",
+        "mapped_category",
+        "mapped_subcategory",
+        "review_count",
+        "avg_rating",
+        "low_star_share",
+        "rating_delta",
+        "product_count",
+        "country_count",
+        "segment",
+    ]
+    present_cols = [col for col in table_cols if col in view.columns]
+    _display_action_dataframe(
+        view[present_cols].head(40),
+        rename_map={
+            "mapped_brand": "Brand",
+            "base_model_number": "Base model",
+            "exemplar_product_name": "Example product name",
+            "mapped_category": "Category",
+            "mapped_subcategory": "Subcategory",
+            "review_count": "Reviews",
+            "avg_rating": "Avg ★",
+            "low_star_share": "Low-star %",
+            "rating_delta": "Δ vs baseline",
+            "product_count": "SKUs",
+            "country_count": "Countries",
+            "segment": "Action segment",
+        },
+        percent_cols=["low_star_share"],
+        star_cols=["avg_rating"],
+        delta_cols=["rating_delta"],
+        height=400,
+    )
+
+
+
+def _render_action_center_alert_tab(action_df: pd.DataFrame, *, freq_code: str, min_reviews: int):
+    if not callable(_build_alert_feed):
+        st.info("Alert board is not available in this build.")
+        return
+    alert_df = _build_alert_feed(action_df, min_reviews=min_reviews, freq=freq_code)
+    if alert_df is None or alert_df.empty:
+        st.info("No alert candidates crossed the current action thresholds.")
+        return
+    st.markdown("**Alert board**")
+    st.caption("This replaces a basic start / stop / continue view with a momentum-aware command board. It ranks where to fix now, where to protect, and where to scale based on ratings, downside share, and recent movement.")
+    controls = st.columns([0.95, 1.05, 2.0])
+    priority_options = [option for option in ["Critical", "High", "Medium", "Low"] if option in set(alert_df["priority"].astype(str))]
+    segment_options = [option for option in ["Fix now", "Protect", "Scale", "Watch", "Stable"] if option in set(alert_df["segment"].astype(str))]
+    selected_priorities = controls[0].multiselect("Priority", priority_options, default=priority_options[:3] if priority_options else [], key="ac_alert_priority")
+    selected_segments = controls[1].multiselect("Segments", segment_options, default=segment_options[:4] if segment_options else [], key="ac_alert_segments")
+    entity_search = controls[2].text_input("Search alert entities", key="ac_alert_search", placeholder="Category, country, base model…")
+    view = alert_df.copy()
+    if selected_priorities:
+        view = view[view["priority"].astype(str).isin(selected_priorities)].copy()
+    if selected_segments:
+        view = view[view["segment"].astype(str).isin(selected_segments)].copy()
+    if entity_search:
+        q = _safe_text(entity_search).lower()
+        mask = view["entity_label"].astype("string").fillna("").str.lower().str.contains(q, na=False)
+        mask |= view["brand"].astype("string").fillna("").str.lower().str.contains(q, na=False)
+        mask |= view["entity_kind"].astype("string").fillna("").str.lower().str.contains(q, na=False)
+        view = view[mask].copy()
+    if view.empty:
+        st.info("No alerts match the current filters.")
+        return
+    mc = st.columns(4)
+    mc[0].metric("Critical / high", f"{int(view['priority'].isin(['Critical', 'High']).sum()):,}")
+    mc[1].metric("Fix now", f"{int((view['segment'] == 'Fix now').sum()):,}")
+    mc[2].metric("Protect", f"{int((view['segment'] == 'Protect').sum()):,}")
+    mc[3].metric("Scale", f"{int((view['segment'] == 'Scale').sum()):,}")
+    chart_df = view.groupby(["segment", "priority"], as_index=False).size().rename(columns={"size": "alert_count"})
+    fig = px.bar(chart_df, x="segment", y="alert_count", color="priority", barmode="group", title="Alert mix by action segment", labels={"segment": "Action segment", "alert_count": "Alerts"})
+    fig.update_layout(height=390, xaxis_title="Action segment", yaxis_title="Alerts")
+    _sw_style_fig(fig)
+    _show_plotly(fig)
+    _display_action_dataframe(
+        view[["priority", "segment", "entity_kind", "brand", "entity_label", "review_count", "avg_rating", "rating_delta", "low_star_share", "reason", "recommended_action"]].head(80),
+        rename_map={
+            "priority": "Priority",
+            "segment": "Action segment",
+            "entity_kind": "Entity type",
+            "brand": "Brand",
+            "entity_label": "Entity",
+            "review_count": "Reviews",
+            "avg_rating": "Avg ★",
+            "rating_delta": "Δ vs baseline",
+            "low_star_share": "Low-star %",
+            "reason": "Why it surfaced",
+            "recommended_action": "Recommended action",
+        },
+        percent_cols=["low_star_share"],
+        star_cols=["avg_rating"],
+        delta_cols=["rating_delta"],
+        height=460,
+    )
+
+
+
+def _render_action_center(*, dataset, overall_df, filtered_df, source_type, source_label, filter_description):
+    st.markdown("<div class='section-title'>Action Center</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-sub'>A command-center view designed for the local review database era: compare categories, countries, and base-model families, then turn momentum shifts into clear actions.</div>", unsafe_allow_html=True)
+    local_ctx = _workspace_local_db_context(dataset)
+    scope_options = ["Current filtered workspace", "Loaded workspace"]
+    if local_ctx and callable(_load_local_review_analytics_frame):
+        scope_options.extend(["Full local DB selection", "All synced local DB"])
+    selection = dict(local_ctx.get("selection") or {})
+    default_scope = "Loaded workspace"
+    if local_ctx and callable(_load_local_review_analytics_frame):
+        if any(_safe_text(selection.get(key)) for key in ["base_model_number", "product_id", "mapped_category", "mapped_subcategory"]):
+            default_scope = "All synced local DB"
+        else:
+            default_scope = "Full local DB selection"
+    if st.session_state.get("action_center_scope") not in scope_options:
+        st.session_state["action_center_scope"] = default_scope
+    control_row = st.columns([1.35, 0.85, 0.85, 0.85])
+    scope = control_row[0].selectbox("Analysis scope", scope_options, index=scope_options.index(st.session_state.get("action_center_scope", default_scope)), key="action_center_scope")
+    organic_only = control_row[1].toggle("Organic only", value=bool(st.session_state.get("action_center_organic_only", False)), key="action_center_organic_only")
+    freq_label = control_row[2].selectbox("Trend grain", ["Monthly", "Weekly"], index=0, key="action_center_freq")
+    min_reviews = int(control_row[3].number_input("Min reviews", min_value=5, max_value=1000, value=int(st.session_state.get("action_center_min_reviews") or 40), step=5, key="action_center_min_reviews"))
+    moderation_source = overall_df if isinstance(overall_df, pd.DataFrame) else pd.DataFrame()
+    moderation_options = sorted({str(value).strip() for value in moderation_source.get("moderation_bucket", pd.Series(dtype="string")).dropna().astype(str) if str(value).strip()}, key=lambda value: value.lower())
+    if not moderation_options:
+        moderation_options = ["Approved", "Pending", "Rejected", "Removed"]
+    moderation_default = [value for value in ["Approved", "Pending"] if value in moderation_options] or moderation_options[:2]
+    brand_options = sorted({str(value).strip() for value in overall_df.get("mapped_brand", pd.Series(dtype="string")).dropna().astype(str) if str(value).strip()}, key=lambda value: value.lower()) if isinstance(overall_df, pd.DataFrame) else []
+    if not brand_options and isinstance(filtered_df, pd.DataFrame):
+        brand_options = sorted({str(value).strip() for value in filtered_df.get("mapped_brand", pd.Series(dtype="string")).dropna().astype(str) if str(value).strip()}, key=lambda value: value.lower())
+    brand_default = [value for value in ["Shark", "Ninja"] if value in brand_options]
+    filter_row = st.columns([1.15, 1.15])
+    moderation_values = filter_row[0].multiselect("Moderation", moderation_options, default=st.session_state.get("action_center_moderation", moderation_default), key="action_center_moderation")
+    brand_values = filter_row[1].multiselect("Brand focus", brand_options, default=st.session_state.get("action_center_brands", brand_default), key="action_center_brands") if brand_options else []
+    provisional_df = _load_action_center_frame(
+        dataset=dataset,
+        overall_df=overall_df,
+        filtered_df=filtered_df,
+        scope=scope,
+        moderation_values=moderation_values,
+        organic_only=organic_only,
+        brand_values=brand_values,
+        country_values=tuple(_safe_text(v) for v in (st.session_state.get("action_center_countries") or []) if _safe_text(v)),
+    )
+    country_options = sorted({str(value).strip() for value in provisional_df.get("country", pd.Series(dtype="string")).dropna().astype(str) if str(value).strip()}, key=lambda value: value.lower()) if isinstance(provisional_df, pd.DataFrame) else []
+    with st.expander("Refine compare set", expanded=False):
+        st.caption("Filter the command center without changing the main workspace sidebar. This is useful when you want executive comparisons on a broader local-DB slice while keeping your detailed workspace narrow.")
+        country_values = st.multiselect("Country focus", country_options, default=[value for value in (st.session_state.get("action_center_countries") or []) if value in country_options], key="action_center_countries") if country_options else []
+    action_df = _load_action_center_frame(
+        dataset=dataset,
+        overall_df=overall_df,
+        filtered_df=filtered_df,
+        scope=scope,
+        moderation_values=moderation_values,
+        organic_only=organic_only,
+        brand_values=brand_values,
+        country_values=country_values,
+    )
+    freq_code = "W" if freq_label == "Weekly" else "M"
+    if scope == "All synced local DB":
+        st.caption("Using the synced SQLite database directly so this view can compare the full corpus without loading every review row into the interactive workspace first.")
+    elif scope == "Full local DB selection":
+        st.caption("Using the full local-database selection tied to your current builder choice, not just the newest rows loaded into the workspace.")
+    else:
+        st.caption(f"Using the current workspace only · {filter_description}")
+    if action_df is None or action_df.empty:
+        st.info("No reviews are available for the current Action Center scope and filters.")
+        return
+    _render_action_metric_strip(action_df)
+    inner_tabs = st.tabs(["🏁 Brands", "📦 Categories", "🌍 Countries", "🧬 Base models", "🚨 Alerts"])
+    with inner_tabs[0]:
+        _render_action_center_brand_tab(action_df, freq_code=freq_code, min_reviews=min_reviews)
+    with inner_tabs[1]:
+        _render_action_center_category_tab(action_df, freq_code=freq_code, min_reviews=min_reviews)
+    with inner_tabs[2]:
+        _render_action_center_country_tab(action_df, freq_code=freq_code, min_reviews=min_reviews)
+    with inner_tabs[3]:
+        _render_action_center_base_model_tab(action_df, freq_code=freq_code, min_reviews=min_reviews)
+    with inner_tabs[4]:
+        _render_action_center_alert_tab(action_df, freq_code=freq_code, min_reviews=min_reviews)
+
+
+
+def _render_review_explorer_trend_detector(filtered_df: pd.DataFrame):
+    if not callable(_detect_trend_movers):
+        return
+    if filtered_df is None or filtered_df.empty:
+        return
+    with st.expander("Trend detector", expanded=False):
+        st.caption("Catch movers before you read row by row. This compares the latest period to a trailing baseline and flags the biggest changes by category, country, base model, or review source.")
+        controls = st.columns([1.0, 0.9, 1.1, 0.9, 0.8])
+        metric_label = controls[0].selectbox("Metric", ["Average rating", "Review count", "Low-star share", "Organic share"], key="review_explorer_trend_metric")
+        metric_map = {"Average rating": "avg_rating", "Review count": "review_count", "Low-star share": "low_star_share", "Organic share": "organic_share"}
+        group_label = controls[1].selectbox("Group by", ["Overall", "Mapped category", "Country", "Base model", "Review origin"], key="review_explorer_trend_group")
+        grain_label = controls[2].selectbox("Trend grain", ["Weekly", "Monthly"], key="review_explorer_trend_grain")
+        organic_only = controls[3].toggle("Organic only", value=False, key="review_explorer_trend_organic")
+        min_group_reviews = int(controls[4].number_input("Min reviews", min_value=5, max_value=1000, value=int(st.session_state.get("review_explorer_trend_min_reviews") or 15), step=5, key="review_explorer_trend_min_reviews"))
+        working = _prepare_action_frame(filtered_df) if callable(_prepare_action_frame) else filtered_df.copy()
+        if organic_only and callable(_apply_action_filters):
+            working = _apply_action_filters(working, organic_only=True)
+        group_map = {
+            "Overall": None,
+            "Mapped category": "mapped_category",
+            "Country": "country",
+            "Base model": "base_model_number",
+            "Review origin": "review_origin_group",
+        }
+        group_col = group_map.get(group_label)
+        freq_code = "W" if grain_label == "Weekly" else "M"
+        trend_df, movers_df = _detect_trend_movers(
+            working,
+            group_col=group_col,
+            metric=metric_map[metric_label],
+            freq=freq_code,
+            min_group_reviews=min_group_reviews,
+        )
+        if trend_df is None or trend_df.empty:
+            st.info("Not enough trend history is available for the current explorer view.")
+            return
+        if group_col:
+            available_groups = trend_df[group_col].dropna().astype(str).unique().tolist()
+            default_groups = movers_df["entity_label"].astype(str).head(5).tolist() if movers_df is not None and not movers_df.empty else available_groups[:5]
+            selected_groups = st.multiselect("Trend focus", available_groups, default=[value for value in default_groups if value in available_groups], key="review_explorer_trend_focus")
+            plot_df = trend_df.copy()
+            if selected_groups:
+                plot_df = plot_df[plot_df[group_col].astype(str).isin(selected_groups)].copy()
+            plot_df["series_label"] = plot_df[group_col].astype(str)
+        else:
+            plot_df = trend_df.copy()
+            plot_df["series_label"] = "All reviews"
+        metric_key = metric_map[metric_label]
+        fig = px.line(plot_df.sort_values("period_start"), x="period_start", y=metric_key, color="series_label", markers=True, title="Trend detector")
+        fig.update_layout(height=360, xaxis_title="Period", yaxis_title=metric_label)
+        if metric_key in {"low_star_share", "organic_share"}:
+            fig.update_yaxes(tickformat=".0%")
+        _sw_style_fig(fig)
+        _show_plotly(fig)
+        if movers_df is not None and not movers_df.empty:
+            _display_action_dataframe(
+                movers_df.head(20),
+                rename_map={
+                    "entity_label": "Entity",
+                    "latest_value": "Latest",
+                    "baseline_value": "Baseline",
+                    "delta": "Δ",
+                    "latest_reviews": "Latest reviews",
+                    "latest_period_start": "Latest period",
+                },
+                percent_cols=["latest_value", "baseline_value", "delta"] if metric_key in {"low_star_share", "organic_share"} else [],
+                delta_cols=["delta"] if metric_key not in {"low_star_share", "organic_share"} else [],
+                star_cols=["latest_value", "baseline_value"] if metric_key == "avg_rating" else [],
+                height=290,
+            )
+
 def _render_review_explorer(*, summary, overall_df, filtered_df, prompt_artifacts, filter_description, active_items):
     st.markdown("<div class='section-title'>Review Explorer</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='section-sub'>Showing <strong>{len(filtered_df):,}</strong> reviews · Use sidebar filters to narrow the stream.</div>", unsafe_allow_html=True)
+    _render_review_explorer_trend_detector(filtered_df)
     bundle, bundle_error = _safe_get_master_bundle(
         summary,
         filtered_df,
@@ -13525,7 +14923,271 @@ def main():
                     key="workspace_auto_build_uploaded_files",
                     help="Builds the workspace immediately after you choose files so you can skip the extra build click.",
                 )
+                loaded_workspace_label = _safe_text(st.session_state.get("workspace_name")).strip() or _safe_text(st.session_state.get("_workspace_loaded_source_label")).strip() or "your current workspace"
                 st.caption("Mapped columns include Event Id, Base SKU, Review Text, Rating, Opened date, Seeded Flag, and Retailer when available. Explicit Symptoms sheets are loaded automatically, and with auto-generate on the app will also draft product knowledge plus an AI taxonomy when no product-specific catalog is already present.")
+
+                st.markdown("<div class='metric-label' style='margin:.9rem 0 .35rem;'>Local central review database</div>", unsafe_allow_html=True)
+                if callable(_ensure_local_review_db_dirs) and callable(_get_local_review_db_status):
+                    local_root = st.text_input(
+                        "Local review database folder",
+                        value=_safe_text(st.session_state.get("workspace_local_db_root")),
+                        key="workspace_local_db_root",
+                        help="Drop the latest merged review export into incoming/reviews and the latest master SKU mapping workbook into incoming/sku_mapping inside this folder.",
+                    )
+                    local_dirs = _ensure_local_review_db_dirs(local_root or None)
+                    st.caption(f"Inputs live in {local_dirs.get('reviews_dir', '')} and {local_dirs.get('mapping_dir', '')}. The synced SQLite file is stored at {local_dirs.get('db_path', '')}.")
+                    local_status = _get_local_review_db_status(local_root or None)
+                    auto_sync_local_db = st.checkbox(
+                        "Auto-sync local database when newer files are detected",
+                        value=bool(st.session_state.get("workspace_local_db_auto_sync", True)),
+                        key="workspace_local_db_auto_sync",
+                        help="Checks the input folders on every rerun and rebuilds the local SQLite database whenever a newer review or SKU mapping file is present.",
+                    )
+                    export_snapshot_local_db = st.checkbox(
+                        "Refresh summary workbook after sync",
+                        value=bool(st.session_state.get("workspace_local_db_export_snapshot", False)),
+                        key="workspace_local_db_export_snapshot",
+                        help="Writes a multi-sheet Excel snapshot with the manifest, base-model directory, product directory, and SKU catalog after each sync.",
+                    )
+                    review_info = local_status.get("review_file") or {}
+                    mapping_info = local_status.get("mapping_file") or {}
+                    status_manifest = local_status.get("manifest") or {}
+                    st.caption(
+                        f"Latest review file: {_safe_text(review_info.get('name')) or 'none'} · Latest SKU mapping: {_safe_text(mapping_info.get('name')) or 'none'}"
+                    )
+                    if status_manifest:
+                        st.caption(
+                            f"Last sync: {_safe_text(status_manifest.get('synced_at')) or 'unknown'} · {int(status_manifest.get('review_count') or 0):,} reviews · {int(status_manifest.get('base_model_count') or 0):,} base models · {int(status_manifest.get('mapped_review_count') or 0):,} mapped rows"
+                        )
+                    db_path = _safe_text(local_dirs.get("db_path"))
+                    db_size_bytes = os.path.getsize(db_path) if db_path and os.path.exists(db_path) else 0
+                    workspace_cache_dir = _safe_text(local_dirs.get("workspace_cache_dir"))
+                    cache_files = [name for name in os.listdir(workspace_cache_dir) if name.endswith(".pkl")] if workspace_cache_dir and os.path.isdir(workspace_cache_dir) else []
+                    cache_bytes = sum(os.path.getsize(os.path.join(workspace_cache_dir, name)) for name in cache_files) if cache_files else 0
+                    st.markdown(
+                        _chip_html(
+                            [
+                                (f"SQLite: {_fmt_file_size(db_size_bytes)}", "gray"),
+                                (f"Warm extracts: {len(cache_files):,}", "indigo"),
+                                (f"Cache: {_fmt_file_size(cache_bytes)}", "gray"),
+                                ("Ready" if local_status.get("is_ready") else "Awaiting sync", "green" if local_status.get("is_ready") else "yellow"),
+                            ]
+                        ),
+                        unsafe_allow_html=True,
+                    )
+                    st.caption("Speed plan: keep the synced SQLite database as the durable store, load only the newest interactive slice with Fast or Balanced profiles, and preload repeated selections so the next workspace open can reuse a warm cached extract.")
+                    sync_cols = st.columns([1.2, 1.1, 2.7])
+                    sync_clicked = sync_cols[0].button("Sync latest folder files", key="ws_local_db_sync", use_container_width=True)
+                    export_clicked = sync_cols[1].button("Export summary workbook", key="ws_local_db_export", use_container_width=True, disabled=not bool(local_status.get('is_ready')))
+                    sync_cols[2].caption("This keeps the master SKU mapping plus merged reviews in one local SQLite database so you can load slices like HD400 without dragging the full corpus into memory.")
+                    if auto_sync_local_db and local_status.get("has_inputs") and local_status.get("needs_sync") and callable(_sync_local_review_database):
+                        try:
+                            _sync_local_review_database(local_root or None, progress_callback=_make_workspace_progress_reporter("Syncing local review database"), export_snapshot=export_snapshot_local_db)
+                            local_status = _get_local_review_db_status(local_root or None)
+                            st.success(_safe_text(local_status.get("message")) or "Local review database synced.")
+                        except Exception as exc:
+                            st.error(f"Local database sync failed: {exc}")
+                    elif sync_clicked and callable(_sync_local_review_database):
+                        try:
+                            _sync_local_review_database(local_root or None, force=True, progress_callback=_make_workspace_progress_reporter("Syncing local review database"), export_snapshot=export_snapshot_local_db)
+                            local_status = _get_local_review_db_status(local_root or None)
+                            st.success(_safe_text(local_status.get("message")) or "Local review database synced.")
+                        except Exception as exc:
+                            st.error(f"Local database sync failed: {exc}")
+                    if export_clicked and callable(_export_local_review_database_snapshot):
+                        try:
+                            snapshot_path = _export_local_review_database_snapshot(local_root or None)
+                            st.success(f"Exported summary workbook: {snapshot_path}")
+                        except Exception as exc:
+                            st.error(f"Could not export the summary workbook: {exc}")
+
+                    local_manifest_id = str((local_status.get("manifest") or {}).get("manifest_id") or "")
+                    if local_status.get("is_ready") and callable(_get_local_review_db_filter_options) and callable(_count_local_review_db_selection):
+                        if callable(_search_local_review_entities):
+                            search_query = st.text_input(
+                                "Quick product search",
+                                key="workspace_local_db_search_query",
+                                placeholder="Search a base model, SKU, or product name — e.g. HD400, FlexStyle, WD201",
+                                help="This searches the synced local database across base model numbers, SKU / product IDs, product names, and mapped categories.",
+                            )
+                            search_hits = _cached_local_db_entity_search(local_root or "", local_manifest_id, query=_safe_text(search_query), limit=20) if _safe_text(search_query) else []
+                            if search_hits:
+                                def _search_hit_label(row):
+                                    entity = _safe_text(row.get("entity_type")) or "Item"
+                                    base_model = _safe_text(row.get("base_model_number"))
+                                    product_id = _safe_text(row.get("product_id"))
+                                    product_name = _safe_text(row.get("original_product_name"))
+                                    brand = _safe_text(row.get("mapped_brand"))
+                                    category = _safe_text(row.get("mapped_category"))
+                                    review_count = int(row.get("review_count") or 0)
+                                    avg_rating = row.get("avg_rating")
+                                    descriptor = product_name or category or brand or "Mapped record"
+                                    id_part = base_model or product_id or descriptor
+                                    rating_part = f" · {float(avg_rating):.2f}★" if pd.notna(avg_rating) else ""
+                                    return f"{entity} · {id_part} · {descriptor} · {review_count:,} reviews{rating_part}"
+
+                                search_option_ids = [None] + list(range(len(search_hits)))
+                                selected_search_ix = st.selectbox(
+                                    "Search results",
+                                    options=search_option_ids,
+                                    index=0,
+                                    key="workspace_local_db_search_result_idx",
+                                    format_func=lambda value: "Choose a result" if value is None else _search_hit_label(search_hits[value]),
+                                )
+                                if selected_search_ix is not None:
+                                    chosen_hit = search_hits[int(selected_search_ix)]
+                                    st.caption(
+                                        f"Smart selection detected: {_safe_text(chosen_hit.get('mapped_brand')) or 'Unknown brand'} · {_safe_text(chosen_hit.get('mapped_category')) or 'Unknown category'} · {_safe_text(chosen_hit.get('mapped_subcategory')) or 'Unknown subcategory'}"
+                                    )
+                                    if st.button("Use search result", key="workspace_local_db_apply_search", use_container_width=True):
+                                        st.session_state["workspace_local_db_selected_brand"] = _safe_text(chosen_hit.get("mapped_brand"))
+                                        st.session_state["workspace_local_db_selected_category"] = _safe_text(chosen_hit.get("mapped_category"))
+                                        st.session_state["workspace_local_db_selected_subcategory"] = _safe_text(chosen_hit.get("mapped_subcategory"))
+                                        st.session_state["workspace_local_db_selected_base_model"] = _safe_text(chosen_hit.get("base_model_number"))
+                                        st.session_state["workspace_local_db_selected_product_id"] = _safe_text(chosen_hit.get("product_id"))
+                                        st.rerun()
+                            elif _safe_text(search_query):
+                                st.info("No local database search hits yet for that query. Try a shorter base model, SKU, or product-name fragment.")
+
+                        options = _cached_local_db_filter_options(
+                            local_root or "",
+                            local_manifest_id,
+                            mapped_brand=_safe_text(st.session_state.get("workspace_local_db_selected_brand")),
+                            mapped_category=_safe_text(st.session_state.get("workspace_local_db_selected_category")),
+                            mapped_subcategory=_safe_text(st.session_state.get("workspace_local_db_selected_subcategory")),
+                            base_model_number=_safe_text(st.session_state.get("workspace_local_db_selected_base_model")),
+                        )
+                        brand_options = [""] + list(options.get("mapped_brand") or [])
+                        brand_choice = st.selectbox("Mapped brand", brand_options, index=(brand_options.index(_safe_text(st.session_state.get("workspace_local_db_selected_brand"))) if _safe_text(st.session_state.get("workspace_local_db_selected_brand")) in brand_options else 0), key="workspace_local_db_selected_brand", help="Optional pre-filter before loading a workspace from the local database.")
+                        options = _cached_local_db_filter_options(
+                            local_root or "",
+                            local_manifest_id,
+                            mapped_brand=_safe_text(brand_choice),
+                            mapped_category=_safe_text(st.session_state.get("workspace_local_db_selected_category")),
+                            mapped_subcategory=_safe_text(st.session_state.get("workspace_local_db_selected_subcategory")),
+                            base_model_number=_safe_text(st.session_state.get("workspace_local_db_selected_base_model")),
+                        )
+                        db_cols_1 = st.columns(2)
+                        category_options = [""] + list(options.get("mapped_category") or [])
+                        base_model_options = [""] + list(options.get("base_model_number") or [])
+                        category_choice = db_cols_1[0].selectbox("Mapped category", category_options, index=(category_options.index(_safe_text(st.session_state.get("workspace_local_db_selected_category"))) if _safe_text(st.session_state.get("workspace_local_db_selected_category")) in category_options else 0), key="workspace_local_db_selected_category")
+                        base_model_choice = db_cols_1[1].selectbox("Base model number", base_model_options, index=(base_model_options.index(_safe_text(st.session_state.get("workspace_local_db_selected_base_model"))) if _safe_text(st.session_state.get("workspace_local_db_selected_base_model")) in base_model_options else 0), key="workspace_local_db_selected_base_model", help="Examples: HD400, DB300, NC700. This is the main family-level filter that links child SKUs together.")
+                        options = _cached_local_db_filter_options(
+                            local_root or "",
+                            local_manifest_id,
+                            mapped_brand=_safe_text(brand_choice),
+                            mapped_category=_safe_text(category_choice),
+                            mapped_subcategory=_safe_text(st.session_state.get("workspace_local_db_selected_subcategory")),
+                            base_model_number=_safe_text(base_model_choice),
+                        )
+                        db_cols_2 = st.columns(2)
+                        subcategory_options = [""] + list(options.get("mapped_subcategory") or [])
+                        product_options = [""] + list(options.get("product_id") or [])
+                        subcategory_choice = db_cols_2[0].selectbox("Mapped subcategory", subcategory_options, index=(subcategory_options.index(_safe_text(st.session_state.get("workspace_local_db_selected_subcategory"))) if _safe_text(st.session_state.get("workspace_local_db_selected_subcategory")) in subcategory_options else 0), key="workspace_local_db_selected_subcategory")
+                        product_choice = db_cols_2[1].selectbox("Specific product / SKU", product_options, index=(product_options.index(_safe_text(st.session_state.get("workspace_local_db_selected_product_id"))) if _safe_text(st.session_state.get("workspace_local_db_selected_product_id")) in product_options else 0), key="workspace_local_db_selected_product_id")
+                        profile_defaults = {"Fast": 25000, "Balanced": 75000, "Deep": 150000, "Custom": None}
+                        perf_cols = st.columns([0.9, 1.1])
+                        load_profile = perf_cols[0].selectbox(
+                            "Load profile",
+                            options=list(profile_defaults.keys()),
+                            index=list(profile_defaults.keys()).index(_safe_text(st.session_state.get("workspace_local_db_load_profile")) or "Fast") if _safe_text(st.session_state.get("workspace_local_db_load_profile")) in profile_defaults else 0,
+                            key="workspace_local_db_load_profile",
+                            help="Fast is now the recommended default for a quicker workspace open. Balanced keeps a broader slice in memory, and Deep loads a much larger slice before you start filtering.",
+                        )
+                        preset_limit = profile_defaults.get(load_profile)
+                        if preset_limit and int(st.session_state.get("workspace_local_db_limit_rows") or 0) != int(preset_limit):
+                            st.session_state["workspace_local_db_limit_rows"] = int(preset_limit)
+                        local_limit_rows = int(
+                            perf_cols[1].number_input(
+                                "Load newest review rows",
+                                min_value=1000,
+                                max_value=500000,
+                                value=int(st.session_state.get("workspace_local_db_limit_rows") or preset_limit or 75000),
+                                step=5000,
+                                key="workspace_local_db_limit_rows",
+                                help="Keeps large database selections responsive by loading only the newest N reviews into the interactive workspace.",
+                            )
+                        )
+                        selection_count = _cached_local_db_selection_count(
+                            local_root or "",
+                            local_manifest_id,
+                            base_model_number=_safe_text(base_model_choice),
+                            mapped_brand=_safe_text(brand_choice),
+                            mapped_category=_safe_text(category_choice),
+                            mapped_subcategory=_safe_text(subcategory_choice),
+                            product_id=_safe_text(product_choice),
+                        )
+                        if selection_count:
+                            planned_rows = min(int(selection_count), int(local_limit_rows)) if local_limit_rows else int(selection_count)
+                            if selection_count > local_limit_rows:
+                                st.caption(f"Current local selection matches {selection_count:,} reviews. The workspace will hydrate the newest {local_limit_rows:,} rows to stay responsive, while Action Center can still analyze the broader synced database.")
+                            else:
+                                st.caption(f"Current local selection matches {selection_count:,} reviews. The full selection can fit directly in the interactive workspace.")
+                            st.caption("Repeat loads get faster because this exact selection is cached to disk after the first successful read. Use preload when you want to warm the cache before entering the workspace.")
+                            local_source_sig = _local_db_source_signature(
+                                local_status,
+                                root=local_root,
+                                base_model_number=_safe_text(base_model_choice),
+                                mapped_brand=_safe_text(brand_choice),
+                                mapped_category=_safe_text(category_choice),
+                                mapped_subcategory=_safe_text(subcategory_choice),
+                                product_id=_safe_text(product_choice),
+                                limit_rows=local_limit_rows,
+                            )
+                            preload_cols = st.columns([1.0, 2.6])
+                            preload_clicked = preload_cols[0].button("Preload current selection", key="ws_preload_local_db", use_container_width=True)
+                            preload_cols[1].caption(f"Preload hydrates about {planned_rows:,} rows now so the next workspace open can reuse a warm cached extract.")
+                            if preload_clicked:
+                                try:
+                                    preload_dataset = _load_local_review_workspace(
+                                        local_root or None,
+                                        base_model_number=_safe_text(base_model_choice),
+                                        mapped_brand=_safe_text(brand_choice),
+                                        mapped_category=_safe_text(category_choice),
+                                        mapped_subcategory=_safe_text(subcategory_choice),
+                                        product_id=_safe_text(product_choice),
+                                        limit_rows=local_limit_rows,
+                                    )
+                                    preload_meta = preload_dataset.get("load_meta") or {}
+                                    preload_seconds = float(preload_meta.get("load_seconds") or 0.0)
+                                    if preload_meta.get("cache_hit"):
+                                        st.success(f"Selection cache is already warm. Reused it in {preload_seconds:.1f}s.")
+                                    else:
+                                        st.success(f"Preloaded {len(preload_dataset.get('reviews_df', pd.DataFrame())):,} rows in {preload_seconds:.1f}s. The next workspace open can reuse that cache.")
+                                except Exception as exc:
+                                    st.error(f"Could not preload the current selection: {exc}")
+                            needs_local_confirmation = _workspace_source_change_needs_confirmation(local_source_sig, source_mode=SOURCE_MODE_LOCAL_DB)
+                            build_local = False
+                            replace_local = False
+                            if needs_local_confirmation:
+                                st.warning(f"A workspace is already loaded ({loaded_workspace_label}). This local-database selection is different, so choose whether to create a new workspace or replace the current one.")
+                                local_confirm_cols = st.columns([1.15, 1.15, 2.7])
+                                build_local = local_confirm_cols[0].button("Create new local DB workspace", type="primary", key="ws_build_local_db_new", use_container_width=True)
+                                replace_local = local_confirm_cols[1].button("Replace current workspace", key="ws_build_local_db_replace", use_container_width=True)
+                                local_confirm_cols[2].caption("Create new starts a fresh workspace. Replace keeps the current workspace name and save target while swapping in the selected local database slice.")
+                            else:
+                                build_local = st.button("Build workspace from local database", type="primary", key="ws_build_local_db", use_container_width=True)
+                            if build_local or replace_local:
+                                try:
+                                    _build_workspace_from_local_database(
+                                        root=local_root or None,
+                                        base_model_number=_safe_text(base_model_choice),
+                                        mapped_brand=_safe_text(brand_choice),
+                                        mapped_category=_safe_text(category_choice),
+                                        mapped_subcategory=_safe_text(subcategory_choice),
+                                        product_id=_safe_text(product_choice),
+                                        limit_rows=local_limit_rows,
+                                        replace_current=bool(replace_local),
+                                        source_signature=local_source_sig,
+                                    )
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"Local database workspace build failed: {exc}")
+                        else:
+                            st.info("Sync the database, then pick a base model, category, or product selection that returns at least one review.")
+                else:
+                    st.info("Local database support is not available in this build.")
+
                 uploaded_build_sig = _uploaded_file_build_signature(
                     uploaded_files or [],
                     include_local_symptomization=include_local_symptomization,
@@ -13635,7 +15297,7 @@ def main():
         st.markdown("""<div class='empty-state-card'>
           <div style="font-size:2.5rem;margin-bottom:.75rem;">📊</div>
           <div class='empty-state-title' style="font-size:16px;">No workspace loaded</div>
-          <div class='empty-state-sub'>Build a workspace above to unlock the Dashboard, Review Explorer, Review Prompt, and Symptomizer. Social Listening Beta stays available from the sidebar when you want the social-only placeholder workflow.</div>
+          <div class='empty-state-sub'>Build a workspace above to unlock the Dashboard, Action Center, Review Explorer, Review Prompt, and Symptomizer. Social Listening Beta stays available from the sidebar when you want the social-only placeholder workflow.</div>
         </div>""", unsafe_allow_html=True)
         return
 
@@ -13678,6 +15340,8 @@ def main():
         _safe_render(_render_dashboard, filtered_df, overall_df)
     elif active_tab == TAB_REVIEW_EXPLORER:
         _safe_render(_render_review_explorer, summary=summary, overall_df=overall_df, filtered_df=filtered_df, prompt_artifacts=st.session_state.get("prompt_run_artifacts"), filter_description=filter_description, active_items=filter_state["active_items"])
+    elif active_tab == TAB_ACTION_CENTER:
+        _safe_render(_render_action_center, dataset=dataset, overall_df=overall_df, filtered_df=filtered_df, source_type=source_type, source_label=source_label, filter_description=filter_description)
     elif active_tab == TAB_REVIEW_PROMPT:
         _safe_render(_render_review_prompt_tab, **common)
     elif active_tab == TAB_SYMPTOMIZER:
@@ -13686,13 +15350,13 @@ def main():
         _safe_render(_render_social_listening_tab)
 
     # ── Persistent AI chat bar (bottom of every page) ─────────────────
-    _render_bottom_chat_bar(settings=settings, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description)
+    _render_bottom_chat_bar(settings=settings, overall_df=overall_df, filtered_df=filtered_df, summary=summary, filter_description=filter_description, dataset=dataset)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  BOTTOM CHAT BAR — persistent AI assistant on every page
 # ═══════════════════════════════════════════════════════════════════════════════
-def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filter_description):
+def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filter_description, dataset=None):
     """Persistent AI chat bar at the bottom of every page."""
     chat_messages = st.session_state.get("chat_messages") or []
     active_tab = st.session_state.get("workspace_active_tab") or TAB_DASHBOARD
@@ -13756,6 +15420,10 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
             options=answer_styles,
             key="bottom_chat_answer_style",
             help="Controls how concise or detailed the answer should be.",
+        )
+        st.markdown(
+            "<div class='soft-disclaimer'>AI is grounded in the current workspace and synced local-database entity matches when available, but it can make mistakes. Verify high-impact decisions against the charts, tables, and source reviews.</div>",
+            unsafe_allow_html=True,
         )
 
         if chat_messages:
@@ -13864,7 +15532,11 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
         enriched_prompt = "\n\n".join(part for part in prompt_parts if part)
 
         st.session_state.setdefault("chat_messages", []).append({"role": "user", "content": prompt})
-        with st.spinner("Thinking through the current view…"):
+        with st.status("Preparing grounded answer…", expanded=True) as ai_status:
+            ai_status.write("Resolving product names, SKUs, base model numbers, and likely misspellings.")
+            ai_status.write("Pulling the strongest review evidence from the active workspace and current filters.")
+            if isinstance(dataset, dict) and _safe_text(dataset.get("source_type")).strip().lower() == "local_database":
+                ai_status.write("Checking synced local-database entity matches to reduce guessing before drafting the answer.")
             try:
                 answer = _call_analyst(
                     question=enriched_prompt,
@@ -13877,9 +15549,12 @@ def _render_bottom_chat_bar(*, settings, overall_df, filtered_df, summary, filte
                     target_words=target_words,
                     include_references=bool(st.session_state.get("ai_include_references", False)),
                     freeform_mode=(focus == "General"),
+                    dataset=dataset,
                 )
+                ai_status.update(label="Answer ready", state="complete", expanded=False)
                 st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
             except Exception as exc:
+                ai_status.update(label="AI answer failed", state="error", expanded=True)
                 st.session_state["chat_messages"].append({"role": "assistant", "content": f"Error: {exc}"})
         st.rerun()
 

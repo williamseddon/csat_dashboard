@@ -31,7 +31,7 @@ html,body,[data-testid="stAppViewContainer"],.stApp,[data-theme="light"],[data-t
 [data-testid="stMetric"] [data-testid="stMetricLabel"]{color:#64748b!important;}
 .block-container{
   padding-top:2rem!important;
-  padding-bottom:3rem!important;
+  padding-bottom:4.75rem!important;
   max-width:1460px!important;
 }
 .hero-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-xl);padding:18px 22px;box-shadow:var(--shadow-sm);margin-bottom:.9rem;}
@@ -173,7 +173,7 @@ html,body,[data-testid="stAppViewContainer"],.stApp,[data-theme="light"],[data-t
   .ref-item{padding:10px 3px 11px 3px;}
   .block-container{
     padding-top:1.25rem!important;
-    padding-bottom:2.25rem!important;
+    padding-bottom:3.25rem!important;
     padding-left:1rem!important;
     padding-right:1rem!important;
   }
@@ -228,7 +228,10 @@ html,body,[data-testid="stAppViewContainer"],.stApp,[data-theme="light"],[data-t
 [data-testid="stRadio"] label p{margin:0;color:var(--navy);}
 [data-testid="stRadio"] label:has(input:checked){background:#ffffff;border:1px solid rgba(79,70,229,.22);box-shadow:var(--shadow-xs);}
 [data-testid="stPopover"]>div,[role="listbox"]{border:1px solid var(--border)!important;border-radius:14px!important;box-shadow:var(--shadow-md)!important;background:#ffffff!important;}
-[data-testid="stChatMessage"]{border:1px solid var(--border);border-radius:18px;background:var(--surface);box-shadow:var(--shadow-xs);padding:.15rem .2rem;}
+[data-testid="stChatMessage"]{border:1px solid var(--border);border-radius:18px;background:var(--surface);box-shadow:var(--shadow-xs);padding:.38rem .5rem .62rem;margin-bottom:.72rem;}
+[data-testid="stChatInput"]{margin-top:.55rem!important;margin-bottom:.25rem!important;}
+[data-testid="stChatMessageContent"]>div:last-child{padding-bottom:.1rem!important;}
+.soft-disclaimer{margin:.3rem 0 .85rem;padding:9px 11px;border:1px solid var(--border);border-radius:14px;background:#fcfcff;font-size:11.4px;line-height:1.55;color:var(--slate-600);}
 [data-testid="stAlert"]{border-radius:16px!important;border:1px solid var(--border)!important;box-shadow:var(--shadow-xs)!important;}
 [data-testid="stDataFrame"]{border-radius:18px;overflow:hidden;border:1px solid var(--border);box-shadow:var(--shadow-xs);}
 [data-testid="stMetric"]{box-shadow:var(--shadow-xs);} 

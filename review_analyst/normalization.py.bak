@@ -486,25 +486,16 @@ def _series_alias(df: pd.DataFrame, aliases: List[str]) -> pd.Series:
 
 
 def _parse_flag(value: Any, *, pos: List[str], neg: List[str]):
-    text = safe_text(value).strip().lower()
-    if text in {"", "nan", "none", "null", "n/a", "na", "unknown", "unspecified"}:
+    text = safe_text(value).lower()
+    if text in {"", "nan", "none", "null", "n/a"}:
         return pd.NA
-    normalized = re.sub(r"[^a-z0-9]+", " ", text).strip()
-    pos_terms = [re.sub(r"[^a-z0-9]+", " ", safe_text(candidate).strip().lower()).strip() for candidate in pos if safe_text(candidate).strip()]
-    neg_terms = [re.sub(r"[^a-z0-9]+", " ", safe_text(candidate).strip().lower()).strip() for candidate in neg if safe_text(candidate).strip()]
-    if normalized in neg_terms:
+    if any(text == candidate.lower() for candidate in neg):
         return False
-    if normalized in pos_terms:
+    if any(text == candidate.lower() for candidate in pos):
         return True
-    if normalized.startswith(("not ", "non ")):
+    if text.startswith(("not ", "non ")):
         return False
-    if re.fullmatch(r"[01](?: 0+)?", normalized):
-        return normalized.startswith("1")
-    if any(term and term in normalized for term in neg_terms):
-        return False
-    if any(term and term in normalized for term in pos_terms):
-        return True
-    return pd.NA
+    return True
 
 
 def _normalize_moderation_status(value: Any) -> str:
@@ -676,11 +667,7 @@ def normalize_uploaded_df(raw_df: pd.DataFrame, *, source_name: str = "", includ
 
     seeded = _series_alias(working, ["Seeded Flag", "Seeded", "Incentivized", "IncentivizedReview (CDV)", "Incentivized Review", "IncentivizedReview", "Gifted", "Gifted Flag"])
     normalized["incentivized_review"] = seeded.map(
-        lambda value: _parse_flag(
-            value,
-            pos=["seeded", "incentivized", "gifted", "sampled", "sampling", "sponsored", "paid", "yes", "true", "1", "t", "y"],
-            neg=["organic", "organic standard", "organic / standard", "earned", "unpaid", "not seeded", "not incentivized", "not gifted", "no incentive", "no incentives", "standard", "no", "false", "0", "f", "n"],
-        )
+        lambda value: _parse_flag(value, pos=["seeded", "incentivized", "yes", "true", "1", "t", "y"], neg=["not seeded", "not incentivized", "no", "false", "0", "f", "n"])
     )
     syndicated = _series_alias(working, ["Syndicated Flag", "Syndicated", "Syndicated Review", "Is Syndicated"])
     normalized["is_syndicated"] = syndicated.map(
